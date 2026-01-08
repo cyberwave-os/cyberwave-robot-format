@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyberwave-robot-format"
+version = "0.1.0"
+description = "Universal robot description schema and format converters for Cyberwave"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Cyberwave Team", email = "hello@cyberwave.com"},
+]
+keywords = [
+    "robotics",
+    "urdf",
+    "mjcf",
+    "sdf",
+    "robot-description",
+    "format-conversion",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "lxml>=4.6.0",
+    "defusedxml>=0.7.0",
+    "trimesh>=3.0.0",
+    "pycollada>=0.7.0",
+    "resolve-robotics-uri-py>=0.3.0",
+    "cattrs>=23.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.10.0",
+    "black>=21.0.0",
+    "isort>=5.0.0",
+    "mypy>=0.800",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cyberwave_robot_format*"]
+
+[tool.black]
+line-length = 120
+target-version = ['py310', 'py311', 'py312']
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 120
+known_first_party = ["cyberwave_robot_format"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--cov=cyberwave_robot_format",
+    "--cov-report=term-missing",
+]
+testpaths = ["tests"]
