@@ -37,6 +37,18 @@ class URDFExporter(BaseExporter):
 
     def export(self, schema: CommonSchema, output_path: str | Path) -> None:
         """Export common schema to URDF format."""
+        # Validate that all joint parent/child links exist
+        link_names = {link.name for link in schema.links}
+        for joint in schema.joints:
+            if joint.parent_link not in link_names:
+                raise ValueError(
+                    f"Joint '{joint.name}' references non-existent parent link '{joint.parent_link}'"
+                )
+            if joint.child_link not in link_names:
+                raise ValueError(
+                    f"Joint '{joint.name}' references non-existent child link '{joint.child_link}'"
+                )
+
         robot = ET.Element("robot", name=schema.metadata.name)
 
         for link in schema.links:
@@ -87,6 +99,8 @@ class URDFExporter(BaseExporter):
             JointType.FIXED: "fixed",
             JointType.FLOATING: "floating",
             JointType.PLANAR: "planar",
+            JointType.SPHERICAL: "continuous",  # URDF approximation
+            JointType.UNIVERSAL: "continuous",  # URDF approximation
         }
 
         urdf_type = type_mapping.get(joint.type, "fixed")

@@ -1,0 +1,183 @@
+{
+  "actuators": [],
+  "contacts": [],
+  "extensions": {
+    "parse_context": {
+      "errors": [],
+      "materials": {},
+      "warnings": []
+    }
+  },
+  "joints": [
+    {
+      "axis": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 1.0
+      },
+      "calibration": null,
+      "child_link": "link1",
+      "dynamics": {
+        "armature": null,
+        "backlash": null,
+        "damping": 0.1,
+        "friction": 0.05,
+        "spring_reference": 0.0,
+        "spring_stiffness": 0.0
+      },
+      "extensions": {},
+      "limits": {
+        "acceleration": null,
+        "effort": 10.0,
+        "jerkmax": null,
+        "lower": -3.14,
+        "upper": 3.14,
+        "velocity": 1.0
+      },
+      "name": "joint1",
+      "parent_link": "base_link",
+      "pose": {
+        "orientation": {
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "position": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.1
+        }
+      },
+      "safety_controller": null,
+      "type": "revolute"
+    }
+  ],
+  "links": [
+    {
+      "center_of_mass": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "collisions": [
+        {
+          "damping": null,
+          "extensions": {},
+          "geometry": {
+            "extensions": {},
+            "filename": null,
+            "length": null,
+            "radius": null,
+            "scale": null,
+            "size": {
+              "x": 0.1,
+              "y": 0.1,
+              "z": 0.1
+            },
+            "type": "box"
+          },
+          "mu_dynamic": null,
+          "mu_static": null,
+          "name": null,
+          "pose": null,
+          "restitution": null,
+          "stiffness": null
+        }
+      ],
+      "extensions": {},
+      "inertia": {
+        "ixx": 0.1,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 0.1,
+        "iyz": 0.0,
+        "izz": 0.1
+      },
+      "mass": 1.0,
+      "name": "base_link",
+      "visuals": [
+        {
+          "extensions": {},
+          "geometry": {
+            "extensions": {},
+            "filename": null,
+            "length": null,
+            "radius": null,
+            "scale": null,
+            "size": {
+              "x": 0.1,
+              "y": 0.1,
+              "z": 0.1
+            },
+            "type": "box"
+          },
+          "material": {
+            "color": [
+              0.0,
+              0.0,
+              1.0,
+              1.0
+            ],
+            "emissive": null,
+            "name": "blue",
+            "shininess": null,
+            "specular": null,
+            "texture": null
+          },
+          "name": null,
+          "pose": null
+        }
+      ]
+    },
+    {
+      "center_of_mass": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "collisions": [],
+      "extensions": {},
+      "inertia": {
+        "ixx": 0.05,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 0.05,
+        "iyz": 0.0,
+        "izz": 0.05
+      },
+      "mass": 0.5,
+      "name": "link1",
+      "visuals": [
+        {
+          "extensions": {},
+          "geometry": {
+            "extensions": {},
+            "filename": null,
+            "length": 0.2,
+            "radius": 0.05,
+            "scale": null,
+            "size": null,
+            "type": "cylinder"
+          },
+          "material": null,
+          "name": null,
+          "pose": null
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "author": null,
+    "creation_date": null,
+    "description": "Converted from URDF: simple_robot.urdf",
+    "extensions": {},
+    "name": "simple_robot",
+    "source_format": "urdf",
+    "units": "SI",
+    "version": "1.0"
+  },
+  "physics": null,
+  "scene": null,
+  "sensors": []
+}
