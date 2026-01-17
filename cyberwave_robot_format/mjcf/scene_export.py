@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 def export_mujoco_zip(
     schema: CommonSchema,
     output_path: str | Path | None = None,
+    mesh_base_dirs: list[str | Path] | None = None,
 ) -> bytes:
     """Export a CommonSchema to a complete MuJoCo ZIP file.
 
@@ -49,6 +50,7 @@ def export_mujoco_zip(
     Args:
         schema: CommonSchema to export (may be a composed scene with multiple robots)
         output_path: Optional path to write the ZIP file. If None, returns bytes only.
+        mesh_base_dirs: Optional list of directories to search for mesh files.
 
     Returns:
         ZIP file contents as bytes
@@ -99,25 +101,51 @@ def export_mujoco_zip(
                 mesh_file = mesh_elem.get("file")
                 if mesh_file:
                     mesh_path = Path(mesh_file)
+                    src_path = None
                     
-                    # Handle absolute paths and relative paths
+                    # Handle absolute paths
                     if mesh_path.is_absolute() and mesh_path.exists():
                         src_path = mesh_path
                     else:
-                        # Try relative to temp directory
-                        src_path = temp_path / mesh_file
-                        if not src_path.exists():
-                            # Try as-is
-                            src_path = mesh_path
+                        # Try in provided mesh_base_dirs
+                        search_dirs = list(mesh_base_dirs or []) + [temp_path]
+                        for base_dir in search_dirs:
+                            candidate = Path(base_dir) / mesh_file
+                            if candidate.exists():
+                                src_path = candidate
+                                break
+                        # If not found by path, try searching for filename
+                        if src_path is None:
+                            target_name = mesh_path.name
+                            for base_dir in search_dirs:
+                                base = Path(base_dir)
+                                if base.exists():
+                                    matches = list(base.rglob(target_name))
+                                    if matches:
+                                        src_path = matches[0]
+                                        break
                     
-                    if src_path.exists():
+                    if src_path and src_path.exists():
                         # Copy to assets directory
                         dst_path = assets_dir / src_path.name
                         if not dst_path.exists():
                             shutil.copy(src_path, dst_path)
                         
-                        # Update XML to reference basename only
-                        mesh_elem.set("file", src_path.name)
+                        final_name = src_path.name
+                        
+                        # Convert DAE to OBJ for MuJoCo compatibility
+                        if dst_path.suffix.lower() == ".dae":
+                            try:
+                                from cyberwave_robot_format.mesh import convert_dae_to_obj
+                                obj_path = convert_dae_to_obj(str(dst_path), output_dir=assets_dir)
+                                final_name = Path(obj_path).name
+                                # Remove original DAE
+                                dst_path.unlink()
+                            except Exception as e:
+                                logger.warning(f"Failed to convert DAE to OBJ: {e}")
+                        
+                        # Update XML to reference final filename
+                        mesh_elem.set("file", final_name)
                     else:
                         logger.warning(f"Mesh file not found: {mesh_file}")
 
@@ -151,4 +179,45 @@ def export_mujoco_zip(
         return zip_bytes
 
 
-__all__ = ["export_mujoco_zip"]
+def export_mujoco_scene_xml(schema: CommonSchema) -> str:
+    """Export a CommonSchema to MJCF XML string.
+
+    This function exports a composed CommonSchema (which may contain multiple
+    robots merged via merge_in) to an MJCF XML string. Note that mesh file
+    references in the XML will be absolute paths to the converted files
+    in /tmp/mujoco_converted_meshes/.
+
+    Args:
+        schema: CommonSchema to export (may be a composed scene with multiple robots)
+
+    Returns:
+        MJCF XML as a string
+
+    Raises:
+        ValueError: If schema validation fails
+        Exception: If export fails
+    """
+    # Validate schema
+    errors = schema.validate()
+    if errors:
+        raise ValueError(f"Schema validation failed: {', '.join(errors)}")
+
+    # Create temporary file for export
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+        temp_path = f.name
+
+    try:
+        exporter = MJCFExporter()
+        exporter.export(schema, temp_path)
+
+        with open(temp_path, "r", encoding="utf-8") as f:
+            xml_content = f.read()
+
+        return xml_content
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+__all__ = ["export_mujoco_zip", "export_mujoco_scene_xml"]

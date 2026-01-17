@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 def export_urdf_zip(
     schema: CommonSchema,
     output_path: str | Path | None = None,
+    mesh_base_dirs: list[str | Path] | None = None,
 ) -> bytes:
     """Export a CommonSchema to a complete URDF ZIP file.
 
@@ -51,6 +52,7 @@ def export_urdf_zip(
     Args:
         schema: CommonSchema to export (may be a composed scene with multiple robots)
         output_path: Optional path to write the ZIP file. If None, returns bytes only.
+        mesh_base_dirs: Optional list of directories to search for mesh files.
 
     Returns:
         ZIP file contents as bytes
@@ -109,16 +111,35 @@ def export_urdf_zip(
                     mesh_rewrite_map[original_filename] = new_relative_path
 
                     # Copy the mesh file if it exists
-                    src_path = original_path if original_path.is_absolute() else None
-
-                    # Try common locations for mesh files
-                    if src_path is None or not src_path.exists():
-                        # Check /tmp/mujoco_converted_meshes (where MJCFExporter puts converted files)
+                    src_path = None
+                    
+                    # Handle absolute paths
+                    if original_path.is_absolute() and original_path.exists():
+                        src_path = original_path
+                    else:
+                        # Try in provided mesh_base_dirs
+                        search_dirs = list(mesh_base_dirs or [])
+                        # Also check /tmp/mujoco_converted_meshes
                         mujoco_mesh_dir = Path("/tmp/mujoco_converted_meshes")
                         if mujoco_mesh_dir.exists():
-                            potential_src = mujoco_mesh_dir / original_path.name
-                            if potential_src.exists():
-                                src_path = potential_src
+                            search_dirs.append(mujoco_mesh_dir)
+                        
+                        for base_dir in search_dirs:
+                            candidate = Path(base_dir) / original_filename
+                            if candidate.exists():
+                                src_path = candidate
+                                break
+                        
+                        # If not found by path, try searching for filename
+                        if src_path is None:
+                            target_name = original_path.name
+                            for base_dir in search_dirs:
+                                base = Path(base_dir)
+                                if base.exists():
+                                    matches = list(base.rglob(target_name))
+                                    if matches:
+                                        src_path = matches[0]
+                                        break
 
                     if src_path and src_path.exists():
                         dst_path = assets_dir / new_name

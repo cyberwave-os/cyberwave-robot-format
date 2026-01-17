@@ -8,6 +8,10 @@ from cyberwave_robot_format.schema import (
     Actuator,
     ActuatorType,
     Collision,
+    CollisionConfig,
+    CollisionExclude,
+    CollisionGroup,
+    CollisionPair,
     CommonSchema,
     Contact,
     ContactSurface,
@@ -30,8 +34,8 @@ from cyberwave_robot_format.schema import (
     Vector3,
     Visual,
 )
-from cyberwave_robot_format.urdf import URDFParser, URDFExporter
-from cyberwave_robot_format.mjcf import MJCFParser, MJCFExporter, export_mujoco_zip
+from cyberwave_robot_format.urdf import URDFParser, URDFExporter, export_urdf_zip, export_urdf_scene_xml
+from cyberwave_robot_format.mjcf import MJCFParser, MJCFExporter, export_mujoco_zip, export_mujoco_scene_xml
 from cyberwave_robot_format.schema_export import export_universal_schema_json
 
 __version__ = "0.1.0"
@@ -41,6 +45,10 @@ __all__ = [
     "Joint",
     "Visual",
     "Collision",
+    "CollisionConfig",
+    "CollisionExclude",
+    "CollisionGroup",
+    "CollisionPair",
     "Geometry",
     "Material",
     "Pose",
@@ -65,5 +73,8 @@ __all__ = [
     "MJCFParser",
     "MJCFExporter",
     "export_mujoco_zip",
+    "export_mujoco_scene_xml",
+    "export_urdf_zip",
+    "export_urdf_scene_xml",
     "export_universal_schema_json",
 ]

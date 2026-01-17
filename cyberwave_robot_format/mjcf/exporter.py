@@ -104,10 +104,9 @@ class MJCFExporter(BaseExporter):
             "geom",
             {
                 "condim": "3",
-                "contype": "0",
-                "conaffinity": "1",
+                # contype/conaffinity now come from CollisionFilter on each collision
                 "priority": "1",
-                "group": "1",
+                "group": "3",
                 "solref": "0.005 1",
                 "solimp": "0.99 0.999 1e-05",
                 "friction": "1 0.01 0.01",
@@ -175,6 +174,9 @@ class MJCFExporter(BaseExporter):
         for root_link in root_links:
             if root_link.name != "world" and root_link.name not in world_children:
                 self._add_body_hierarchy(worldbody, root_link, schema, link_to_children, mesh_name_map)
+
+        # Add collision configuration (excludes and pairs)
+        self._add_contact_section(mujoco, schema)
 
         actuator_elem = ET.SubElement(mujoco, "actuator")
 
@@ -342,6 +344,7 @@ class MJCFExporter(BaseExporter):
                 f"visual_{i}",
                 mesh_name_map,
                 group="2",
+                schema=schema,
             )
 
         for i, collision in enumerate(link.collisions):
@@ -354,6 +357,7 @@ class MJCFExporter(BaseExporter):
                 mesh_name_map,
                 group="3",
                 collision=collision,
+                schema=schema,
             )
 
         if schema.sensors:
@@ -458,6 +462,7 @@ class MJCFExporter(BaseExporter):
                 f"visual_{i}",
                 mesh_name_map,
                 group="2",
+                schema=schema,
             )
 
         for i, collision in enumerate(link.collisions):
@@ -470,6 +475,7 @@ class MJCFExporter(BaseExporter):
                 mesh_name_map,
                 group="3",
                 collision=collision,
+                schema=schema,
             )
 
         if schema.sensors:
@@ -504,6 +510,7 @@ class MJCFExporter(BaseExporter):
         mesh_name_map: dict[tuple[str, tuple[float, float, float]], str],
         group: str = "0",
         collision: Collision | None = None,
+        schema: CommonSchema | None = None,
     ) -> None:
         """Add geometry element to body."""
         geom = ET.SubElement(body, "geom")
@@ -519,8 +526,11 @@ class MJCFExporter(BaseExporter):
             quat_str = f"{quat.w} {quat.x} {quat.y} {quat.z}"
             geom.set("quat", quat_str)
 
+        # Visual geoms: disable collision
         if group == "2":
             geom.set("class", "visual")
+            geom.set("contype", "0")
+            geom.set("conaffinity", "0")
         elif group == "3":
             geom.set("class", "collision")
 
@@ -571,14 +581,46 @@ class MJCFExporter(BaseExporter):
         if material and material.name:
             geom.set("material", material.name)
 
+        # Apply collision filter if this is a collision geom
         if collision:
+            group_name = collision.group
+            
+            # "default" group doesn't require collision_config - use default MuJoCo behavior
+            if group_name == "default" and (not schema or not schema.collision_config):
+                # Use default MuJoCo collision behavior (all collisions enabled)
+                # MuJoCo defaults: contype=1, conaffinity=1 (all collisions enabled)
+                # We don't need to set these explicitly - MuJoCo will use defaults
+                pass
+            elif schema and schema.collision_config:
+                # Look up collision group from schema.collision_config.groups
+                if group_name not in schema.collision_config.groups:
+                    raise ValueError(
+                        f"Collision references group '{group_name}' which is not defined in "
+                        f"collision_config.groups. Available groups: {list(schema.collision_config.groups.keys())}"
+                    )
+                
+                collision_group = schema.collision_config.groups[group_name]
+                
+                # Apply contype/conaffinity from the group
+                geom.set("contype", str(collision_group.contype))
+                geom.set("conaffinity", str(collision_group.conaffinity))
+            else:
+                # Non-default group requires collision_config
+                raise ValueError(
+                    f"Collision references group '{group_name}' but schema has no collision_config"
+                )
+            
+            # Apply contact properties (friction, etc.)
             if collision.mu_dynamic is not None:
                 mu_static = collision.mu_static if collision.mu_static is not None else collision.mu_dynamic
-                geom.set("friction", f"{collision.mu_dynamic} {mu_static}")
-            for key in ["contype", "conaffinity", "margin", "solref", "solimp"]:
-                val = collision.extensions.get(key) if collision.extensions else None
-                if val is not None:
-                    geom.set(key, str(val))
+                geom.set("friction", f"{collision.mu_dynamic} {mu_static} 0.01")
+            
+            # Check for MuJoCo-specific overrides in extensions (highest priority)
+            if collision.extensions:
+                for key in ["contype", "conaffinity", "margin", "solref", "solimp", "condim"]:
+                    val = collision.extensions.get(key)
+                    if val is not None:
+                        geom.set(key, str(val))
 
     def _add_actuator(self, actuator_elem: ET.Element, actuator: Actuator) -> None:
         """Add actuator to actuator section."""
@@ -614,13 +656,19 @@ class MJCFExporter(BaseExporter):
             force_min, force_max = actuator.force_range
             force_range = f"{force_min} {force_max}"
             act.set("forcerange", force_range)
+        elif hasattr(actuator, "max_torque") and actuator.max_torque is not None:
+            # If max_torque is specified but no force_range, use symmetric range
+            max_torque = actuator.max_torque
+            act.set("forcerange", f"-{max_torque} {max_torque}")
 
         if actuator.gear_ratio is not None:
             act.set("gear", str(actuator.gear_ratio))
-        if actuator.kp is not None:
+
+        if actuator.kp is not None and act_tag == "position":
             act.set("kp", str(actuator.kp))
-        if actuator.kd is not None:
-            act.set("kd", str(actuator.kd))
+        
+        if actuator.kd is not None and act_tag in ["position", "velocity"]:
+            act.set("kv", str(actuator.kd))
 
     def _add_sensor(self, sensor_elem: ET.Element, sensor: Sensor) -> None:
         """Add sensor entry."""
@@ -677,6 +725,53 @@ class MJCFExporter(BaseExporter):
             if val is not None:
                 attrs[key] = str(val)
         ET.SubElement(contact_elem, "pair", **attrs)
+
+    def _add_contact_section(self, mujoco: ET.Element, schema: CommonSchema) -> None:
+        """Add <contact> section with excludes and pairs."""
+        if not schema.collision_config:
+            return
+        
+        config = schema.collision_config
+        
+        # Only create <contact> if we have rules
+        if not config.excludes and not config.pairs:
+            return
+        
+        contact = ET.SubElement(mujoco, "contact")
+        
+        # Add body-level excludes
+        for exclude in config.excludes:
+            ET.SubElement(contact, "exclude", {
+                "body1": exclude.body1,
+                "body2": exclude.body2
+            })
+        
+        # Add explicit geom pairs
+        for pair in config.pairs:
+            pair_attrs = {
+                "geom1": pair.geom1,
+                "geom2": pair.geom2
+            }
+            
+            # Add optional contact overrides
+            if pair.friction is not None:
+                pair_attrs["friction"] = " ".join(str(f) for f in pair.friction)
+            if pair.solref is not None:
+                pair_attrs["solref"] = " ".join(str(s) for s in pair.solref)
+            if pair.solimp is not None:
+                pair_attrs["solimp"] = " ".join(str(s) for s in pair.solimp)
+            if pair.condim is not None:
+                pair_attrs["condim"] = str(pair.condim)
+            if pair.margin is not None:
+                pair_attrs["margin"] = str(pair.margin)
+            if pair.gap is not None:
+                pair_attrs["gap"] = str(pair.gap)
+            
+            # Add any extension attributes
+            if pair.extensions:
+                pair_attrs.update({k: str(v) for k, v in pair.extensions.items()})
+            
+            ET.SubElement(contact, "pair", pair_attrs)
 
     def _write_pretty_xml(self, root: ET.Element, output_path: str | Path) -> None:
         """Write XML with pretty formatting."""

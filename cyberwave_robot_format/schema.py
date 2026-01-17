@@ -207,6 +207,9 @@ class Collision:
     name: str | None = None
     pose: Pose = field(default_factory=Pose)
     geometry: Geometry | None = None
+    
+    # Collision group reference (defined in CollisionConfig.groups)
+    group: str = "default"
 
     # Contact properties
     mu_static: float | None = None
@@ -404,6 +407,73 @@ class Scene:
 
 
 @dataclass
+class CollisionGroup:
+    """Named collision group with MuJoCo-style bitmask properties.
+    
+    Groups are defined in CollisionConfig and referenced by Collision.group.
+    """
+    
+    name: str
+    contype: int = 1        # Bitmask: what collision type(s) this group belongs to
+    conaffinity: int = 1    # Bitmask: what collision type(s) this group collides with
+    # To disable collisions, set both contype=0 and conaffinity=0
+
+
+@dataclass
+class CollisionExclude:
+    """Exclude all collisions between two bodies (links).
+    
+    Maps to MuJoCo <contact><exclude body1="..." body2="..."/></contact>
+    """
+    
+    body1: str  # Link name
+    body2: str  # Link name
+
+
+@dataclass
+class CollisionPair:
+    """Explicit geom-pair collision with optional contact overrides.
+    
+    Maps to MuJoCo <contact><pair geom1="..." geom2="..." .../></contact>
+    
+    Note: Bypasses parent-child filtering and contype/conaffinity checks.
+    Geoms must be on different bodies (same-body collisions not allowed).
+    """
+    
+    geom1: str  # Collision name (Collision.name) or link__collision format
+    geom2: str  # Collision name (Collision.name) or link__collision format
+    
+    # Optional contact property overrides for this pair
+    friction: list[float] | None = None      # [sliding, torsional, rolling]
+    solref: list[float] | None = None        # [timeconst, dampratio]
+    solimp: list[float] | None = None        # [dmin, dmax, width, mid, power]
+    condim: int | None = None                # Contact dimensionality (1, 3, 4, 6)
+    margin: float | None = None              # Distance margin for contact detection
+    gap: float | None = None                 # Initial gap between geoms
+    
+    extensions: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CollisionConfig:
+    """World-level collision configuration.
+    
+    Defines collision groups, body-level exclusions, and explicit geom pairs.
+    """
+    
+    # Named collision groups (e.g., "default", "ROBOT", "ENV")
+    groups: dict[str, CollisionGroup] = field(default_factory=dict)
+    
+    # Body-level exclusions (e.g., adjacent links, self-collision suppression)
+    excludes: list[CollisionExclude] = field(default_factory=list)
+    
+    # Explicit geom pairs with optional contact overrides
+    pairs: list[CollisionPair] = field(default_factory=list)
+    
+    extensions: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class Metadata:
     """Robot model metadata."""
 
@@ -444,6 +514,7 @@ class CommonSchema:
     metadata: Metadata
     physics: Physics | None = None
     scene: Scene | None = None
+    collision_config: CollisionConfig | None = None
     links: list[Link] = field(default_factory=list)
     joints: list[Joint] = field(default_factory=list)
     actuators: list[Actuator] = field(default_factory=list)
@@ -452,6 +523,30 @@ class CommonSchema:
 
     # Global extensions for format-specific features
     extensions: dict[str, Any] = field(default_factory=dict)
+
+    def add_cyberwave_metadata(self, twin_uuid: str, asset_uuid: str | None, instance_name: str, root_link: str | None) -> None:
+        """Add Cyberwave-specific metadata for a twin instance.
+        
+        This metadata tracks the mapping between schema components and high-level
+        Cyberwave entities (Twin/Asset).
+        
+        Args:
+            twin_uuid: UUID of the Twin
+            asset_uuid: UUID of the Asset (if derived from an asset)
+            instance_name: Schema namespacing prefix used for this instance
+            root_link: Name of the root link for this instance (namespaced)
+        """
+        if "cyberwave" not in self.extensions:
+            self.extensions["cyberwave"] = {"twins": {}}
+        
+        if "twins" not in self.extensions["cyberwave"]:
+            self.extensions["cyberwave"]["twins"] = {}
+            
+        self.extensions["cyberwave"]["twins"][twin_uuid] = {
+            "asset_uuid": asset_uuid,
+            "instance_name": instance_name,
+            "root_link": root_link
+        }
 
     def get_link(self, name: str) -> Link | None:
         """Get link by name."""
@@ -591,7 +686,7 @@ class CommonSchema:
             instance_name: Prefix for all names from `other` (must match [A-Za-z0-9_]+)
             spawn_pose: Pose for spawning the merged robot in world frame (always required)
             fixed_base: If True, creates FIXED joint (robot bolted in place).
-                       If False, creates FREE joint (6-DOF mobile robot like wheeled platform/drone)
+                       If False, creates FLOATING joint (6-DOF mobile robot like wheeled platform/drone)
 
         Raises:
             ValueError: If instance_name is invalid, or if other has 0 or >1 root links
@@ -665,6 +760,40 @@ class CommonSchema:
             contact.name = prefixed(contact.name)
             contact.link = prefixed(contact.link)
 
+        # Merge collision_config with prefixing
+        if other_copy.collision_config:
+            # Ensure self has collision_config
+            if self.collision_config is None:
+                self.collision_config = CollisionConfig()
+            
+            # Merge groups (copy without prefixing group names - they're global identifiers)
+            for group_name, group in other_copy.collision_config.groups.items():
+                if group_name not in self.collision_config.groups:
+                    self.collision_config.groups[group_name] = group
+            
+            # Merge excludes with prefixed body names
+            for exclude in other_copy.collision_config.excludes:
+                prefixed_exclude = CollisionExclude(
+                    body1=prefixed(exclude.body1),
+                    body2=prefixed(exclude.body2)
+                )
+                self.collision_config.excludes.append(prefixed_exclude)
+            
+            # Merge pairs with prefixed geom names
+            for pair in other_copy.collision_config.pairs:
+                prefixed_pair = CollisionPair(
+                    geom1=prefixed(pair.geom1),
+                    geom2=prefixed(pair.geom2),
+                    friction=pair.friction,
+                    solref=pair.solref,
+                    solimp=pair.solimp,
+                    condim=pair.condim,
+                    margin=pair.margin,
+                    gap=pair.gap,
+                    extensions=pair.extensions
+                )
+                self.collision_config.pairs.append(prefixed_pair)
+        
         # Append all entities to self
         self.links.extend(other_copy.links)
         self.joints.extend(other_copy.joints)
@@ -675,7 +804,7 @@ class CommonSchema:
         # Add spawn joint (always required)
         spawn_joint = Joint(
             name=prefixed("spawn"),
-            type=JointType.FIXED if fixed_base else JointType.FREE,
+            type=JointType.FIXED if fixed_base else JointType.FLOATING,
             parent_link="world",
             child_link=prefixed(root_link.name),
             pose=spawn_pose,

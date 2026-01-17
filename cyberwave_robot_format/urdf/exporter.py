@@ -36,20 +36,22 @@ class URDFExporter(BaseExporter):
         return "urdf"
 
     def export(self, schema: CommonSchema, output_path: str | Path) -> None:
-        """Export common schema to URDF format."""
-        # Validate that all joint parent/child links exist
-        link_names = {link.name for link in schema.links}
-        for joint in schema.joints:
-            if joint.parent_link not in link_names:
-                raise ValueError(
-                    f"Joint '{joint.name}' references non-existent parent link '{joint.parent_link}'"
-                )
-            if joint.child_link not in link_names:
-                raise ValueError(
-                    f"Joint '{joint.name}' references non-existent child link '{joint.child_link}'"
-                )
-
+        """Export common schema to URDF format.
+        
+        Handles special cases:
+        - If any joint has parent_link='world', a world link is automatically injected
+        - JointType.FREE is mapped to URDF 'floating' joint type
+        """
         robot = ET.Element("robot", name=schema.metadata.name)
+
+        # Check if we need to inject a world link
+        needs_world_link = any(j.parent_link == "world" for j in schema.joints)
+        has_world_link = any(link.name == "world" for link in schema.links)
+
+        if needs_world_link and not has_world_link:
+            # Inject an empty world link
+            ET.SubElement(robot, "link", name="world")
+            logger.info("Injected world link for joints with parent_link='world'")
 
         for link in schema.links:
             self._add_link(robot, link)
@@ -91,7 +93,10 @@ class URDFExporter(BaseExporter):
             self._add_collision(link_elem, collision)
 
     def _add_joint(self, robot: ET.Element, joint: Joint) -> None:
-        """Add joint element to URDF."""
+        """Add joint element to URDF.
+        
+        JointType.FLOATING maps to URDF 'floating' type for mobile/floating base robots.
+        """
         type_mapping = {
             JointType.REVOLUTE: "revolute",
             JointType.CONTINUOUS: "continuous",
@@ -99,8 +104,8 @@ class URDFExporter(BaseExporter):
             JointType.FIXED: "fixed",
             JointType.FLOATING: "floating",
             JointType.PLANAR: "planar",
-            JointType.SPHERICAL: "continuous",  # URDF approximation
-            JointType.UNIVERSAL: "continuous",  # URDF approximation
+            JointType.SPHERICAL: "continuous",  # Approximate spherical as continuous
+            JointType.UNIVERSAL: "continuous",  # Approximate universal as continuous
         }
 
         urdf_type = type_mapping.get(joint.type, "fixed")
@@ -182,6 +187,15 @@ class URDFExporter(BaseExporter):
 
         elif geometry.type == GeometryType.SPHERE:
             ET.SubElement(geom_elem, "sphere", radius=str(geometry.radius or 1.0))
+
+        elif geometry.type == GeometryType.PLANE:
+            # URDF doesn't have native plane support, represent as thin box
+            if geometry.size:
+                size = geometry.size
+                ET.SubElement(geom_elem, "box", size=f"{size.x} {size.y} {size.z}")
+            else:
+                # Default 10x10m plane with 1cm thickness
+                ET.SubElement(geom_elem, "box", size="10 10 0.01")
 
         elif geometry.type == GeometryType.MESH:
             mesh_attrs = {}

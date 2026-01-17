@@ -32,71 +32,14 @@ from cyberwave_robot_format.schema import (
 from cyberwave_robot_format.urdf import URDFExporter
 
 
-class TestURDFExporterLinkValidation:
-    """Tests for link validation in URDFExporter."""
+class TestURDFExporterWorldLink:
+    """Tests for world link injection in URDFExporter."""
 
-    def test_error_when_joint_references_nonexistent_parent_link(self):
-        """Test that an error is raised when a joint references a non-existent parent link."""
+    def test_world_link_injected_when_joint_references_world(self):
+        """Test that a world link is automatically injected when a joint has parent_link='world'."""
         schema = CommonSchema(
             metadata=Metadata(name="test_robot"),
             links=[
-                Link(name="base_link", mass=1.0),
-            ],
-            joints=[
-                Joint(
-                    name="world_to_base",
-                    type=JointType.FIXED,
-                    parent_link="world",  # Does not exist
-                    child_link="base_link",
-                    pose=Pose(position=Vector3(x=0.0, y=0.0, z=0.0)),
-                ),
-            ],
-        )
-
-        with tempfile.NamedTemporaryFile(suffix=".urdf", delete=False) as f:
-            output_path = f.name
-
-        try:
-            exporter = URDFExporter()
-            with pytest.raises(ValueError, match="non-existent parent link 'world'"):
-                exporter.export(schema, output_path)
-        finally:
-            Path(output_path).unlink(missing_ok=True)
-
-    def test_error_when_joint_references_nonexistent_child_link(self):
-        """Test that an error is raised when a joint references a non-existent child link."""
-        schema = CommonSchema(
-            metadata=Metadata(name="test_robot"),
-            links=[
-                Link(name="base_link", mass=1.0),
-            ],
-            joints=[
-                Joint(
-                    name="base_to_missing",
-                    type=JointType.FIXED,
-                    parent_link="base_link",
-                    child_link="missing_link",  # Does not exist
-                    pose=Pose(position=Vector3(x=0.0, y=0.0, z=0.0)),
-                ),
-            ],
-        )
-
-        with tempfile.NamedTemporaryFile(suffix=".urdf", delete=False) as f:
-            output_path = f.name
-
-        try:
-            exporter = URDFExporter()
-            with pytest.raises(ValueError, match="non-existent child link 'missing_link'"):
-                exporter.export(schema, output_path)
-        finally:
-            Path(output_path).unlink(missing_ok=True)
-
-    def test_valid_export_when_all_links_exist(self):
-        """Test that export succeeds when all referenced links exist."""
-        schema = CommonSchema(
-            metadata=Metadata(name="test_robot"),
-            links=[
-                Link(name="world", mass=0.0),
                 Link(name="base_link", mass=1.0),
             ],
             joints=[
@@ -121,10 +64,94 @@ class TestURDFExporterLinkValidation:
             tree = ET.parse(output_path)
             root = tree.getroot()
 
-            # Check both links exist
-            links = root.findall("link")
-            link_names = {link.get("name") for link in links}
-            assert link_names == {"world", "base_link"}
+            # Check that world link exists
+            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            assert len(world_links) == 1, "World link should be injected"
+
+            # Check that base_link also exists
+            base_links = [link for link in root.findall("link") if link.get("name") == "base_link"]
+            assert len(base_links) == 1, "base_link should exist"
+
+            # Check the joint references world correctly
+            joints = root.findall("joint")
+            assert len(joints) == 1
+            joint = joints[0]
+            assert joint.find("parent").get("link") == "world"
+            assert joint.find("child").get("link") == "base_link"
+
+        finally:
+            Path(output_path).unlink(missing_ok=True)
+
+    def test_world_link_not_duplicated_when_already_in_schema(self):
+        """Test that world link is not duplicated if it already exists in the schema."""
+        schema = CommonSchema(
+            metadata=Metadata(name="test_robot"),
+            links=[
+                Link(name="world", mass=0.0),  # World link already in schema
+                Link(name="base_link", mass=1.0),
+            ],
+            joints=[
+                Joint(
+                    name="world_to_base",
+                    type=JointType.FIXED,
+                    parent_link="world",
+                    child_link="base_link",
+                    pose=Pose(position=Vector3(x=0.0, y=0.0, z=0.0)),
+                ),
+            ],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".urdf", delete=False) as f:
+            output_path = f.name
+
+        try:
+            exporter = URDFExporter()
+            exporter.export(schema, output_path)
+
+            # Parse the generated URDF
+            tree = ET.parse(output_path)
+            root = tree.getroot()
+
+            # Check that only one world link exists (not duplicated)
+            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            assert len(world_links) == 1, "World link should not be duplicated"
+
+        finally:
+            Path(output_path).unlink(missing_ok=True)
+
+    def test_no_world_link_when_not_needed(self):
+        """Test that world link is not injected when no joint references it."""
+        schema = CommonSchema(
+            metadata=Metadata(name="test_robot"),
+            links=[
+                Link(name="base_link", mass=1.0),
+                Link(name="link1", mass=0.5),
+            ],
+            joints=[
+                Joint(
+                    name="base_to_link1",
+                    type=JointType.REVOLUTE,
+                    parent_link="base_link",
+                    child_link="link1",
+                    pose=Pose(position=Vector3(x=0.0, y=0.0, z=0.1)),
+                ),
+            ],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".urdf", delete=False) as f:
+            output_path = f.name
+
+        try:
+            exporter = URDFExporter()
+            exporter.export(schema, output_path)
+
+            # Parse the generated URDF
+            tree = ET.parse(output_path)
+            root = tree.getroot()
+
+            # Check that no world link exists
+            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            assert len(world_links) == 0, "World link should not be injected"
 
         finally:
             Path(output_path).unlink(missing_ok=True)
@@ -189,7 +216,6 @@ class TestURDFExporterJointTypes:
         schema = CommonSchema(
             metadata=Metadata(name="mobile_robot"),
             links=[
-                Link(name="world", mass=0.0),
                 Link(name="base_link", mass=10.0),
             ],
             joints=[
@@ -213,6 +239,10 @@ class TestURDFExporterJointTypes:
             # Parse the generated URDF
             tree = ET.parse(output_path)
             root = tree.getroot()
+
+            # Check world link is injected
+            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            assert len(world_links) == 1
 
             # Check joint is floating type
             joints = root.findall("joint")
