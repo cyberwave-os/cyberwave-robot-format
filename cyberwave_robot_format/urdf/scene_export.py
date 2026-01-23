@@ -118,6 +118,8 @@ def export_urdf_zip(
                         src_path = original_path
                     else:
                         # Try in provided mesh_base_dirs
+                        # For URDF-relative paths (e.g., "meshes/foo.stl"), we need to
+                        # resolve them relative to each base directory
                         search_dirs = list(mesh_base_dirs or [])
                         # Also check /tmp/mujoco_converted_meshes
                         mujoco_mesh_dir = Path("/tmp/mujoco_converted_meshes")
@@ -160,28 +162,7 @@ def export_urdf_zip(
         # Export URDF
         urdf_path = temp_path / "scene.urdf"
         exporter = URDFExporter()
-        
-        # #region agent log
-        import json
-        import os
-        log_path = '/app/tmp/debug.log'
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        cube_link = next((l for l in schema.links if 'attached_cube' in l.name), None)
-        with open(log_path, 'a') as f:
-            f.write(json.dumps({"location":"scene_export.py:142","message":"Before URDF export","data":{"cube_link_exists":cube_link is not None,"cube_link_name":cube_link.name if cube_link else None,"cube_visuals_count":len(cube_link.visuals) if cube_link else 0,"cube_collisions_count":len(cube_link.collisions) if cube_link else 0,"cube_visual_geometry_type":cube_link.visuals[0].geometry.type.value if cube_link and cube_link.visuals and cube_link.visuals[0].geometry else None,"total_links":len(schema.links)},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","runId":"initial","hypothesisId":"B"}) + '\n')
-        # #endregion
-        
         exporter.export(schema, str(urdf_path))
-        
-        # #region agent log
-        log_path = '/app/tmp/debug.log'
-        with open(urdf_path, 'r') as urdf_file:
-            urdf_content = urdf_file.read()
-            cube_in_urdf = 'attached_cube' in urdf_content
-            cube_visual_in_urdf = 'attached_cube' in urdf_content and '<visual>' in urdf_content[urdf_content.find('attached_cube'):urdf_content.find('attached_cube')+500] if 'attached_cube' in urdf_content else False
-        with open(log_path, 'a') as f:
-            f.write(json.dumps({"location":"scene_export.py:143","message":"After URDF export","data":{"cube_in_urdf":cube_in_urdf,"cube_visual_in_urdf":cube_visual_in_urdf,"urdf_file_size":len(urdf_content)},"timestamp":__import__('time').time()*1000,"sessionId":"debug-session","runId":"initial","hypothesisId":"B"}) + '\n')
-        # #endregion
 
         # Create ZIP file
         zip_path = temp_path / "scene_urdf.zip"
