@@ -289,6 +289,13 @@ class Joint:
     safety_controller: dict[str, float] | None = None
     calibration: dict[str, float] | None = None
 
+    # Default position
+    home_position: float | None = None
+    """Default position of the joint.
+    
+    In meters for prismatic joints, in radians for revolute joints.
+    """
+
     # Format-specific extensions
     extensions: dict[str, Any] = field(default_factory=dict)
 
@@ -524,30 +531,6 @@ class CommonSchema:
     # Global extensions for format-specific features
     extensions: dict[str, Any] = field(default_factory=dict)
 
-    def add_cyberwave_metadata(self, twin_uuid: str, asset_uuid: str | None, instance_name: str, root_link: str | None) -> None:
-        """Add Cyberwave-specific metadata for a twin instance.
-        
-        This metadata tracks the mapping between schema components and high-level
-        Cyberwave entities (Twin/Asset).
-        
-        Args:
-            twin_uuid: UUID of the Twin
-            asset_uuid: UUID of the Asset (if derived from an asset)
-            instance_name: Schema namespacing prefix used for this instance
-            root_link: Name of the root link for this instance (namespaced)
-        """
-        if "cyberwave" not in self.extensions:
-            self.extensions["cyberwave"] = {"twins": {}}
-        
-        if "twins" not in self.extensions["cyberwave"]:
-            self.extensions["cyberwave"]["twins"] = {}
-            
-        self.extensions["cyberwave"]["twins"][twin_uuid] = {
-            "asset_uuid": asset_uuid,
-            "instance_name": instance_name,
-            "root_link": root_link
-        }
-
     def get_link(self, name: str) -> Link | None:
         """Get link by name."""
         for link in self.links:
@@ -577,6 +560,31 @@ class CommonSchema:
         """
         child_links = {joint.child_link for joint in self.joints if joint.parent_link != "world"}
         return [link for link in self.links if link.name not in child_links]
+
+    def get_single_root_link(self) -> Link:
+        """Get the single canonical root link for this schema.
+        
+        This enforces the invariant that valid asset schemas have exactly one
+        root link. Callers that rely on a well-defined base link (e.g. when
+        composing robots into scenes) must use this helper instead of
+        interpreting ``get_root_links()`` themselves.
+        
+        Raises:
+            ValueError: If there are 0 or more than 1 root links.
+        """
+        roots = self.get_root_links()
+        if len(roots) == 0:
+            raise ValueError(
+                f"Schema {self.metadata.name!r} has no root links "
+                "(possible kinematic loop or malformed model)."
+            )
+        if len(roots) > 1:
+            root_names = [link.name for link in roots]
+            raise ValueError(
+                f"Schema {self.metadata.name!r} has multiple root links: {root_names}. "
+                "Expected exactly one canonical root link."
+            )
+        return roots[0]
 
     def get_kinematic_tree(self) -> dict[str, list[str]]:
         """Get kinematic tree structure as parent->children mapping."""
@@ -668,11 +676,11 @@ class CommonSchema:
         return converter.structure(data, cls)
 
     def merge_in(
-        self, 
-        other: CommonSchema, 
-        instance_name: str, 
+        self,
+        other: CommonSchema,
+        instance_name: str,
         spawn_pose: Pose,
-        fixed_base: bool = True
+        fixed_base: bool = True,
     ) -> None:
         """Merge another schema into this one with deterministic namespacing.
 
@@ -689,7 +697,8 @@ class CommonSchema:
                        If False, creates FLOATING joint (6-DOF mobile robot like wheeled platform/drone)
 
         Raises:
-            ValueError: If instance_name is invalid, or if other has 0 or >1 root links
+            ValueError: If instance_name is invalid, or if ``other`` does not have
+                exactly one root link.
 
         Example:
             >>> scene = CommonSchema(metadata=Metadata(name="scene"))
@@ -711,17 +720,8 @@ class CommonSchema:
         if not re.match(r"^[A-Za-z0-9_]+$", instance_name):
             raise ValueError(f"instance_name must match [A-Za-z0-9_]+, got: {instance_name!r}")
 
-        # Determine root link for spawn joint
-        root_links = other.get_root_links()
-        if len(root_links) == 0:
-            raise ValueError(f"Cannot merge schema with 0 root links (possible kinematic loop in {other.metadata.name})")
-        if len(root_links) > 1:
-            root_names = [link.name for link in root_links]
-            raise ValueError(
-                f"Cannot merge schema with multiple root links: {root_names}. "
-                f"Please ensure the schema has a single root link or manually specify the root."
-            )
-        root_link = root_links[0]
+        # Determine root link for spawn joint (must be unique)
+        root_link = other.get_single_root_link()
 
         # Deep copy to avoid mutating the original
         other_copy = deepcopy(other)
