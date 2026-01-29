@@ -27,6 +27,8 @@ from cyberwave_robot_format.core import BaseParser, ParseContext, ParseError
 from cyberwave_robot_format.mesh import resolve_mesh_uri
 from cyberwave_robot_format.schema import (
     Collision,
+    CollisionConfig,
+    CollisionGroup,
     CommonSchema,
     Geometry,
     GeometryType,
@@ -191,8 +193,20 @@ class URDFParser(BaseParser):
 
         sensors = self._parse_urdf_sensors(root, context)
 
+        # Initialize collision_config with default group
+        collision_config = CollisionConfig(
+            groups={
+                "default": CollisionGroup(
+                    name="default",
+                    contype=1,
+                    conaffinity=1
+                )
+            }
+        )
+
         schema = CommonSchema(
             metadata=metadata,
+            collision_config=collision_config,
             links=links,
             joints=joints,
             sensors=sensors,

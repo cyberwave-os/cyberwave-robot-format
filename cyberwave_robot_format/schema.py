@@ -60,12 +60,12 @@ class GeometryType(Enum):
 class ActuatorType(Enum):
     """Supported actuator models."""
 
-    DC_MOTOR = "dc_motor"
-    SERVO = "servo"
-    VELOCITY = "velocity"
-    POSITION = "position"
-    TORQUE = "torque"
-    MUSCLE = "muscle"  # MJCF specific
+    DC_MOTOR = "dc_motor"  # Direct torque control
+    SERVO = "servo"  # PD control
+    VELOCITY = "velocity"  # Velocity damping control
+    POSITION = "position"  # PD control
+    TORQUE = "torque"  # Direct torque control
+    MUSCLE = "muscle"  # Biomechanical muscle model
 
 
 @dataclass

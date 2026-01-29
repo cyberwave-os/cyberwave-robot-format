@@ -2,17 +2,7 @@
 
 import pytest
 
-from cyberwave_robot_format.schema import (
-    CommonSchema,
-    Geometry,
-    GeometryType,
-    Joint,
-    JointType,
-    Link,
-    Metadata,
-    Pose,
-    Vector3,
-)
+from cyberwave_robot_format.schema import CommonSchema, Joint, JointType, Link, Metadata, Vector3
 
 
 def test_schema_validation_valid():
@@ -103,6 +93,76 @@ def test_schema_get_root_links():
     root_links = schema.get_root_links()
     assert len(root_links) == 1
     assert root_links[0].name == "base_link"
+
+
+def test_schema_get_single_root_link_success():
+    """get_single_root_link returns the single canonical root."""
+    metadata = Metadata(name="test_robot")
+    link1 = Link(name="base_link", mass=1.0)
+    link2 = Link(name="link1", mass=0.5)
+    joint = Joint(
+        name="joint1",
+        type=JointType.REVOLUTE,
+        parent_link="base_link",
+        child_link="link1",
+    )
+
+    schema = CommonSchema(
+        metadata=metadata,
+        links=[link1, link2],
+        joints=[joint],
+    )
+
+    root = schema.get_single_root_link()
+    assert root.name == "base_link"
+
+
+def test_schema_get_single_root_link_errors():
+    """get_single_root_link fails for 0 or multiple roots."""
+    # No roots (kinematic loop)
+    metadata = Metadata(name="loop_robot")
+    link1 = Link(name="l1")
+    link2 = Link(name="l2")
+    joint1 = Joint(
+        name="j1",
+        type=JointType.REVOLUTE,
+        parent_link="l1",
+        child_link="l2",
+    )
+    joint2 = Joint(
+        name="j2",
+        type=JointType.REVOLUTE,
+        parent_link="l2",
+        child_link="l1",
+    )
+    loop_schema = CommonSchema(
+        metadata=metadata,
+        links=[link1, link2],
+        joints=[joint1, joint2],
+    )
+
+    with pytest.raises(ValueError, match="no root links"):
+        loop_schema.get_single_root_link()
+
+    # Multiple roots
+    metadata_multi = Metadata(name="multi_root_robot")
+    root1 = Link(name="root1")
+    root2 = Link(name="root2")
+    child = Link(name="child")
+    joint = Joint(
+        name="j1",
+        type=JointType.REVOLUTE,
+        parent_link="root1",
+        child_link="child",
+    )
+    multi_schema = CommonSchema(
+        metadata=metadata_multi,
+        links=[root1, root2, child],
+        joints=[joint],
+    )
+
+    with pytest.raises(ValueError, match="multiple root links"):
+        multi_schema.get_single_root_link()
 
 
 def test_schema_to_dict():
