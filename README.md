@@ -72,6 +72,37 @@ exporter = MJCFExporter()
 exporter.export(schema, "output/robot.xml")
 ```
 
+### Cloud-Native Scene Export
+
+Export complete scenes with meshes to ZIP files, supporting cloud storage and in-memory conversion:
+
+```python
+from cyberwave_robot_format.mjcf import export_mujoco_zip_cloud
+from cyberwave_robot_format.urdf import export_urdf_zip_cloud
+
+# Cloud-safe resolver with in-memory DAE→OBJ conversion
+def s3_resolver(filename: str) -> tuple[str, bytes] | None:
+    """Download from S3 and convert in memory."""
+    mesh_bytes = s3.get_object(Bucket='meshes', Key=filename)['Body'].read()
+    
+    if filename.endswith('.dae'):
+        obj_bytes = convert_dae_to_obj_in_memory(mesh_bytes)
+        return (filename.replace('.dae', '.obj'), obj_bytes)
+    
+    return (Path(filename).name, mesh_bytes)
+
+# Export with cloud resolver (mesh_resolver is required)
+mujoco_zip = export_mujoco_zip_cloud(
+    schema,
+    s3_resolver,
+    strict_missing_meshes=True  # Fail fast on missing meshes
+)
+
+urdf_zip = export_urdf_zip_cloud(schema, s3_resolver)
+```
+
+See [`CLOUD_SAFE_EXPORT.md`](CLOUD_SAFE_EXPORT.md) and [`MESH_RESOLVER_GUIDE.md`](MESH_RESOLVER_GUIDE.md) for details.
+
 ## Development
 
 Install in editable mode:

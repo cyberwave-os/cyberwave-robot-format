@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 from cyberwave_robot_format.mjcf.exporter import MJCFExporter
@@ -34,38 +34,68 @@ from cyberwave_robot_format.schema import CommonSchema
 
 logger = logging.getLogger(__name__)
 
+# Type alias for mesh resolver that returns (final_filename, bytes)
+# This allows in-memory conversion: resolve "foo.dae" -> ("foo.obj", obj_bytes)
+MeshResolver = Callable[[str], tuple[str, bytes] | None]
 
-def export_mujoco_zip(
+
+def export_mujoco_zip_cloud(
     schema: CommonSchema,
+    mesh_resolver: MeshResolver,
     output_path: str | Path | None = None,
-    mesh_base_dirs: list[str | Path] | None = None,
+    strict_missing_meshes: bool = False,
 ) -> bytes:
-    """Export a CommonSchema to a complete MuJoCo ZIP file.
+    """Export a CommonSchema to a complete MuJoCo ZIP file (cloud-native).
+    
+    This is a cloud-native implementation requiring a mesh_resolver.
+    No filesystem access is performed - all meshes must be provided via the resolver.
 
     This function exports a composed CommonSchema (which may contain multiple
     robots merged via merge_in) to a ZIP file containing:
     - mujoco_scene.xml: The complete MJCF scene
     - assets/: Directory with all required mesh files
 
+    This is a cloud-native implementation that requires mesh_resolver.
+    No filesystem access is performed.
+
     Args:
         schema: CommonSchema to export (may be a composed scene with multiple robots)
+        mesh_resolver: Function that takes a mesh filename and returns:
+                      - tuple[str, bytes]: (final_filename, bytes) for in-memory conversion
+                      - None: mesh not found
+                      Enables cloud-safe in-memory conversion:
+                      resolve "foo.dae" -> ("foo.obj", obj_bytes)
         output_path: Optional path to write the ZIP file. If None, returns bytes only.
-        mesh_base_dirs: Optional list of directories to search for mesh files.
+        strict_missing_meshes: If True, raise FileNotFoundError for any missing meshes.
+                              If False (default), log warnings and continue.
 
     Returns:
         ZIP file contents as bytes
 
     Raises:
         ValueError: If schema validation fails
+        FileNotFoundError: If strict_missing_meshes=True and any meshes are missing
         Exception: If export fails
 
     Example:
-        >>> from cyberwave_robot_format import CommonSchema, Metadata, export_mujoco_zip
+        >>> from cyberwave_robot_format.mjcf import export_mujoco_zip_cloud
         >>> schema = CommonSchema(metadata=Metadata(name="my_scene"))
         >>> # ... add robots via merge_in ...
-        >>> zip_bytes = export_mujoco_zip(schema, "output/scene.zip")
+        >>> 
+        >>> # Cloud-safe in-memory conversion:
+        >>> def my_resolver(filename: str) -> tuple[str, bytes] | None:
+        ...     if filename.endswith('.dae'):
+        ...         dae_bytes = download_from_s3(filename)
+        ...         obj_bytes = convert_dae_to_obj_in_memory(dae_bytes)
+        ...         return (filename.replace('.dae', '.obj'), obj_bytes)
+        ...     return None
+        >>> 
+        >>> zip_bytes = export_mujoco_zip_cloud(schema, my_resolver)
     """
-    # Validate schema
+    # Validate inputs
+    if not callable(mesh_resolver):
+        raise ValueError("mesh_resolver must be a callable function")
+    
     errors = schema.validate()
     if errors:
         raise ValueError(f"Schema validation failed: {', '.join(errors)}")
@@ -94,60 +124,76 @@ def export_mujoco_zip(
             compiler = ET.Element("compiler", angle="radian", assetdir="assets")
             root.insert(0, compiler)
 
+        # Build mesh rewrite map to avoid collisions in composed scenes
+        mesh_rewrite_map: dict[str, str] = {}  # original_mesh_file -> unique_asset_name
+        mesh_counter: dict[str, int] = {}  # basename -> count for deduplication
+        missing_meshes: list[str] = []
+
         # Collect and copy mesh files
         asset_elem = root.find("asset")
         if asset_elem is not None:
             for mesh_elem in asset_elem.findall("mesh"):
                 mesh_file = mesh_elem.get("file")
-                if mesh_file:
-                    mesh_path = Path(mesh_file)
-                    src_path = None
+                if not mesh_file:
+                    continue
+
+                # Skip if already processed (deduplication)
+                if mesh_file in mesh_rewrite_map:
+                    mesh_elem.set("file", mesh_rewrite_map[mesh_file])
+                    logger.debug(f"Reusing existing mesh: {mesh_file} -> {mesh_rewrite_map[mesh_file]}")
+                    continue
+
+                mesh_path = Path(mesh_file)
+                final_filename = None
+                mesh_bytes = None
+                
+                # Resolve mesh via mesh_resolver (cloud-native)
+                if mesh_resolver:
+                    logger.debug(f"Trying mesh_resolver for: {mesh_file}")
+                    result = mesh_resolver(mesh_file)
                     
-                    # Handle absolute paths
-                    if mesh_path.is_absolute() and mesh_path.exists():
-                        src_path = mesh_path
-                    else:
-                        # Try in provided mesh_base_dirs
-                        search_dirs = list(mesh_base_dirs or []) + [temp_path]
-                        for base_dir in search_dirs:
-                            candidate = Path(base_dir) / mesh_file
-                            if candidate.exists():
-                                src_path = candidate
-                                break
-                        # If not found by path, try searching for filename
-                        if src_path is None:
-                            target_name = mesh_path.name
-                            for base_dir in search_dirs:
-                                base = Path(base_dir)
-                                if base.exists():
-                                    matches = list(base.rglob(target_name))
-                                    if matches:
-                                        src_path = matches[0]
-                                        break
+                    if result is not None:
+                        # Expect tuple: (final_filename, bytes)
+                        final_filename, mesh_bytes = result
+                        logger.debug(f"  Resolved via mesh_resolver: {mesh_file} -> {final_filename} ({len(mesh_bytes)} bytes)")
+                
+                # Process the mesh if we got bytes
+                if mesh_bytes is not None and final_filename is not None:
+                    # Generate unique asset name to avoid collisions
+                    final_path = Path(final_filename)
+                    basename = final_path.stem
+                    extension = final_path.suffix or ".obj"
                     
-                    if src_path and src_path.exists():
-                        # Copy to assets directory
-                        dst_path = assets_dir / src_path.name
-                        if not dst_path.exists():
-                            shutil.copy(src_path, dst_path)
-                        
-                        final_name = src_path.name
-                        
-                        # Convert DAE to OBJ for MuJoCo compatibility
-                        if dst_path.suffix.lower() == ".dae":
-                            try:
-                                from cyberwave_robot_format.mesh import convert_dae_to_obj
-                                obj_path = convert_dae_to_obj(str(dst_path), output_dir=assets_dir)
-                                final_name = Path(obj_path).name
-                                # Remove original DAE
-                                dst_path.unlink()
-                            except Exception as e:
-                                logger.warning(f"Failed to convert DAE to OBJ: {e}")
-                        
-                        # Update XML to reference final filename
-                        mesh_elem.set("file", final_name)
+                    # Handle duplicates
+                    count = mesh_counter.get(basename, 0)
+                    if count > 0:
+                        unique_name = f"{basename}_{count}{extension}"
                     else:
-                        logger.warning(f"Mesh file not found: {mesh_file}")
+                        unique_name = f"{basename}{extension}"
+                    mesh_counter[basename] = count + 1
+                    
+                    # Write to assets directory
+                    dst_path = assets_dir / unique_name
+                    dst_path.write_bytes(mesh_bytes)
+                    logger.debug(f"Wrote mesh to assets: {dst_path}")
+                    
+                    final_asset_name = unique_name
+                    
+                    # Update rewrite map and XML
+                    mesh_rewrite_map[mesh_file] = final_asset_name
+                    mesh_elem.set("file", final_asset_name)
+                    logger.debug(f"Updated XML mesh reference: {mesh_file} -> {final_asset_name}")
+                else:
+                    # Mesh not found
+                    missing_meshes.append(mesh_file)
+                    logger.error(f"Mesh file not found: {mesh_file}")
+                    logger.error(f"  mesh_resolver returned None for this file")
+        
+        # Handle missing meshes
+        if missing_meshes and strict_missing_meshes:
+            raise FileNotFoundError(
+                f"Missing {len(missing_meshes)} mesh file(s): {', '.join(missing_meshes)}"
+            )
 
         # Write updated XML
         tree.write(mjcf_path, encoding="utf-8", xml_declaration=True)
@@ -220,4 +266,4 @@ def export_mujoco_scene_xml(schema: CommonSchema) -> str:
             os.unlink(temp_path)
 
 
-__all__ = ["export_mujoco_zip", "export_mujoco_scene_xml"]
+__all__ = ["export_mujoco_zip_cloud", "export_mujoco_scene_xml"]

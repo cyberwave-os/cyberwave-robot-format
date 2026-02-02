@@ -22,7 +22,10 @@ Used for MuJoCo compatibility, because MuJoCo does not natively support DAE file
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -93,6 +96,70 @@ def convert_dae_to_obj(
     return str(new_filename)
 
 
+def convert_mesh_bytes_to_obj(
+    mesh_bytes: bytes,
+    original_filename: str,
+    scale: Vector3 | None = None,
+) -> bytes:
+    """Convert DAE/STL mesh bytes to OBJ format in-memory.
+    
+    Cloud-safe converter that works with bytes without requiring
+    filesystem access to original mesh files. This function is designed
+    for use in cloud environments where mesh files are stored in object
+    storage (S3, GCS, etc.) rather than on the local filesystem.
+    
+    Args:
+        mesh_bytes: Raw mesh file bytes (DAE, STL, etc.)
+        original_filename: Original filename (used for extension detection)
+        scale: Optional scale to apply to mesh vertices
+    
+    Returns:
+        OBJ format bytes
+        
+    Raises:
+        Exception: If mesh conversion fails
+    
+    Example:
+        >>> dae_bytes = storage.read('model.dae')
+        >>> obj_bytes = convert_mesh_bytes_to_obj(dae_bytes, 'model.dae')
+        >>> storage.write('model.obj', obj_bytes)
+    """
+    # Write to temp file (trimesh requires file path for loading)
+    with tempfile.NamedTemporaryFile(
+        suffix=os.path.splitext(original_filename)[1], 
+        delete=False
+    ) as tmp_in:
+        tmp_in.write(mesh_bytes)
+        tmp_in_path = tmp_in.name
+    
+    try:
+        mesh = trimesh.load(tmp_in_path)
+        
+        # Handle Scene objects (flatten to single mesh)
+        if isinstance(mesh, trimesh.Scene):
+            if len(mesh.geometry) > 0:
+                geom = mesh.dump(concatenate=True)
+            else:
+                geom = trimesh.Trimesh()
+        else:
+            geom = mesh
+        
+        # Apply scale transform if provided
+        if scale:
+            transform = np.eye(4)
+            transform[0, 0] = scale.x
+            transform[1, 1] = scale.y
+            transform[2, 2] = scale.z
+            geom.apply_transform(transform)
+        
+        # Export to OBJ bytes
+        obj_buffer = io.BytesIO()
+        geom.export(obj_buffer, file_type='obj')
+        return obj_buffer.getvalue()
+    finally:
+        os.unlink(tmp_in_path)
+
+
 def get_mesh_lookup_key(filename: str, scale: Vector3 | None) -> tuple[str, tuple[float, float, float]]:
     """Generate a lookup key for mesh asset caching.
 
@@ -107,4 +174,4 @@ def get_mesh_lookup_key(filename: str, scale: Vector3 | None) -> tuple[str, tupl
     return (filename, scale_tuple)
 
 
-__all__ = ["convert_dae_to_obj", "get_mesh_lookup_key"]
+__all__ = ["convert_dae_to_obj", "convert_mesh_bytes_to_obj", "get_mesh_lookup_key"]

@@ -21,11 +21,12 @@ URDF scene ZIP file with all required mesh assets.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
-import shutil
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 from cyberwave_robot_format.schema import CommonSchema, GeometryType
@@ -33,13 +34,21 @@ from cyberwave_robot_format.urdf.exporter import URDFExporter
 
 logger = logging.getLogger(__name__)
 
+# Type alias for mesh resolver that returns (final_filename, bytes)
+# This allows in-memory conversion: resolve "foo.dae" -> ("foo.obj", obj_bytes)
+MeshResolver = Callable[[str], tuple[str, bytes] | None]
 
-def export_urdf_zip(
+
+def export_urdf_zip_cloud(
     schema: CommonSchema,
+    mesh_resolver: MeshResolver,
     output_path: str | Path | None = None,
-    mesh_base_dirs: list[str | Path] | None = None,
+    strict_missing_meshes: bool = False,
 ) -> bytes:
-    """Export a CommonSchema to a complete URDF ZIP file.
+    """Export a CommonSchema to a complete URDF ZIP file (cloud-native).
+    
+    This is a cloud-native implementation requiring a mesh_resolver.
+    No filesystem access is performed - all meshes must be provided via the resolver.
 
     This function exports a composed CommonSchema (which may contain multiple
     robots merged via merge_in) to a ZIP file containing:
@@ -49,29 +58,56 @@ def export_urdf_zip(
     The mesh filenames in the URDF are rewritten to reference the assets/ directory
     with deterministic names to avoid collisions.
 
+    This is a cloud-native implementation that requires mesh_resolver.
+    No filesystem access is performed.
+
+    IMPORTANT: This function does NOT mutate the input schema. It operates on a deep copy.
+
     Args:
         schema: CommonSchema to export (may be a composed scene with multiple robots)
+        mesh_resolver: Function that takes a mesh filename and returns:
+                      - tuple[str, bytes]: (final_filename, bytes) for in-memory conversion
+                      - None: mesh not found
+                      Enables cloud-safe in-memory conversion:
+                      resolve "foo.dae" -> ("foo.obj", obj_bytes)
         output_path: Optional path to write the ZIP file. If None, returns bytes only.
-        mesh_base_dirs: Optional list of directories to search for mesh files.
+        strict_missing_meshes: If True, raise FileNotFoundError for any missing meshes.
+                              If False (default), log warnings and continue.
 
     Returns:
         ZIP file contents as bytes
 
     Raises:
         ValueError: If schema validation fails
+        FileNotFoundError: If strict_missing_meshes=True and any meshes are missing
         Exception: If export fails
 
     Example:
         >>> from cyberwave_robot_format import CommonSchema, Metadata
-        >>> from cyberwave_robot_format.urdf import export_urdf_zip
+        >>> from cyberwave_robot_format.urdf import export_urdf_zip_cloud
         >>> schema = CommonSchema(metadata=Metadata(name="my_scene"))
         >>> # ... add robots via merge_in ...
-        >>> zip_bytes = export_urdf_zip(schema, "output/scene_urdf.zip")
+        >>> 
+        >>> # Cloud-safe in-memory conversion:
+        >>> def my_resolver(filename: str) -> tuple[str, bytes] | None:
+        ...     if filename.endswith('.dae'):
+        ...         dae_bytes = download_from_s3(filename)
+        ...         obj_bytes = convert_dae_to_obj_in_memory(dae_bytes)
+        ...         return (filename.replace('.dae', '.obj'), obj_bytes)
+        ...     return None
+        >>> 
+        >>> zip_bytes = export_urdf_zip_cloud(schema, my_resolver)
     """
-    # Validate schema
+    # Validate inputs
+    if not callable(mesh_resolver):
+        raise ValueError("mesh_resolver must be a callable function")
+    
     errors = schema.validate()
     if errors:
         raise ValueError(f"Schema validation failed: {', '.join(errors)}")
+
+    # Deep copy schema to avoid mutating the original
+    schema_copy = copy.deepcopy(schema)
 
     # Create temporary directory for building the scene
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -82,8 +118,9 @@ def export_urdf_zip(
         # Collect all mesh files and build rewrite map
         mesh_rewrite_map: dict[str, str] = {}  # original_path -> new_relative_path
         mesh_counter: dict[str, int] = {}  # basename -> count for deduplication
+        missing_meshes: list[str] = []
 
-        for link in schema.links:
+        for link in schema_copy.links:
             for geom_container in list(link.visuals) + list(link.collisions):
                 if geom_container.geometry and geom_container.geometry.type == GeometryType.MESH:
                     original_filename = geom_container.geometry.filename
@@ -94,75 +131,65 @@ def export_urdf_zip(
                         # Already processed this mesh
                         continue
 
-                    # Generate deterministic name
-                    original_path = Path(original_filename)
-                    basename = original_path.stem
-                    extension = original_path.suffix or ".obj"
-
-                    # Handle duplicates
-                    count = mesh_counter.get(basename, 0)
-                    if count > 0:
-                        new_name = f"{basename}_{count}{extension}"
-                    else:
-                        new_name = f"{basename}{extension}"
-                    mesh_counter[basename] = count + 1
-
-                    new_relative_path = f"assets/{new_name}"
-                    mesh_rewrite_map[original_filename] = new_relative_path
-
-                    # Copy the mesh file if it exists
-                    src_path = None
+                    # Resolve mesh via mesh_resolver (cloud-native)
+                    final_filename = None
+                    mesh_bytes = None
                     
-                    # Handle absolute paths
-                    if original_path.is_absolute() and original_path.exists():
-                        src_path = original_path
-                    else:
-                        # Try in provided mesh_base_dirs
-                        # For URDF-relative paths (e.g., "meshes/foo.stl"), we need to
-                        # resolve them relative to each base directory
-                        search_dirs = list(mesh_base_dirs or [])
-                        # Also check /tmp/mujoco_converted_meshes
-                        mujoco_mesh_dir = Path("/tmp/mujoco_converted_meshes")
-                        if mujoco_mesh_dir.exists():
-                            search_dirs.append(mujoco_mesh_dir)
+                    if mesh_resolver:
+                        logger.debug(f"Trying mesh_resolver for: {original_filename}")
+                        result = mesh_resolver(original_filename)
                         
-                        for base_dir in search_dirs:
-                            candidate = Path(base_dir) / original_filename
-                            if candidate.exists():
-                                src_path = candidate
-                                break
-                        
-                        # If not found by path, try searching for filename
-                        if src_path is None:
-                            target_name = original_path.name
-                            for base_dir in search_dirs:
-                                base = Path(base_dir)
-                                if base.exists():
-                                    matches = list(base.rglob(target_name))
-                                    if matches:
-                                        src_path = matches[0]
-                                        break
+                        if result is not None:
+                            # Expect tuple: (final_filename, bytes)
+                            final_filename, mesh_bytes = result
+                            logger.debug(f"  Resolved via mesh_resolver: {original_filename} -> {final_filename} ({len(mesh_bytes)} bytes)")
+                    
+                    # Process the mesh if we got bytes
+                    if mesh_bytes is not None and final_filename is not None:
+                        # Generate deterministic name to avoid collisions
+                        final_path = Path(final_filename)
+                        basename = final_path.stem
+                        extension = final_path.suffix or ".obj"
 
-                    if src_path and src_path.exists():
-                        dst_path = assets_dir / new_name
-                        shutil.copy(src_path, dst_path)
-                        logger.debug(f"Copied mesh: {src_path} -> {dst_path}")
+                        # Handle duplicates
+                        count = mesh_counter.get(basename, 0)
+                        if count > 0:
+                            unique_name = f"{basename}_{count}{extension}"
+                        else:
+                            unique_name = f"{basename}{extension}"
+                        mesh_counter[basename] = count + 1
+
+                        new_relative_path = f"assets/{unique_name}"
+                        mesh_rewrite_map[original_filename] = new_relative_path
+
+                        # Write to assets directory
+                        dst_path = assets_dir / unique_name
+                        dst_path.write_bytes(mesh_bytes)
+                        logger.debug(f"Wrote mesh to assets: {dst_path}")
                     else:
-                        logger.warning(f"Mesh file not found: {original_filename}")
+                        # Mesh not found
+                        missing_meshes.append(original_filename)
+                        logger.error(f"Mesh file not found: {original_filename}")
+                        logger.error(f"  mesh_resolver returned None for this file")
 
-        # Create a modified schema with rewritten mesh paths
-        # We need to modify the schema in-place for export
-        for link in schema.links:
+        # Handle missing meshes
+        if missing_meshes and strict_missing_meshes:
+            raise FileNotFoundError(
+                f"Missing {len(missing_meshes)} mesh file(s): {', '.join(missing_meshes)}"
+            )
+
+        # Rewrite mesh paths in the schema copy (not the original!)
+        for link in schema_copy.links:
             for geom_container in list(link.visuals) + list(link.collisions):
                 if geom_container.geometry and geom_container.geometry.type == GeometryType.MESH:
                     original_filename = geom_container.geometry.filename
                     if original_filename and original_filename in mesh_rewrite_map:
                         geom_container.geometry.filename = mesh_rewrite_map[original_filename]
 
-        # Export URDF
+        # Export URDF using the modified copy
         urdf_path = temp_path / "scene.urdf"
         exporter = URDFExporter()
-        exporter.export(schema, str(urdf_path))
+        exporter.export(schema_copy, str(urdf_path))
 
         # Create ZIP file
         zip_path = temp_path / "scene_urdf.zip"
@@ -231,4 +258,4 @@ def export_urdf_scene_xml(schema: CommonSchema) -> str:
             os.unlink(temp_path)
 
 
-__all__ = ["export_urdf_zip", "export_urdf_scene_xml"]
+__all__ = ["export_urdf_zip_cloud", "export_urdf_scene_xml"]

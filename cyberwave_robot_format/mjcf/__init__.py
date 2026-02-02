@@ -5,6 +5,6 @@
 
 from cyberwave_robot_format.mjcf.exporter import MJCFExporter
 from cyberwave_robot_format.mjcf.parser import MJCFParser
-from cyberwave_robot_format.mjcf.scene_export import export_mujoco_zip, export_mujoco_scene_xml
+from cyberwave_robot_format.mjcf.scene_export import export_mujoco_zip_cloud, export_mujoco_scene_xml
 
-__all__ = ["MJCFParser", "MJCFExporter", "export_mujoco_zip", "export_mujoco_scene_xml"]
+__all__ = ["MJCFParser", "MJCFExporter", "export_mujoco_zip_cloud", "export_mujoco_scene_xml"]
