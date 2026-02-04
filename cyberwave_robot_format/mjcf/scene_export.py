@@ -59,7 +59,7 @@ def export_mujoco_zip_cloud(
     No filesystem access is performed.
 
     Args:
-        schema: CommonSchema to export (may be a composed scene with multiple robots)
+        schema: CommonSchema to export
         mesh_resolver: Function that takes a mesh filename and returns:
                       - tuple[str, bytes]: (final_filename, bytes) for in-memory conversion
                       - None: mesh not found
