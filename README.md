@@ -101,8 +101,6 @@ mujoco_zip = export_mujoco_zip_cloud(
 urdf_zip = export_urdf_zip_cloud(schema, s3_resolver)
 ```
 
-See [`CLOUD_SAFE_EXPORT.md`](CLOUD_SAFE_EXPORT.md) and [`MESH_RESOLVER_GUIDE.md`](MESH_RESOLVER_GUIDE.md) for details.
-
 ## Development
 
 Install in editable mode:
