@@ -1,17 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 Mesh URI resolution utilities.
 
@@ -70,7 +56,9 @@ def resolve_mesh_uri(filename: str, base_dir: Path) -> str:
             if resolved:
                 return str(resolved)
         except Exception as exc:  # pragma: no cover
-            logger.debug("Failed to resolve %s via resolve-robotics-uri-py: %s", filename, exc)
+            logger.debug(
+                "Failed to resolve %s via resolve-robotics-uri-py: %s", filename, exc
+            )
 
     if filename.startswith("package://"):
         package_path = filename[len("package://") :]
@@ -79,7 +67,9 @@ def resolve_mesh_uri(filename: str, base_dir: Path) -> str:
         relative_path = parts[1] if len(parts) > 1 else ""
         for root in _package_search_paths(base_dir):
             candidates = [
-                root / package_name / relative_path if package_name else root / relative_path,
+                root / package_name / relative_path
+                if package_name
+                else root / relative_path,
                 root / relative_path,
             ]
             for cand in candidates:
@@ -96,7 +86,9 @@ def resolve_mesh_uri(filename: str, base_dir: Path) -> str:
             try:
                 matches = list(search_dir.rglob(target_name))
                 if matches:
-                    logger.info("Resolved %s via recursive search to %s", filename, matches[0])
+                    logger.info(
+                        "Resolved %s via recursive search to %s", filename, matches[0]
+                    )
                     return str(matches[0])
             except Exception:
                 pass
@@ -125,7 +117,9 @@ def resolve_mesh_uri(filename: str, base_dir: Path) -> str:
                 # Find file with same name
                 matches = list(search_dir.rglob(target_name))
                 if matches:
-                    logger.info("Resolved %s via recursive search to %s", filename, matches[0])
+                    logger.info(
+                        "Resolved %s via recursive search to %s", filename, matches[0]
+                    )
                     return str(matches[0])
             except Exception:
                 pass
@@ -155,7 +149,9 @@ def resolve_mesh_uri(filename: str, base_dir: Path) -> str:
             try:
                 matches = list(search_dir.rglob(target_name))
                 if matches:
-                    logger.info("Resolved %s via recursive search to %s", filename, matches[0])
+                    logger.info(
+                        "Resolved %s via recursive search to %s", filename, matches[0]
+                    )
                     return str(matches[0])
             except Exception:
                 pass

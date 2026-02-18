@@ -1,17 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 Mesh processing utilities.
 
@@ -71,7 +57,12 @@ def convert_dae_to_obj(
     if new_filename.exists():
         return str(new_filename)
 
-    logger.info("Converting DAE to OBJ: %s -> %s (scale=%s).", dae_path, new_filename, scale_tuple)
+    logger.info(
+        "Converting DAE to OBJ: %s -> %s (scale=%s).",
+        dae_path,
+        new_filename,
+        scale_tuple,
+    )
 
     mesh = trimesh.load(dae_path)
 
@@ -102,23 +93,23 @@ def convert_mesh_bytes_to_obj(
     scale: Vector3 | None = None,
 ) -> bytes:
     """Convert DAE/STL mesh bytes to OBJ format in-memory.
-    
+
     Cloud-safe converter that works with bytes without requiring
     filesystem access to original mesh files. This function is designed
     for use in cloud environments where mesh files are stored in object
     storage (S3, GCS, etc.) rather than on the local filesystem.
-    
+
     Args:
         mesh_bytes: Raw mesh file bytes (DAE, STL, etc.)
         original_filename: Original filename (used for extension detection)
         scale: Optional scale to apply to mesh vertices
-    
+
     Returns:
         OBJ format bytes
-        
+
     Raises:
         Exception: If mesh conversion fails
-    
+
     Example:
         >>> dae_bytes = storage.read('model.dae')
         >>> obj_bytes = convert_mesh_bytes_to_obj(dae_bytes, 'model.dae')
@@ -126,15 +117,14 @@ def convert_mesh_bytes_to_obj(
     """
     # Write to temp file (trimesh requires file path for loading)
     with tempfile.NamedTemporaryFile(
-        suffix=os.path.splitext(original_filename)[1], 
-        delete=False
+        suffix=os.path.splitext(original_filename)[1], delete=False
     ) as tmp_in:
         tmp_in.write(mesh_bytes)
         tmp_in_path = tmp_in.name
-    
+
     try:
         mesh = trimesh.load(tmp_in_path)
-        
+
         # Handle Scene objects (flatten to single mesh)
         if isinstance(mesh, trimesh.Scene):
             if len(mesh.geometry) > 0:
@@ -143,7 +133,7 @@ def convert_mesh_bytes_to_obj(
                 geom = trimesh.Trimesh()
         else:
             geom = mesh
-        
+
         # Apply scale transform if provided
         if scale:
             transform = np.eye(4)
@@ -151,16 +141,18 @@ def convert_mesh_bytes_to_obj(
             transform[1, 1] = scale.y
             transform[2, 2] = scale.z
             geom.apply_transform(transform)
-        
+
         # Export to OBJ bytes
         obj_buffer = io.BytesIO()
-        geom.export(obj_buffer, file_type='obj')
+        geom.export(obj_buffer, file_type="obj")
         return obj_buffer.getvalue()
     finally:
         os.unlink(tmp_in_path)
 
 
-def get_mesh_lookup_key(filename: str, scale: Vector3 | None) -> tuple[str, tuple[float, float, float]]:
+def get_mesh_lookup_key(
+    filename: str, scale: Vector3 | None
+) -> tuple[str, tuple[float, float, float]]:
     """Generate a lookup key for mesh asset caching.
 
     Args:

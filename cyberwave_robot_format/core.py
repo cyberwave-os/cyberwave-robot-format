@@ -1,19 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-# Copyright [2021-2025] Thanh Nguyen
-# Copyright [2022-2023] [CNRS, Toward SAS]
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 Core format conversion engine and orchestration classes.
 """
@@ -143,7 +127,10 @@ class ConversionEngine:
 
     def get_supported_formats(self) -> dict[str, list[str]]:
         """Return supported formats for parsing and exporting."""
-        return {"parsers": list(self.parsers.keys()), "exporters": list(self.exporters.keys())}
+        return {
+            "parsers": list(self.parsers.keys()),
+            "exporters": list(self.exporters.keys()),
+        }
 
     def convert(
         self,
@@ -268,32 +255,52 @@ class FormatConverter:
         except ImportError:
             logger.debug("USD support not available (missing pxr module).")
 
-    def convert(self, input_path: str | Path, output_path: str | Path, **kwargs) -> CommonSchema:
+    def convert(
+        self, input_path: str | Path, output_path: str | Path, **kwargs
+    ) -> CommonSchema:
         """Convert between formats using the conversion engine."""
         return self.engine.convert(input_path, output_path, **kwargs)
 
     def urdf_to_sdf(self, urdf_path: str, sdf_path: str) -> CommonSchema:
         """Convert URDF to SDF format."""
-        return self.convert(urdf_path, sdf_path, source_format="urdf", target_format="sdf")
+        return self.convert(
+            urdf_path, sdf_path, source_format="urdf", target_format="sdf"
+        )
 
     def urdf_to_mjcf(self, urdf_path: str, mjcf_path: str) -> CommonSchema:
         """Convert URDF to MJCF format."""
-        return self.convert(urdf_path, mjcf_path, source_format="urdf", target_format="mjcf")
+        return self.convert(
+            urdf_path, mjcf_path, source_format="urdf", target_format="mjcf"
+        )
 
     def sdf_to_urdf(self, sdf_path: str, urdf_path: str) -> CommonSchema:
         """Convert SDF to URDF format."""
-        return self.convert(sdf_path, urdf_path, source_format="sdf", target_format="urdf")
+        return self.convert(
+            sdf_path, urdf_path, source_format="sdf", target_format="urdf"
+        )
 
     def to_schema(self, input_path: str, schema_path: str) -> CommonSchema:
         """Convert any supported format to common schema."""
         return self.convert(input_path, schema_path, target_format="schema")
 
-    def from_schema(self, schema_path: str, output_path: str, target_format: str | None = None) -> CommonSchema:
+    def from_schema(
+        self, schema_path: str, output_path: str, target_format: str | None = None
+    ) -> CommonSchema:
         """Convert from common schema to any supported format."""
-        return self.convert(schema_path, output_path, source_format="schema", target_format=target_format)
+        return self.convert(
+            schema_path,
+            output_path,
+            source_format="schema",
+            target_format=target_format,
+        )
 
     def batch_convert(
-        self, input_dir: str | Path, output_dir: str | Path, source_format: str, target_format: str, pattern: str = "*"
+        self,
+        input_dir: str | Path,
+        output_dir: str | Path,
+        source_format: str,
+        target_format: str,
+        pattern: str = "*",
     ) -> list[Path]:
         """Batch convert files in a directory.
 
@@ -335,12 +342,21 @@ class FormatConverter:
         for input_file in input_files:
             output_file = output_dir / (input_file.stem + target_ext)
             try:
-                self.convert(input_file, output_file, source_format=source_format, target_format=target_format)
+                self.convert(
+                    input_file,
+                    output_file,
+                    source_format=source_format,
+                    target_format=target_format,
+                )
                 converted_files.append(output_file)
             except Exception as e:
                 logger.error("Failed to convert %s: %s.", input_file, e)
 
-        logger.info("Batch conversion complete: %s/%s files converted.", len(converted_files), len(input_files))
+        logger.info(
+            "Batch conversion complete: %s/%s files converted.",
+            len(converted_files),
+            len(input_files),
+        )
         return converted_files
 
     def get_conversion_matrix(self) -> dict[str, list[str]]:

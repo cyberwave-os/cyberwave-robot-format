@@ -1,18 +1,3 @@
-# Copyright [2021-2025] Thanh Nguyen
-# Copyright [2022-2023] [CNRS, Toward SAS]
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 Common schema definition for robot description format conversion.
 
@@ -20,6 +5,7 @@ This module defines a unified intermediate representation that can capture
 the semantics of different robot description formats while preserving
 format-specific information through extensions.
 """
+
 from __future__ import annotations
 import math
 import re
@@ -132,7 +118,10 @@ class Pose:
     @classmethod
     def from_xyzrpy(cls, xyz: list[float], rpy: list[float]) -> "Pose":
         """Create pose from position and RPY orientation."""
-        return cls(position=Vector3.from_list(xyz), orientation=Quaternion.from_rpy(rpy[0], rpy[1], rpy[2]))
+        return cls(
+            position=Vector3.from_list(xyz),
+            orientation=Quaternion.from_rpy(rpy[0], rpy[1], rpy[2]),
+        )
 
 
 @dataclass
@@ -149,7 +138,11 @@ class Inertia:
     def to_matrix(self) -> np.ndarray:
         """Convert to 3x3 inertia matrix."""
         return np.array(
-            [[self.ixx, self.ixy, self.ixz], [self.ixy, self.iyy, self.iyz], [self.ixz, self.iyz, self.izz]]
+            [
+                [self.ixx, self.ixy, self.ixz],
+                [self.ixy, self.iyy, self.iyz],
+                [self.ixz, self.iyz, self.izz],
+            ]
         )
 
 
@@ -207,7 +200,7 @@ class Collision:
     name: str | None = None
     pose: Pose = field(default_factory=Pose)
     geometry: Geometry | None = None
-    
+
     # Collision group reference (defined in CollisionConfig.groups)
     group: str = "default"
 
@@ -416,23 +409,23 @@ class Scene:
 @dataclass
 class CollisionGroup:
     """Named collision group with MuJoCo-style bitmask properties.
-    
+
     Groups are defined in CollisionConfig and referenced by Collision.group.
     """
-    
+
     name: str
-    contype: int = 1        # Bitmask: what collision type(s) this group belongs to
-    conaffinity: int = 1    # Bitmask: what collision type(s) this group collides with
+    contype: int = 1  # Bitmask: what collision type(s) this group belongs to
+    conaffinity: int = 1  # Bitmask: what collision type(s) this group collides with
     # To disable collisions, set both contype=0 and conaffinity=0
 
 
 @dataclass
 class CollisionExclude:
     """Exclude all collisions between two bodies (links).
-    
+
     Maps to MuJoCo <contact><exclude body1="..." body2="..."/></contact>
     """
-    
+
     body1: str  # Link name
     body2: str  # Link name
 
@@ -440,43 +433,43 @@ class CollisionExclude:
 @dataclass
 class CollisionPair:
     """Explicit geom-pair collision with optional contact overrides.
-    
+
     Maps to MuJoCo <contact><pair geom1="..." geom2="..." .../></contact>
-    
+
     Note: Bypasses parent-child filtering and contype/conaffinity checks.
     Geoms must be on different bodies (same-body collisions not allowed).
     """
-    
+
     geom1: str  # Collision name (Collision.name) or link__collision format
     geom2: str  # Collision name (Collision.name) or link__collision format
-    
+
     # Optional contact property overrides for this pair
-    friction: list[float] | None = None      # [sliding, torsional, rolling]
-    solref: list[float] | None = None        # [timeconst, dampratio]
-    solimp: list[float] | None = None        # [dmin, dmax, width, mid, power]
-    condim: int | None = None                # Contact dimensionality (1, 3, 4, 6)
-    margin: float | None = None              # Distance margin for contact detection
-    gap: float | None = None                 # Initial gap between geoms
-    
+    friction: list[float] | None = None  # [sliding, torsional, rolling]
+    solref: list[float] | None = None  # [timeconst, dampratio]
+    solimp: list[float] | None = None  # [dmin, dmax, width, mid, power]
+    condim: int | None = None  # Contact dimensionality (1, 3, 4, 6)
+    margin: float | None = None  # Distance margin for contact detection
+    gap: float | None = None  # Initial gap between geoms
+
     extensions: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class CollisionConfig:
     """World-level collision configuration.
-    
+
     Defines collision groups, body-level exclusions, and explicit geom pairs.
     """
-    
+
     # Named collision groups (e.g., "default", "ROBOT", "ENV")
     groups: dict[str, CollisionGroup] = field(default_factory=dict)
-    
+
     # Body-level exclusions (e.g., adjacent links, self-collision suppression)
     excludes: list[CollisionExclude] = field(default_factory=list)
-    
+
     # Explicit geom pairs with optional contact overrides
     pairs: list[CollisionPair] = field(default_factory=list)
-    
+
     extensions: dict[str, Any] = field(default_factory=dict)
 
 
@@ -554,21 +547,23 @@ class CommonSchema:
 
     def get_root_links(self) -> list[Link]:
         """Get links that are not children of any joint (root links).
-        
+
         Note: Joints with parent_link='world' are excluded from this calculation,
         so their child links are still considered roots.
         """
-        child_links = {joint.child_link for joint in self.joints if joint.parent_link != "world"}
+        child_links = {
+            joint.child_link for joint in self.joints if joint.parent_link != "world"
+        }
         return [link for link in self.links if link.name not in child_links]
 
     def get_single_root_link(self) -> Link:
         """Get the single canonical root link for this schema.
-        
+
         This enforces the invariant that valid asset schemas have exactly one
         root link. Callers that rely on a well-defined base link (e.g. when
         composing robots into scenes) must use this helper instead of
         interpreting ``get_root_links()`` themselves.
-        
+
         Raises:
             ValueError: If there are 0 or more than 1 root links.
         """
@@ -618,20 +613,28 @@ class CommonSchema:
         # Note: 'world' is a special case - it's a valid parent reference but not an actual link
         for joint in self.joints:
             if joint.parent_link != "world" and not self.get_link(joint.parent_link):
-                issues.append(f"Joint {joint.name!r} references unknown parent link: {joint.parent_link}.")
+                issues.append(
+                    f"Joint {joint.name!r} references unknown parent link: {joint.parent_link}."
+                )
             if not self.get_link(joint.child_link):
-                issues.append(f"Joint {joint.name!r} references unknown child link: {joint.child_link}.")
+                issues.append(
+                    f"Joint {joint.name!r} references unknown child link: {joint.child_link}."
+                )
 
         # Check actuator references
         for actuator in self.actuators:
             if not self.get_joint(actuator.joint):
-                issues.append(f"Actuator {actuator.name!r} references unknown joint: {actuator.joint}.")
+                issues.append(
+                    f"Actuator {actuator.name!r} references unknown joint: {actuator.joint}."
+                )
 
         # Check sensor references
         # Note: 'world' is a special case - it's a valid parent reference but not an actual link
         for sensor in self.sensors:
             if sensor.parent_link != "world" and not self.get_link(sensor.parent_link):
-                issues.append(f"Sensor {sensor.name!r} references unknown parent link: {sensor.parent_link}.")
+                issues.append(
+                    f"Sensor {sensor.name!r} references unknown parent link: {sensor.parent_link}."
+                )
 
         # Check for kinematic loops (basic check)
         try:
@@ -705,8 +708,8 @@ class CommonSchema:
             >>> # Fixed-base robot arm
             >>> scene.merge_in(arm_schema, "arm1", spawn_pose=Pose(), fixed_base=True)
             >>> # Mobile wheeled robot
-            >>> scene.merge_in(mobile_schema, "robot1", 
-            ...                spawn_pose=Pose(position=Vector3(2, 0, 0)), 
+            >>> scene.merge_in(mobile_schema, "robot1",
+            ...                spawn_pose=Pose(position=Vector3(2, 0, 0)),
             ...                fixed_base=False)
 
         Note:
@@ -718,7 +721,9 @@ class CommonSchema:
         if not instance_name:
             raise ValueError("instance_name cannot be empty.")
         if not re.match(r"^[A-Za-z0-9_]+$", instance_name):
-            raise ValueError(f"instance_name must match [A-Za-z0-9_]+, got: {instance_name!r}")
+            raise ValueError(
+                f"instance_name must match [A-Za-z0-9_]+, got: {instance_name!r}"
+            )
 
         # Determine root link for spawn joint (must be unique)
         root_link = other.get_single_root_link()
@@ -765,20 +770,19 @@ class CommonSchema:
             # Ensure self has collision_config
             if self.collision_config is None:
                 self.collision_config = CollisionConfig()
-            
+
             # Merge groups (copy without prefixing group names - they're global identifiers)
             for group_name, group in other_copy.collision_config.groups.items():
                 if group_name not in self.collision_config.groups:
                     self.collision_config.groups[group_name] = group
-            
+
             # Merge excludes with prefixed body names
             for exclude in other_copy.collision_config.excludes:
                 prefixed_exclude = CollisionExclude(
-                    body1=prefixed(exclude.body1),
-                    body2=prefixed(exclude.body2)
+                    body1=prefixed(exclude.body1), body2=prefixed(exclude.body2)
                 )
                 self.collision_config.excludes.append(prefixed_exclude)
-            
+
             # Merge pairs with prefixed geom names
             for pair in other_copy.collision_config.pairs:
                 prefixed_pair = CollisionPair(
@@ -790,10 +794,10 @@ class CommonSchema:
                     condim=pair.condim,
                     margin=pair.margin,
                     gap=pair.gap,
-                    extensions=pair.extensions
+                    extensions=pair.extensions,
                 )
                 self.collision_config.pairs.append(prefixed_pair)
-        
+
         # Append all entities to self
         self.links.extend(other_copy.links)
         self.joints.extend(other_copy.joints)

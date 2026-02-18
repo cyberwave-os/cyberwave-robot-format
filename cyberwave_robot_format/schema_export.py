@@ -1,17 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Universal schema JSON export utilities.
 
 This module provides functions for exporting CommonSchema to JSON format.
@@ -60,13 +46,13 @@ def export_universal_schema_json(
 
     # Convert to JSON with pretty printing and sorted keys for determinism
     json_str = json.dumps(schema_dict, sort_keys=True, indent=2, ensure_ascii=False)
-    json_bytes = json_str.encode('utf-8')
+    json_bytes = json_str.encode("utf-8")
 
     # Optionally write to output path
     if output_path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'wb') as f:
+        with open(output_path, "wb") as f:
             f.write(json_bytes)
         logger.info(f"Exported universal schema JSON to {output_path}")
 

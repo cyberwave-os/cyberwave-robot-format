@@ -5,6 +5,7 @@ Universal robot description schema and format converters for Cyberwave.
 ## Overview
 
 This package provides:
+
 - **Universal Schema**: A canonical representation for robotic assets (`CommonSchema`)
 - **Format Importers**: Parse URDF, MJCF into the universal schema
 - **Format Exporters**: Export universal schema to URDF, MJCF
@@ -84,11 +85,11 @@ from cyberwave_robot_format.urdf import export_urdf_zip_cloud
 def s3_resolver(filename: str) -> tuple[str, bytes] | None:
     """Download from S3 and convert in memory."""
     mesh_bytes = s3.get_object(Bucket='meshes', Key=filename)['Body'].read()
-    
+
     if filename.endswith('.dae'):
         obj_bytes = convert_dae_to_obj_in_memory(mesh_bytes)
         return (filename.replace('.dae', '.obj'), obj_bytes)
-    
+
     return (Path(filename).name, mesh_bytes)
 
 # Export with cloud resolver (mesh_resolver is required)
@@ -104,11 +105,23 @@ urdf_zip = export_urdf_zip_cloud(schema, s3_resolver)
 ## Development
 
 Install in editable mode:
+
 ```bash
 pip install -e .
 ```
 
 Run tests:
+
 ```bash
 pytest
 ```
+
+## Acknowledgments
+
+This project incorporates portions of code from
+[https://github.com/thanhndv212/robot_format_converter](Robot Format Converter) (Apache 2.0 licensed).
+
+Original repository:
+https://github.com/thanhndv212/robot_format_converter
+
+We thank the original authors for their work.

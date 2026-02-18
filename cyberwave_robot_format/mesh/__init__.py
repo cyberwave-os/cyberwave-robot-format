@@ -1,6 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-# Licensed under the Apache License, Version 2.0
-
 from cyberwave_robot_format.mesh.processing import (
     convert_dae_to_obj,
     convert_mesh_bytes_to_obj,

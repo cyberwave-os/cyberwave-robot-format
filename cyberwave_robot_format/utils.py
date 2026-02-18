@@ -1,17 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 Utility functions for format detection, validation, and conversion support.
 """
@@ -135,7 +121,9 @@ def validate_schema(schema: CommonSchema) -> None:
     """
     issues = schema.validate()
     if issues:
-        error_msg = "Schema validation failed:\n" + "\n".join(f"  - {issue}" for issue in issues)
+        error_msg = "Schema validation failed:\n" + "\n".join(
+            f"  - {issue}" for issue in issues
+        )
         raise ValueError(error_msg)
 
 
@@ -259,7 +247,9 @@ def sanitize_name(name: str) -> str:
     return sanitized
 
 
-def merge_extensions(base_ext: dict[str, Any], new_ext: dict[str, Any]) -> dict[str, Any]:
+def merge_extensions(
+    base_ext: dict[str, Any], new_ext: dict[str, Any]
+) -> dict[str, Any]:
     """Merge extension dictionaries, handling conflicts appropriately.
 
     Args:
@@ -329,7 +319,14 @@ def compare_schemas(schema1: CommonSchema, schema2: CommonSchema) -> dict[str, A
     Returns:
         Dictionary describing differences between schemas
     """
-    differences = {"metadata": {}, "links": {}, "joints": {}, "actuators": {}, "sensors": {}, "summary": {}}
+    differences = {
+        "metadata": {},
+        "links": {},
+        "joints": {},
+        "actuators": {},
+        "sensors": {},
+        "summary": {},
+    }
 
     # Compare counts
     differences["summary"] = {

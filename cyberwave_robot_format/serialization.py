@@ -1,17 +1,3 @@
-# Copyright [2025] Tomáš Macháček <tomasmachacekw@gmail.com>
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-# http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
 Serialization utilities using cattrs for CommonSchema (de)serialization.
 
@@ -66,7 +52,9 @@ def _structure_vector3(val: Any, _: type[Vector3]) -> Vector3:
     if isinstance(val, Vector3):
         return val
     if not isinstance(val, dict):
-        raise TypeError(f"Vector3 must be a dict with x/y/z keys, got {type(val).__name__}")
+        raise TypeError(
+            f"Vector3 must be a dict with x/y/z keys, got {type(val).__name__}"
+        )
     return Vector3(
         x=float(val.get("x", 0.0)),
         y=float(val.get("y", 0.0)),
@@ -86,7 +74,9 @@ def _structure_quaternion(val: Any, _: type[Quaternion]) -> Quaternion:
     if isinstance(val, Quaternion):
         return val
     if not isinstance(val, dict):
-        raise TypeError(f"Quaternion must be a dict with x/y/z/w keys, got {type(val).__name__}")
+        raise TypeError(
+            f"Quaternion must be a dict with x/y/z/w keys, got {type(val).__name__}"
+        )
     return Quaternion(
         x=float(val.get("x", 0.0)),
         y=float(val.get("y", 0.0)),
@@ -112,7 +102,9 @@ def _structure_pose(val: Any, _: type[Pose]) -> Pose:
     if isinstance(val, Pose):
         return val
     if not isinstance(val, dict):
-        raise TypeError(f"Pose must be a dict with position/orientation keys, got {type(val).__name__}")
+        raise TypeError(
+            f"Pose must be a dict with position/orientation keys, got {type(val).__name__}"
+        )
     return Pose(
         position=_structure_vector3(val.get("position"), Vector3),
         orientation=_structure_quaternion(val.get("orientation"), Quaternion),
