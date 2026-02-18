@@ -124,4 +124,14 @@ This project incorporates portions of code from
 Original repository:
 https://github.com/thanhndv212/robot_format_converter
 
-We thank the original authors for their work.
+We thank the original authors for their initial work.
+
+```bibtex
+@software{robot_format_converter,
+author = {Nguyen, Thanh},
+title = {Robot Format Converter: Universal Robot Description Format Converter},
+year = {2025},
+url = {https://github.com/thanhndv212/robot_format_converter},
+version = {1.0.0}
+}
+```
