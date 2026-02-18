@@ -225,7 +225,7 @@ def test_merge_single_root_required():
         ],
     )
     
-    with pytest.raises(ValueError, match="Cannot merge schema with 0 root links"):
+    with pytest.raises(ValueError, match="has no root links"):
         base.merge_in(loop_schema, "loop", spawn_pose=Pose())
     
     # Schema with multiple roots
@@ -237,7 +237,7 @@ def test_merge_single_root_required():
         ],
     )
     
-    with pytest.raises(ValueError, match="Cannot merge schema with multiple root links"):
+    with pytest.raises(ValueError, match="has multiple root links"):
         base.merge_in(multi_root, "multi", spawn_pose=Pose())
 
 
