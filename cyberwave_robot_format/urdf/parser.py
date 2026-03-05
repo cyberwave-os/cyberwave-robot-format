@@ -169,6 +169,13 @@ class URDFParser(BaseParser):
             try:
                 link = self._parse_link(link_elem, context)
                 if link:
+                    if link.name == "world":
+                        logger.debug(
+                            "Skipping 'world' link from URDF '%s' — asset schemas must not "
+                            "contain a world link; the environment schema provides it.",
+                            file_path.name,
+                        )
+                        continue
                     links.append(link)
             except Exception as e:
                 context.add_error(f"Failed to parse link: {e}", link_elem.get("name"))
