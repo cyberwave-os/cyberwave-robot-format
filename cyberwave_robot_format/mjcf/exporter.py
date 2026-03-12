@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from xml.dom import minidom
@@ -181,8 +182,15 @@ class MJCFExporter(BaseExporter):
         actuator_elem = ET.SubElement(mujoco, "actuator")
 
         if schema.actuators:
+            # Build a joint-name → limits lookup so _add_actuator can fall back
+            # to joint limits when no explicit control_range is set on the actuator.
+            joint_limits_map = {
+                j.name: j.limits
+                for j in schema.joints
+                if j.limits is not None
+            }
             for actuator in schema.actuators:
-                self._add_actuator(actuator_elem, actuator)
+                self._add_actuator(actuator_elem, actuator, joint_limits_map)
         else:
             for joint in schema.joints:
                 if joint.type != JointType.FIXED and joint.type != JointType.FLOATING:
@@ -390,9 +398,20 @@ class MJCFExporter(BaseExporter):
                 quat = sensor.pose.orientation
                 cam.set("quat", f"{quat.w} {quat.x} {quat.y} {quat.z}")
 
-        if "hfov" in sensor.parameters:
-            fovy = sensor.parameters.get("fovy", sensor.parameters["hfov"])
-            cam.set("fovy", str(fovy))
+        if "hfov" in sensor.parameters or "fovy" in sensor.parameters:
+            if "fovy" in sensor.parameters:
+                # Explicit fovy supplied — use as-is (assumed degrees)
+                fovy_deg = float(sensor.parameters["fovy"])
+            else:
+                # hfov is stored in radians (SI).  Convert to vertical FOV in
+                # degrees for MuJoCo, accounting for the sensor's aspect ratio.
+                hfov_rad = float(sensor.parameters["hfov"])
+                width  = float(sensor.parameters.get("width",  640))
+                height = float(sensor.parameters.get("height", 480))
+                # hfov → vfov: tan(vfov/2) = tan(hfov/2) * (height/width)
+                vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * height / width)
+                fovy_deg = math.degrees(vfov_rad)
+            cam.set("fovy", str(fovy_deg))
 
     def _add_body_with_joint(
         self,
@@ -622,8 +641,24 @@ class MJCFExporter(BaseExporter):
                     if val is not None:
                         geom.set(key, str(val))
 
-    def _add_actuator(self, actuator_elem: ET.Element, actuator: Actuator) -> None:
-        """Add actuator to actuator section."""
+    def _add_actuator(
+        self,
+        actuator_elem: ET.Element,
+        actuator: Actuator,
+        joint_limits_map: dict | None = None,
+    ) -> None:
+        """Add actuator to actuator section.
+
+        Args:
+            actuator_elem: Parent ``<actuator>`` XML element.
+            actuator: Actuator definition from the universal schema.
+            joint_limits_map: Optional mapping of joint name → ``JointLimits``.
+                Used to set ``ctrlrange`` on position/velocity actuators when
+                the actuator has no explicit ``control_range``.  Without this,
+                MuJoCo defaults the ``ctrlrange`` to ``[0, 0]`` which freezes
+                position-actuated joints and collapses the viewer Ctrl-panel
+                slider to zero width.
+        """
         raw_type = getattr(actuator, "type", None)
         norm = None
         if isinstance(raw_type, str):
@@ -649,8 +684,14 @@ class MJCFExporter(BaseExporter):
 
         if hasattr(actuator, "control_range") and actuator.control_range:
             ctrl_min, ctrl_max = actuator.control_range
-            ctrl_range = f"{ctrl_min} {ctrl_max}"
-            act.set("ctrlrange", ctrl_range)
+            act.set("ctrlrange", f"{ctrl_min} {ctrl_max}")
+        elif act_tag in ("position", "velocity") and joint_limits_map:
+            # Fall back to joint position limits so the actuator's control range
+            # matches the joint's allowed range.  Without this MuJoCo uses [0, 0]
+            # which clips every ctrl command to zero (position actuators frozen).
+            limits = joint_limits_map.get(actuator.joint)
+            if limits is not None and limits.lower is not None and limits.upper is not None:
+                act.set("ctrlrange", f"{limits.lower} {limits.upper}")
 
         if hasattr(actuator, "force_range") and actuator.force_range:
             force_min, force_max = actuator.force_range
