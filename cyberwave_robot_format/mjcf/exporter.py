@@ -211,8 +211,8 @@ class MJCFExporter(BaseExporter):
         if schema.sensors:
             sensor_elem = ET.SubElement(mujoco, "sensor")
             for sensor in schema.sensors:
-                if sensor.type == "camera":
-                    pass
+                if sensor.type in ("camera", "depth_camera"):
+                    pass  # cameras become <camera> elements in the body, not <sensor>
                 else:
                     self._add_sensor(sensor_elem, sensor)
 
@@ -370,7 +370,7 @@ class MJCFExporter(BaseExporter):
 
         if schema.sensors:
             for sensor in schema.sensors:
-                if sensor.type == "camera" and sensor.parent_link == link.name:
+                if sensor.type in ("camera", "depth_camera") and sensor.parent_link == link.name:
                     self._add_camera(body, sensor)
 
         if link.name in link_to_children:
@@ -499,9 +499,9 @@ class MJCFExporter(BaseExporter):
 
         if schema.sensors:
             for sensor in schema.sensors:
-                if sensor.type == "camera" and sensor.parent_link == link.name:
+                if sensor.type in ("camera", "depth_camera") and sensor.parent_link == link.name:
                     self._add_camera(body, sensor)
-                else:
+                elif sensor.type not in ("camera", "depth_camera"):
                     logger.warning("Sensor %s with type %s is not supported.", sensor.name, sensor.type)
 
         if link.name in link_to_children:
