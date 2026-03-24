@@ -703,6 +703,18 @@ class MJCFExporter(BaseExporter):
             act.set("forcerange", f"-{max_torque} {max_torque}")
 
         if actuator.gear_ratio is not None:
+            if act_tag in ("position", "velocity"):
+                import warnings
+                warnings.warn(
+                    f"Actuator '{actuator.name}' has gear_ratio={actuator.gear_ratio} and "
+                    f"act_tag='{act_tag}'. Emitting gear={actuator.gear_ratio}, but note that for "
+                    "position/velocity actuators this divides the controllable joint range by the "
+                    "gear ratio (effective max qpos = ctrlrange_max / gear). Ensure kp/kv/forcerange "
+                    "are in motor-shaft space, or set gear_ratio=None if they are in joint "
+                    "(output-shaft) space.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             act.set("gear", str(actuator.gear_ratio))
 
         if actuator.kp is not None and act_tag == "position":
