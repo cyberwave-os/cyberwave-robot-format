@@ -711,9 +711,6 @@ class MJCFExporter(BaseExporter):
         if actuator.kd is not None and act_tag in ["position", "velocity"]:
             act.set("kv", str(actuator.kd))
 
-        if actuator.max_velocity is not None:
-            act.set("maxvel", str(actuator.max_velocity))
-
     def _add_sensor(self, sensor_elem: ET.Element, sensor: Sensor) -> None:
         """Add sensor entry."""
         sensor_type = sensor.type.lower()
