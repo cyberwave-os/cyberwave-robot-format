@@ -396,18 +396,28 @@ class MJCFExporter(BaseExporter):
                 cam.set("pos", f"{pos.x} {pos.y} {pos.z}")
             if sensor.pose.orientation:
                 quat = sensor.pose.orientation
-                cam.set("quat", f"{quat.w} {quat.x} {quat.y} {quat.z}")
+                # Skip identity to keep MJCF compact; non-identity encodes optical offset.
+                if not (
+                    abs(quat.w - 1.0) < 1e-9
+                    and abs(quat.x) < 1e-9
+                    and abs(quat.y) < 1e-9
+                    and abs(quat.z) < 1e-9
+                ):
+                    cam.set("quat", f"{quat.w} {quat.x} {quat.y} {quat.z}")
 
-        if "hfov" in sensor.parameters or "fovy" in sensor.parameters:
-            if "fovy" in sensor.parameters:
+        params = sensor.parameters or {}
+        if "hfov" in params or "fovy" in params or "fov_degrees" in params:
+            if "fovy" in params:
                 # Explicit fovy supplied — use as-is (assumed degrees)
-                fovy_deg = float(sensor.parameters["fovy"])
+                fovy_deg = float(params["fovy"])
+            elif "fov_degrees" in params:
+                fovy_deg = float(params["fov_degrees"])
             else:
                 # hfov is stored in radians (SI).  Convert to vertical FOV in
                 # degrees for MuJoCo, accounting for the sensor's aspect ratio.
-                hfov_rad = float(sensor.parameters["hfov"])
-                width  = float(sensor.parameters.get("width",  640))
-                height = float(sensor.parameters.get("height", 480))
+                hfov_rad = float(params["hfov"])
+                width  = float(params.get("width",  640))
+                height = float(params.get("height", 480))
                 # hfov → vfov: tan(vfov/2) = tan(hfov/2) * (height/width)
                 vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * height / width)
                 fovy_deg = math.degrees(vfov_rad)
