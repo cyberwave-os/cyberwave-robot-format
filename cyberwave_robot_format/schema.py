@@ -262,6 +262,18 @@ class JointDynamics:
 
 
 @dataclass
+class MimicJoint:
+    """URDF mimic joint constraint — slave joint mirrors driver joint position."""
+
+    joint: str
+    """Name of the driver joint this joint mirrors."""
+    multiplier: float = 1.0
+    """Scale factor: slave_pos = driver_pos * multiplier + offset."""
+    offset: float = 0.0
+    """Constant offset: slave_pos = driver_pos * multiplier + offset."""
+
+
+@dataclass
 class Joint:
     """Robot joint definition."""
 
@@ -285,9 +297,12 @@ class Joint:
     # Default position
     home_position: float | None = None
     """Default position of the joint.
-    
+
     In meters for prismatic joints, in radians for revolute joints.
     """
+
+    # Mimic constraint (URDF <mimic> tag)
+    mimic: MimicJoint | None = None
 
     # Format-specific extensions
     extensions: dict[str, Any] = field(default_factory=dict)
@@ -748,6 +763,8 @@ class CommonSchema:
             if joint.parent_link != "world":
                 joint.parent_link = prefixed(joint.parent_link)
             joint.child_link = prefixed(joint.child_link)
+            if joint.mimic is not None:
+                joint.mimic.joint = prefixed(joint.mimic.joint)
 
         # Rewrite all actuators and their references
         for actuator in other_copy.actuators:

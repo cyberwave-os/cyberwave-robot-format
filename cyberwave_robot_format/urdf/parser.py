@@ -40,6 +40,7 @@ from cyberwave_robot_format.schema import (
     Link,
     Material,
     Metadata,
+    MimicJoint,
     Pose,
     Sensor,
     Vector3,
@@ -531,6 +532,19 @@ class URDFParser(BaseParser):
                 )
             except ValueError as e:
                 context.add_error(f"Invalid dynamics values: {e}", name)
+
+        mimic = elem.find("mimic")
+        if mimic is not None:
+            driver = mimic.get("joint")
+            if driver:
+                try:
+                    joint.mimic = MimicJoint(
+                        joint=driver,
+                        multiplier=float(mimic.get("multiplier", "1")),
+                        offset=float(mimic.get("offset", "0")),
+                    )
+                except ValueError as e:
+                    context.add_error(f"Invalid mimic values: {e}", name)
 
         return joint
 
