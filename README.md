@@ -73,6 +73,45 @@ exporter = MJCFExporter()
 exporter.export(schema, "output/robot.xml")
 ```
 
+### Infer URDF mimic joints (gripper coupling)
+
+When a URDF has coupled finger / gripper joints but no `<mimic>` tags, infer pairs from
+kinematics and write a new `{stem}-mimic-joint.urdf` (the original file is never modified).
+
+```python
+from pathlib import Path
+from cyberwave_robot_format.urdf import (
+    infer_mimic_joints,
+    infer_and_patch_if_needed,
+    write_mimic_patched_urdf,
+)
+
+result = infer_mimic_joints("robot.urdf")
+for m in result.inferred_mimics:
+    print(m.driver_joint, "→", m.slave_joint, "mult", m.multiplier, "conf", m.confidence)
+
+# Write patched URDF when confidence ≥ 0.85 (default)
+patched = infer_and_patch_if_needed(Path("robot.urdf"))
+if patched.output_path:
+    print("Wrote", patched.output_path)
+```
+
+**Multiplier defaults**
+
+| Context | Default |
+|---------|---------|
+| URDF `<mimic>` if `multiplier` omitted | `1` |
+| `offset` omitted | `0` |
+| Inference for opposing prismatic jaws | Often `-1` when complementary limits validate |
+
+Inference checks opposing axes, complementary joint limits, and samples driver positions so
+`slave = multiplier × driver + offset` stays within slave limits. Pass an optional `mjcf_path`
+to seed coeffs from MuJoCo equality constraints.
+
+Used by Cyberwave backend `seed_controllers --infer-mimic-from-urdf` and
+`src/lib/urdf_mimic_utils.py`. See `cyberwave-backend/docs/mimic-joints.md` for the full
+platform workflow (autogen, teleop, MQTT).
+
 ### Cloud-Native Scene Export
 
 Export complete scenes with meshes to ZIP files, supporting cloud storage and in-memory conversion:

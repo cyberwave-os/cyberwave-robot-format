@@ -105,5 +105,39 @@ def test_urdf_parser_joint_properties(simple_urdf_path):
     assert joint.dynamics.friction == pytest.approx(0.05)
 
 
+def test_urdf_parser_preserves_mimic_joint(tmp_path):
+    """Gripper-style URDF: slave joint mimic metadata must survive parsing."""
+    urdf = """<?xml version="1.0"?>
+<robot name="gripper_test">
+  <link name="base"/><link name="finger_l"/><link name="finger_r"/>
+  <joint name="finger_joint1" type="revolute">
+    <parent link="base"/><child link="finger_l"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.8" upper="0.8" effort="10" velocity="1"/>
+  </joint>
+  <joint name="finger_joint2" type="revolute">
+    <parent link="base"/><child link="finger_r"/>
+    <mimic joint="finger_joint1" multiplier="-1" offset="0"/>
+  </joint>
+</robot>"""
+    urdf_path = tmp_path / "gripper_test.urdf"
+    urdf_path.write_text(urdf, encoding="utf-8")
+
+    parser = URDFParser()
+    schema = parser.parse(urdf_path)
+
+    assert schema.metadata.name == "gripper_test"
+    assert len(schema.joints) == 2
+
+    driver = next(j for j in schema.joints if j.name == "finger_joint1")
+    slave = next(j for j in schema.joints if j.name == "finger_joint2")
+
+    assert driver.mimic is None
+    assert slave.mimic is not None
+    assert slave.mimic.joint == "finger_joint1"
+    assert slave.mimic.multiplier == pytest.approx(-1.0)
+    assert slave.mimic.offset == pytest.approx(0.0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

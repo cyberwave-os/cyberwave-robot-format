@@ -141,6 +141,15 @@ class URDFExporter(BaseExporter):
                 friction=str(dyn.friction),
             )
 
+        if joint.mimic:
+            ET.SubElement(
+                joint_elem,
+                "mimic",
+                joint=joint.mimic.joint,
+                multiplier=str(joint.mimic.multiplier),
+                offset=str(joint.mimic.offset),
+            )
+
     def _add_visual(self, link_elem: ET.Element, visual: Visual) -> None:
         """Add visual element to link."""
         visual_elem = ET.SubElement(link_elem, "visual")

@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<robot name="gripper_prismatic_pair">
+  <link name="base"/>
+  <link name="arm_tip"/>
+  <link name="finger_l"/>
+  <link name="finger_r"/>
+  <joint name="base_to_tip" type="fixed">
+    <parent link="base"/><child link="arm_tip"/>
+  </joint>
+  <joint name="joint7" type="prismatic">
+    <parent link="arm_tip"/><child link="finger_l"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="0.04" effort="10" velocity="1"/>
+  </joint>
+  <joint name="joint8" type="prismatic">
+    <parent link="arm_tip"/><child link="finger_r"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.04" upper="0" effort="10" velocity="1"/>
+  </joint>
+</robot>
