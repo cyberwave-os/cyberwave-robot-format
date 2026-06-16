@@ -61,6 +61,7 @@ class MJCFParser(BaseParser):
         self._default_geom_friction: list[float] | None = None
         self._default_geom_material: str | None = None
         self._default_size: dict[str, str] = {}
+        self._default_actuator_attrs: dict[str, dict[str, str]] = {}
 
     def can_parse(self, file_path: str | Path) -> bool:
         """Check if file is a valid MJCF file."""
@@ -102,6 +103,7 @@ class MJCFParser(BaseParser):
         self._default_geom_friction = None
         self._default_geom_material = None
         self._default_size = {}
+        self._default_actuator_attrs = {}
 
         default_elem = root.find("default")
         if default_elem is not None:
@@ -116,6 +118,7 @@ class MJCFParser(BaseParser):
                 material_attr = geom_default.get("material")
                 if material_attr:
                     self._default_geom_material = sanitize_name(material_attr)
+            self._parse_default_actuator_attrs(default_elem)
 
         size_elem = root.find("size")
         if size_elem is not None:
@@ -710,41 +713,99 @@ class MJCFParser(BaseParser):
         """Parse actuator definitions with validation."""
         actuators = []
 
-        for motor_elem in actuator_elem.findall("motor"):
-            name = motor_elem.get("name")
-            joint = motor_elem.get("joint")
+        type_by_tag = {
+            "motor": ActuatorType.DC_MOTOR,
+            "position": ActuatorType.POSITION,
+            "velocity": ActuatorType.VELOCITY,
+            "general": ActuatorType.DC_MOTOR,
+            "muscle": ActuatorType.MUSCLE,
+        }
 
+        for actuator_entry in list(actuator_elem):
+            actuator_type = type_by_tag.get(actuator_entry.tag)
+            if actuator_type is None:
+                continue
+            attrs = self._actuator_attrs_with_defaults(actuator_entry)
+            name = attrs.get("name")
+            joint = attrs.get("joint")
             if not name or not joint:
-                context.add_warning("Motor missing name or joint reference")
+                context.add_warning(
+                    f"{actuator_entry.tag.capitalize()} actuator missing name or joint reference"
+                )
                 continue
 
             actuator = Actuator(
                 name=sanitize_name(name),
                 joint=sanitize_name(joint),
-                type=ActuatorType.DC_MOTOR,
+                type=actuator_type,
             )
 
-            gear_str = motor_elem.get("gear")
-            if gear_str:
-                try:
-                    gear_values = [float(x) for x in gear_str.split()]
-                    if gear_values:
-                        actuator.gear_ratio = gear_values[0]
-                except ValueError:
-                    context.add_warning(f"Invalid gear values for motor {name}")
+            gear = self._parse_first_float(attrs.get("gear"))
+            if gear is not None:
+                actuator.gear_ratio = gear
 
-            ctrlrange_str = motor_elem.get("ctrlrange")
-            if ctrlrange_str:
-                try:
-                    ctrl_range = [float(x) for x in ctrlrange_str.split()]
-                    if len(ctrl_range) == 2:
-                        actuator.control_range = (ctrl_range[0], ctrl_range[1])
-                except ValueError:
-                    context.add_warning(f"Invalid control range for motor {name}")
+            ctrl_range = self._parse_float_pair(attrs.get("ctrlrange"))
+            if ctrl_range is not None:
+                actuator.control_range = ctrl_range
+
+            force_range = self._parse_float_pair(attrs.get("forcerange"))
+            if force_range is not None:
+                actuator.force_range = force_range
+                actuator.max_torque = max(abs(force_range[0]), abs(force_range[1]))
+
+            kp = self._parse_first_float(attrs.get("kp"))
+            if kp is not None:
+                actuator.kp = kp
+
+            kv = self._parse_first_float(attrs.get("kv"))
+            if kv is not None:
+                actuator.kd = kv
 
             actuators.append(actuator)
 
         return actuators
+
+    def _parse_default_actuator_attrs(self, default_elem: ET.Element) -> None:
+        default_class = default_elem.get("class")
+        if default_class:
+            class_key = sanitize_name(default_class)
+            for tag in ("motor", "position", "velocity", "general", "muscle"):
+                actuator_default = default_elem.find(tag)
+                if actuator_default is not None:
+                    self._default_actuator_attrs[class_key] = dict(
+                        actuator_default.attrib
+                    )
+
+        for child_default in default_elem.findall("default"):
+            self._parse_default_actuator_attrs(child_default)
+
+    def _actuator_attrs_with_defaults(self, actuator_elem: ET.Element) -> dict[str, str]:
+        attrs: dict[str, str] = {}
+        class_name = actuator_elem.get("class")
+        if class_name:
+            attrs.update(self._default_actuator_attrs.get(sanitize_name(class_name), {}))
+        attrs.update(actuator_elem.attrib)
+        return attrs
+
+    def _parse_first_float(self, value: str | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            values = [float(x) for x in value.split()]
+        except ValueError:
+            return None
+        return values[0] if values else None
+
+    def _parse_float_pair(self, value: str | None) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        try:
+            values = [float(x) for x in value.split()]
+        except ValueError:
+            return None
+        if len(values) != 2:
+            return None
+        return values[0], values[1]
 
     def _parse_sensors(
         self,

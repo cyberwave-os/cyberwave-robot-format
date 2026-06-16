@@ -56,7 +56,15 @@ class MJCFExporter(BaseExporter):
         """Export common schema to MJCF format."""
         mujoco = ET.Element("mujoco", model=schema.metadata.name)
 
-        ET.SubElement(mujoco, "compiler", angle="radian", autolimits="true")
+        ET.SubElement(
+            mujoco,
+            "compiler",
+            angle="radian",
+            autolimits="true",
+            balanceinertia="true",
+            boundmass="1e-6",
+            boundinertia="1e-9",
+        )
 
         option_attrs = {}
         if schema.physics is not None:
@@ -307,9 +315,20 @@ class MJCFExporter(BaseExporter):
 
         return mesh_lookup
 
-    def _add_inertial(self, body: ET.Element, link: Link) -> None:
+    def _add_inertial(
+        self,
+        body: ET.Element,
+        link: Link,
+        *,
+        require_positive: bool = False,
+    ) -> None:
         """Add inertial element to body, ensuring validity."""
         if link.mass <= 0:
+            if require_positive:
+                inertial = ET.SubElement(body, "inertial")
+                inertial.set("pos", "0 0 0")
+                inertial.set("mass", "1e-4")
+                inertial.set("diaginertia", "1e-8 1e-8 1e-8")
             return
 
         inertial = ET.SubElement(body, "inertial")
@@ -318,6 +337,8 @@ class MJCFExporter(BaseExporter):
         if link.center_of_mass:
             pos = f"{link.center_of_mass.x} {link.center_of_mass.y} " f"{link.center_of_mass.z}"
             inertial.set("pos", pos)
+        else:
+            inertial.set("pos", "0 0 0")
 
         ixx, iyy, izz, ixy, ixz, iyz = sanitize_inertia(link)
 
@@ -480,7 +501,11 @@ class MJCFExporter(BaseExporter):
                 if joint.dynamics.spring_stiffness is not None and joint.dynamics.spring_stiffness != 0.0:
                     joint_elem.set("stiffness", str(joint.dynamics.spring_stiffness))
 
-        self._add_inertial(body, link)
+        self._add_inertial(
+            body,
+            link,
+            require_positive=joint.type != JointType.FIXED,
+        )
 
         for i, visual in enumerate(link.visuals):
             self._add_geom(

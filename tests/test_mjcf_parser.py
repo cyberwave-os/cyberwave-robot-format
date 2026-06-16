@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from cyberwave_robot_format.mjcf import MJCFParser, MJCFExporter
+from cyberwave_robot_format.schema import ActuatorType
 
 
 @pytest.fixture
@@ -79,6 +80,46 @@ def test_mjcf_parser_joint_properties(simple_mjcf_path):
     assert joint.dynamics is not None
     assert joint.dynamics.damping == pytest.approx(0.1)
     assert joint.dynamics.friction == pytest.approx(0.05)
+
+
+def test_mjcf_parser_position_actuator_defaults(tmp_path):
+    """MuJoCo Menagerie policies commonly use defaulted position actuators."""
+    mjcf_path = tmp_path / "position_actuator.xml"
+    mjcf_path.write_text(
+        """
+<mujoco model="defaulted_position_actuator">
+  <default>
+    <default class="affine">
+      <position kp="100" kv="2" ctrlrange="-1 1" forcerange="-80 80"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="base">
+      <body name="leg">
+        <joint name="hip" type="hinge" range="-0.5 0.5"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <position class="affine" joint="hip" name="hip"/>
+  </actuator>
+</mujoco>
+""",
+        encoding="utf-8",
+    )
+
+    schema = MJCFParser().parse(mjcf_path)
+
+    assert len(schema.actuators) == 1
+    actuator = schema.actuators[0]
+    assert actuator.name == "hip"
+    assert actuator.joint == "hip"
+    assert actuator.type == ActuatorType.POSITION
+    assert actuator.kp == pytest.approx(100.0)
+    assert actuator.kd == pytest.approx(2.0)
+    assert actuator.control_range == pytest.approx((-1.0, 1.0))
+    assert actuator.force_range == pytest.approx((-80.0, 80.0))
+    assert actuator.max_torque == pytest.approx(80.0)
 
 
 def test_mjcf_roundtrip(simple_mjcf_path, tmp_path):

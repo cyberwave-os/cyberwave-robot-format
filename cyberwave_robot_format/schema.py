@@ -327,6 +327,8 @@ class Actuator:
     kp: float | None = None  # Proportional gain
     ki: float | None = None  # Integral gain
     kd: float | None = None  # Derivative gain
+    control_range: tuple[float, float] | None = None
+    force_range: tuple[float, float] | None = None
 
     # Physical properties
     resistance: float | None = None

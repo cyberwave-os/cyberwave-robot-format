@@ -39,6 +39,33 @@ logger = logging.getLogger(__name__)
 MeshResolver = Callable[[str], tuple[str, bytes] | None]
 
 
+def _fallback_missing_mesh_references(
+    root: ET.Element,
+    asset_elem: ET.Element,
+    missing_mesh_names: set[str],
+) -> None:
+    """Remove unresolved mesh assets and keep collision geoms loadable."""
+    if not missing_mesh_names:
+        return
+
+    for mesh_elem in list(asset_elem.findall("mesh")):
+        if mesh_elem.get("name") in missing_mesh_names:
+            asset_elem.remove(mesh_elem)
+
+    for parent in root.iter():
+        for child in list(parent):
+            if child.tag != "geom" or child.get("mesh") not in missing_mesh_names:
+                continue
+
+            if child.get("class") == "collision" or child.get("group") == "3":
+                child.attrib.pop("mesh", None)
+                child.set("type", "box")
+                child.set("size", "0.025 0.025 0.025")
+                continue
+
+            parent.remove(child)
+
+
 def export_mujoco_zip_cloud(
     schema: CommonSchema,
     mesh_resolver: MeshResolver,
@@ -128,6 +155,7 @@ def export_mujoco_zip_cloud(
         mesh_rewrite_map: dict[str, str] = {}  # original_mesh_file -> unique_asset_name
         mesh_counter: dict[str, int] = {}  # basename -> count for deduplication
         missing_meshes: list[str] = []
+        missing_mesh_names: set[str] = set()
 
         # Collect and copy mesh files
         asset_elem = root.find("asset")
@@ -186,6 +214,9 @@ def export_mujoco_zip_cloud(
                 else:
                     # Mesh not found
                     missing_meshes.append(mesh_file)
+                    mesh_name = mesh_elem.get("name")
+                    if mesh_name:
+                        missing_mesh_names.add(mesh_name)
                     logger.error(f"Mesh file not found: {mesh_file}")
                     logger.error(f"  mesh_resolver returned None for this file")
         
@@ -194,6 +225,8 @@ def export_mujoco_zip_cloud(
             raise FileNotFoundError(
                 f"Missing {len(missing_meshes)} mesh file(s): {', '.join(missing_meshes)}"
             )
+        if missing_meshes and asset_elem is not None:
+            _fallback_missing_mesh_references(root, asset_elem, missing_mesh_names)
 
         # Write updated XML
         tree.write(mjcf_path, encoding="utf-8", xml_declaration=True)
