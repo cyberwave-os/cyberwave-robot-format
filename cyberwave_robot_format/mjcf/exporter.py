@@ -56,15 +56,7 @@ class MJCFExporter(BaseExporter):
         """Export common schema to MJCF format."""
         mujoco = ET.Element("mujoco", model=schema.metadata.name)
 
-        ET.SubElement(
-            mujoco,
-            "compiler",
-            angle="radian",
-            autolimits="true",
-            balanceinertia="true",
-            boundmass="1e-6",
-            boundinertia="1e-9",
-        )
+        ET.SubElement(mujoco, "compiler", angle="radian", autolimits="true")
 
         option_attrs = {}
         if schema.physics is not None:
@@ -81,7 +73,9 @@ class MJCFExporter(BaseExporter):
                     "implicitfast": "implicitfast",
                     "quick": "implicitfast",
                 }
-                integrator = integrator_map.get(schema.physics.solver.type, "implicitfast")
+                integrator = integrator_map.get(
+                    schema.physics.solver.type, "implicitfast"
+                )
                 option_attrs["integrator"] = integrator
                 if schema.physics.solver.iterations is not None:
                     option_attrs["iterations"] = str(schema.physics.solver.iterations)
@@ -91,9 +85,15 @@ class MJCFExporter(BaseExporter):
         if not option_attrs:
             option_attrs["integrator"] = "implicitfast"
 
+        option_attrs.setdefault("noslip_iterations", "10")
+
         ET.SubElement(mujoco, "option", **option_attrs)
 
-        size_attrs = schema.extensions.get("mjcf_size") if hasattr(schema, "extensions") else None
+        size_attrs = (
+            schema.extensions.get("mjcf_size")
+            if hasattr(schema, "extensions")
+            else None
+        )
         if size_attrs:
             ET.SubElement(mujoco, "size", **{k: str(v) for k, v in size_attrs.items()})
 
@@ -105,7 +105,9 @@ class MJCFExporter(BaseExporter):
         ET.SubElement(d_motor, "motor", {"gear": "1"})
 
         d_visual = ET.SubElement(d_robot, "default", {"class": "visual"})
-        ET.SubElement(d_visual, "geom", {"contype": "0", "conaffinity": "0", "group": "2"})
+        ET.SubElement(
+            d_visual, "geom", {"contype": "0", "conaffinity": "0", "group": "2"}
+        )
 
         d_collision = ET.SubElement(d_robot, "default", {"class": "collision"})
         ET.SubElement(
@@ -113,21 +115,28 @@ class MJCFExporter(BaseExporter):
             "geom",
             {
                 "condim": "3",
-                # contype/conaffinity now come from CollisionFilter on each collision
+                "contype": "1",
+                "conaffinity": "1",
                 "priority": "1",
                 "group": "3",
-                "solref": "0.005 1",
-                "solimp": "0.99 0.999 1e-05",
-                "friction": "1 0.01 0.01",
+                "solref": "0.02 1",
+                "solimp": "0.7 0.9 0.02",
+                "friction": "0.6 0.005 0.005",
             },
         )
 
-        defaults = schema.extensions.get("mjcf_defaults") if hasattr(schema, "extensions") else None
+        defaults = (
+            schema.extensions.get("mjcf_defaults")
+            if hasattr(schema, "extensions")
+            else None
+        )
         if defaults and defaults.get("geom"):
             geom_defaults = defaults["geom"]
             geom_attrs = {}
             if geom_defaults.get("friction"):
-                geom_attrs["friction"] = " ".join(str(x) for x in geom_defaults["friction"])
+                geom_attrs["friction"] = " ".join(
+                    str(x) for x in geom_defaults["friction"]
+                )
             if geom_defaults.get("material"):
                 geom_attrs["material"] = geom_defaults["material"]
             if geom_attrs:
@@ -152,8 +161,14 @@ class MJCFExporter(BaseExporter):
         worldbody = ET.SubElement(mujoco, "worldbody")
 
         child_links = {joint.child_link for joint in schema.joints}
-        world_children = {joint.child_link for joint in schema.joints if joint.parent_link == "world"}
-        root_names = {link.name for link in schema.links if link.name not in child_links and link.name != "world"}
+        world_children = {
+            joint.child_link for joint in schema.joints if joint.parent_link == "world"
+        }
+        root_names = {
+            link.name
+            for link in schema.links
+            if link.name not in child_links and link.name != "world"
+        }
         root_links = [link for link in schema.links if link.name in root_names]
 
         if not root_links and schema.links:
@@ -169,7 +184,10 @@ class MJCFExporter(BaseExporter):
 
         if "world" in link_to_children:
             for joint, child_link_name in link_to_children["world"]:
-                child_link = next((link for link in schema.links if link.name == child_link_name), None)
+                child_link = next(
+                    (link for link in schema.links if link.name == child_link_name),
+                    None,
+                )
                 if child_link:
                     self._add_body_with_joint(
                         worldbody,
@@ -182,7 +200,9 @@ class MJCFExporter(BaseExporter):
 
         for root_link in root_links:
             if root_link.name != "world" and root_link.name not in world_children:
-                self._add_body_hierarchy(worldbody, root_link, schema, link_to_children, mesh_name_map)
+                self._add_body_hierarchy(
+                    worldbody, root_link, schema, link_to_children, mesh_name_map
+                )
 
         # Add collision configuration (excludes and pairs)
         self._add_contact_section(mujoco, schema)
@@ -193,9 +213,7 @@ class MJCFExporter(BaseExporter):
             # Build a joint-name → limits lookup so _add_actuator can fall back
             # to joint limits when no explicit control_range is set on the actuator.
             joint_limits_map = {
-                j.name: j.limits
-                for j in schema.joints
-                if j.limits is not None
+                j.name: j.limits for j in schema.joints if j.limits is not None
             }
             for actuator in schema.actuators:
                 self._add_actuator(actuator_elem, actuator, joint_limits_map)
@@ -213,8 +231,14 @@ class MJCFExporter(BaseExporter):
                             f"-{joint.limits.effort} {joint.limits.effort}",
                         )
 
-                    if joint.limits and joint.limits.lower is not None and joint.limits.upper is not None:
-                        motor.set("ctrlrange", f"{joint.limits.lower} {joint.limits.upper}")
+                    if (
+                        joint.limits
+                        and joint.limits.lower is not None
+                        and joint.limits.upper is not None
+                    ):
+                        motor.set(
+                            "ctrlrange", f"{joint.limits.lower} {joint.limits.upper}"
+                        )
 
         if schema.sensors:
             sensor_elem = ET.SubElement(mujoco, "sensor")
@@ -252,7 +276,11 @@ class MJCFExporter(BaseExporter):
         if material.emissive:
             mat_elem.set("emission", str(material.emissive[0]))
 
-        reflectance = material.extensions.get("reflectance") if hasattr(material, "extensions") else None
+        reflectance = (
+            material.extensions.get("reflectance")
+            if hasattr(material, "extensions")
+            else None
+        )
         if reflectance is not None:
             mat_elem.set("reflectance", str(reflectance))
 
@@ -278,7 +306,9 @@ class MJCFExporter(BaseExporter):
 
             if filename.lower().endswith(".dae"):
                 try:
-                    actual_filename = convert_dae_to_obj(filename, scale if scale else None)
+                    actual_filename = convert_dae_to_obj(
+                        filename, scale if scale else None
+                    )
                 except Exception as e:
                     logger.warning("Failed to convert DAE mesh %s: %s", filename, e)
 
@@ -307,7 +337,10 @@ class MJCFExporter(BaseExporter):
 
         for link in schema.links:
             for geom_container in list(link.visuals) + list(link.collisions):
-                if geom_container.geometry and geom_container.geometry.type == GeometryType.MESH:
+                if (
+                    geom_container.geometry
+                    and geom_container.geometry.type == GeometryType.MESH
+                ):
                     register_mesh(
                         geom_container.geometry.filename,
                         geom_container.geometry.scale,
@@ -315,30 +348,45 @@ class MJCFExporter(BaseExporter):
 
         return mesh_lookup
 
+    # Fallback for movable bodies (frames, tool sites) that the source schema
+    # leaves with zero mass. MuJoCo refuses to load any moving body whose mass
+    # or inertia is below mjMINVAL, so the exporter has to emit *something*.
+    _FALLBACK_MASS = 1e-6
+    _FALLBACK_DIAGINERTIA = "1e-9 1e-9 1e-9"
+
     def _add_inertial(
-        self,
-        body: ET.Element,
-        link: Link,
-        *,
-        require_positive: bool = False,
+        self, body: ET.Element, link: Link, *, ensure_minimum: bool = False
     ) -> None:
-        """Add inertial element to body, ensuring validity."""
-        if link.mass <= 0:
-            if require_positive:
+        """Add inertial element to body, ensuring validity.
+
+        ``ensure_minimum=True`` guarantees that the body has a non-zero
+        inertial even when ``link.mass`` is missing or non-positive. Callers
+        that know the body will have a joint underneath should pass it; this
+        is the case for every body emitted via :meth:`_add_body_with_joint`.
+        """
+        has_mass = link.mass and link.mass > 0
+        if not has_mass:
+            if ensure_minimum:
                 inertial = ET.SubElement(body, "inertial")
+                inertial.set("mass", str(self._FALLBACK_MASS))
                 inertial.set("pos", "0 0 0")
-                inertial.set("mass", "1e-4")
-                inertial.set("diaginertia", "1e-8 1e-8 1e-8")
+                inertial.set("diaginertia", self._FALLBACK_DIAGINERTIA)
+                logger.debug(
+                    "Emitted fallback inertial for movable body '%s' (link.mass=%s).",
+                    link.name,
+                    link.mass,
+                )
             return
 
         inertial = ET.SubElement(body, "inertial")
         inertial.set("mass", str(link.mass))
 
         if link.center_of_mass:
-            pos = f"{link.center_of_mass.x} {link.center_of_mass.y} " f"{link.center_of_mass.z}"
+            pos = (
+                f"{link.center_of_mass.x} {link.center_of_mass.y} "
+                f"{link.center_of_mass.z}"
+            )
             inertial.set("pos", pos)
-        else:
-            inertial.set("pos", "0 0 0")
 
         ixx, iyy, izz, ixy, ixz, iyz = sanitize_inertia(link)
 
@@ -364,6 +412,16 @@ class MJCFExporter(BaseExporter):
 
         self._add_inertial(body, link)
 
+        # Links that host camera sensors get group=5 so the wrist-depth renderer
+        # (which already disables geomgroup[5]) does not see the camera housing.
+        _camera_parent_links: frozenset[str] = frozenset(
+            s.parent_link
+            for s in (schema.sensors or [])
+            if s.type in ("camera", "depth_camera")
+        )
+        visual_group = "5" if link.name in _camera_parent_links else "2"
+        collision_group = "5" if link.name in _camera_parent_links else "3"
+
         for i, visual in enumerate(link.visuals):
             self._add_geom(
                 body,
@@ -372,7 +430,7 @@ class MJCFExporter(BaseExporter):
                 visual.pose,
                 f"visual_{i}",
                 mesh_name_map,
-                group="2",
+                group=visual_group,
                 schema=schema,
             )
 
@@ -384,19 +442,25 @@ class MJCFExporter(BaseExporter):
                 collision.pose,
                 f"collision_{i}",
                 mesh_name_map,
-                group="3",
+                group=collision_group,
                 collision=collision,
                 schema=schema,
             )
 
         if schema.sensors:
             for sensor in schema.sensors:
-                if sensor.type in ("camera", "depth_camera") and sensor.parent_link == link.name:
+                if (
+                    sensor.type in ("camera", "depth_camera")
+                    and sensor.parent_link == link.name
+                ):
                     self._add_camera(body, sensor)
 
         if link.name in link_to_children:
             for joint, child_link_name in link_to_children[link.name]:
-                child_link = next((link for link in schema.links if link.name == child_link_name), None)
+                child_link = next(
+                    (link for link in schema.links if link.name == child_link_name),
+                    None,
+                )
                 if child_link:
                     self._add_body_with_joint(
                         body,
@@ -437,7 +501,7 @@ class MJCFExporter(BaseExporter):
                 # hfov is stored in radians (SI).  Convert to vertical FOV in
                 # degrees for MuJoCo, accounting for the sensor's aspect ratio.
                 hfov_rad = float(params["hfov"])
-                width  = float(params.get("width",  640))
+                width = float(params.get("width", 640))
                 height = float(params.get("height", 480))
                 # hfov → vfov: tan(vfov/2) = tan(hfov/2) * (height/width)
                 vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * height / width)
@@ -498,14 +562,25 @@ class MJCFExporter(BaseExporter):
                     joint_elem.set("frictionloss", str(joint.dynamics.friction))
                 if joint.dynamics.armature is not None:
                     joint_elem.set("armature", str(joint.dynamics.armature))
-                if joint.dynamics.spring_stiffness is not None and joint.dynamics.spring_stiffness != 0.0:
+                if (
+                    joint.dynamics.spring_stiffness is not None
+                    and joint.dynamics.spring_stiffness != 0.0
+                ):
                     joint_elem.set("stiffness", str(joint.dynamics.spring_stiffness))
 
-        self._add_inertial(
-            body,
-            link,
-            require_positive=joint.type != JointType.FIXED,
+        # A movable body must always have a valid inertial.
+        is_movable_joint = joint.type not in (JointType.FIXED,)
+        self._add_inertial(body, link, ensure_minimum=is_movable_joint)
+
+        # Links that host camera sensors get group=5 so the wrist-depth renderer
+        # (which already disables geomgroup[5]) does not see the camera housing.
+        _camera_parent_links: frozenset[str] = frozenset(
+            s.parent_link
+            for s in (schema.sensors or [])
+            if s.type in ("camera", "depth_camera")
         )
+        visual_group = "5" if link.name in _camera_parent_links else "2"
+        collision_group = "5" if link.name in _camera_parent_links else "3"
 
         for i, visual in enumerate(link.visuals):
             self._add_geom(
@@ -515,7 +590,7 @@ class MJCFExporter(BaseExporter):
                 visual.pose,
                 f"visual_{i}",
                 mesh_name_map,
-                group="2",
+                group=visual_group,
                 schema=schema,
             )
 
@@ -527,21 +602,31 @@ class MJCFExporter(BaseExporter):
                 collision.pose,
                 f"collision_{i}",
                 mesh_name_map,
-                group="3",
+                group=collision_group,
                 collision=collision,
                 schema=schema,
             )
 
         if schema.sensors:
             for sensor in schema.sensors:
-                if sensor.type in ("camera", "depth_camera") and sensor.parent_link == link.name:
+                if (
+                    sensor.type in ("camera", "depth_camera")
+                    and sensor.parent_link == link.name
+                ):
                     self._add_camera(body, sensor)
                 elif sensor.type not in ("camera", "depth_camera"):
-                    logger.warning("Sensor %s with type %s is not supported.", sensor.name, sensor.type)
+                    logger.warning(
+                        "Sensor %s with type %s is not supported.",
+                        sensor.name,
+                        sensor.type,
+                    )
 
         if link.name in link_to_children:
             for child_joint, child_link_name in link_to_children[link.name]:
-                child_link = next((link for link in schema.links if link.name == child_link_name), None)
+                child_link = next(
+                    (link for link in schema.links if link.name == child_link_name),
+                    None,
+                )
                 if child_link:
                     self._add_body_with_joint(
                         body,
@@ -570,6 +655,9 @@ class MJCFExporter(BaseExporter):
         geom = ET.SubElement(body, "geom")
         geom.set("group", group)
 
+        if collision is not None and collision.name:
+            geom.set("name", collision.name)
+
         if pose and pose.position:
             pos = pose.position
             pos_str = f"{pos.x} {pos.y} {pos.z}"
@@ -580,18 +668,22 @@ class MJCFExporter(BaseExporter):
             quat_str = f"{quat.w} {quat.x} {quat.y} {quat.z}"
             geom.set("quat", quat_str)
 
-        # Visual geoms: disable collision
-        if group == "2":
+        # Visual geoms: disable collision.
+        # Group "5" is the camera-mount convention: same class/collision rules
+        # as groups 2/3 but hidden from the depth-camera renderer.
+        if group == "2" or (group == "5" and collision is None):
             geom.set("class", "visual")
             geom.set("contype", "0")
             geom.set("conaffinity", "0")
-        elif group == "3":
+        elif group == "3" or (group == "5" and collision is not None):
             geom.set("class", "collision")
 
         if geometry.type == GeometryType.BOX:
             geom.set("type", "box")
             if geometry.size:
-                size_str = f"{geometry.size.x / 2} {geometry.size.y / 2} " f"{geometry.size.z / 2}"
+                size_str = (
+                    f"{geometry.size.x / 2} {geometry.size.y / 2} {geometry.size.z / 2}"
+                )
                 geom.set("size", size_str)
 
         elif geometry.type == GeometryType.SPHERE:
@@ -617,11 +709,20 @@ class MJCFExporter(BaseExporter):
                 size_str = f"{geometry.size.x} {geometry.size.y} {geometry.size.z}"
                 geom.set("size", size_str)
 
+        elif geometry.type == GeometryType.ELLIPSOID:
+            geom.set("type", "ellipsoid")
+            if geometry.size:
+                # ``size`` carries the three semi-axes (rx, ry, rz).
+                size_str = f"{geometry.size.x} {geometry.size.y} {geometry.size.z}"
+                geom.set("size", size_str)
+
         elif geometry.type == GeometryType.MESH:
             geom.set("type", "mesh")
             if geometry.filename:
                 scale_tuple = (
-                    (geometry.scale.x, geometry.scale.y, geometry.scale.z) if geometry.scale else (1.0, 1.0, 1.0)
+                    (geometry.scale.x, geometry.scale.y, geometry.scale.z)
+                    if geometry.scale
+                    else (1.0, 1.0, 1.0)
                 )
                 key = (geometry.filename, scale_tuple)
 
@@ -630,7 +731,9 @@ class MJCFExporter(BaseExporter):
                     geom.set("mesh", mesh_name)
 
         else:
-            raise ValueError(f"Unsupported geometry type for MJCF export: {geometry.type}")
+            raise ValueError(
+                f"Unsupported geometry type for MJCF export: {geometry.type}"
+            )
 
         if material and material.name:
             geom.set("material", material.name)
@@ -638,7 +741,7 @@ class MJCFExporter(BaseExporter):
         # Apply collision filter if this is a collision geom
         if collision:
             group_name = collision.group
-            
+
             # "default" group doesn't require collision_config - use default MuJoCo behavior
             if group_name == "default" and (not schema or not schema.collision_config):
                 # Use default MuJoCo collision behavior (all collisions enabled)
@@ -652,9 +755,9 @@ class MJCFExporter(BaseExporter):
                         f"Collision references group '{group_name}' which is not defined in "
                         f"collision_config.groups. Available groups: {list(schema.collision_config.groups.keys())}"
                     )
-                
+
                 collision_group = schema.collision_config.groups[group_name]
-                
+
                 # Apply contype/conaffinity from the group
                 geom.set("contype", str(collision_group.contype))
                 geom.set("conaffinity", str(collision_group.conaffinity))
@@ -663,15 +766,27 @@ class MJCFExporter(BaseExporter):
                 raise ValueError(
                     f"Collision references group '{group_name}' but schema has no collision_config"
                 )
-            
+
             # Apply contact properties (friction, etc.)
             if collision.mu_dynamic is not None:
-                mu_static = collision.mu_static if collision.mu_static is not None else collision.mu_dynamic
+                mu_static = (
+                    collision.mu_static
+                    if collision.mu_static is not None
+                    else collision.mu_dynamic
+                )
                 geom.set("friction", f"{collision.mu_dynamic} {mu_static} 0.01")
-            
+
             # Check for MuJoCo-specific overrides in extensions (highest priority)
             if collision.extensions:
-                for key in ["contype", "conaffinity", "margin", "solref", "solimp", "condim"]:
+                for key in [
+                    "contype",
+                    "conaffinity",
+                    "margin",
+                    "solref",
+                    "solimp",
+                    "condim",
+                    "friction",
+                ]:
                     val = collision.extensions.get(key)
                     if val is not None:
                         geom.set(key, str(val))
@@ -715,7 +830,9 @@ class MJCFExporter(BaseExporter):
             "general": "general",
         }
         act_tag = type_map.get(raw_type) or type_map.get(norm, "general")
-        act = ET.SubElement(actuator_elem, act_tag, name=actuator.name, joint=actuator.joint)
+        act = ET.SubElement(
+            actuator_elem, act_tag, name=actuator.name, joint=actuator.joint
+        )
 
         if hasattr(actuator, "control_range") and actuator.control_range:
             ctrl_min, ctrl_max = actuator.control_range
@@ -725,7 +842,11 @@ class MJCFExporter(BaseExporter):
             # matches the joint's allowed range.  Without this MuJoCo uses [0, 0]
             # which clips every ctrl command to zero (position actuators frozen).
             limits = joint_limits_map.get(actuator.joint)
-            if limits is not None and limits.lower is not None and limits.upper is not None:
+            if (
+                limits is not None
+                and limits.lower is not None
+                and limits.upper is not None
+            ):
                 act.set("ctrlrange", f"{limits.lower} {limits.upper}")
 
         if hasattr(actuator, "force_range") and actuator.force_range:
@@ -740,6 +861,7 @@ class MJCFExporter(BaseExporter):
         if actuator.gear_ratio is not None:
             if act_tag in ("position", "velocity"):
                 import warnings
+
                 warnings.warn(
                     f"Actuator '{actuator.name}' has gear_ratio={actuator.gear_ratio} and "
                     f"act_tag='{act_tag}'. Emitting gear={actuator.gear_ratio}, but note that for "
@@ -755,8 +877,17 @@ class MJCFExporter(BaseExporter):
         if actuator.kp is not None and act_tag == "position":
             act.set("kp", str(actuator.kp))
 
+        ext = getattr(actuator, "extensions", None) or {}
+        timeconst = ext.get("timeconst")
+        dampratio = ext.get("dampratio")
+        if timeconst is not None:
+            act.set("timeconst", str(timeconst))
+        if dampratio is not None:
+            act.set("dampratio", str(dampratio))
+
         if actuator.kd is not None and act_tag in ["position", "velocity"]:
-            act.set("kv", str(actuator.kd))
+            if timeconst is None and dampratio is None:
+                act.set("kv", str(actuator.kd))
 
     def _add_sensor(self, sensor_elem: ET.Element, sensor: Sensor) -> None:
         """Add sensor entry."""
@@ -785,7 +916,11 @@ class MJCFExporter(BaseExporter):
         attrs = {"name": sensor.name}
 
         if sensor_type in ("jointpos", "jointvel"):
-            joint_name = sensor.parameters.get("joint") if hasattr(sensor, "parameters") else None
+            joint_name = (
+                sensor.parameters.get("joint")
+                if hasattr(sensor, "parameters")
+                else None
+            )
             if joint_name:
                 attrs["joint"] = joint_name
         else:
@@ -818,29 +953,25 @@ class MJCFExporter(BaseExporter):
         """Add <contact> section with excludes and pairs."""
         if not schema.collision_config:
             return
-        
+
         config = schema.collision_config
-        
+
         # Only create <contact> if we have rules
         if not config.excludes and not config.pairs:
             return
-        
+
         contact = ET.SubElement(mujoco, "contact")
-        
+
         # Add body-level excludes
         for exclude in config.excludes:
-            ET.SubElement(contact, "exclude", {
-                "body1": exclude.body1,
-                "body2": exclude.body2
-            })
-        
+            ET.SubElement(
+                contact, "exclude", {"body1": exclude.body1, "body2": exclude.body2}
+            )
+
         # Add explicit geom pairs
         for pair in config.pairs:
-            pair_attrs = {
-                "geom1": pair.geom1,
-                "geom2": pair.geom2
-            }
-            
+            pair_attrs = {"geom1": pair.geom1, "geom2": pair.geom2}
+
             # Add optional contact overrides
             if pair.friction is not None:
                 pair_attrs["friction"] = " ".join(str(f) for f in pair.friction)
@@ -854,11 +985,11 @@ class MJCFExporter(BaseExporter):
                 pair_attrs["margin"] = str(pair.margin)
             if pair.gap is not None:
                 pair_attrs["gap"] = str(pair.gap)
-            
+
             # Add any extension attributes
             if pair.extensions:
                 pair_attrs.update({k: str(v) for k, v in pair.extensions.items()})
-            
+
             ET.SubElement(contact, "pair", pair_attrs)
 
     def _write_pretty_xml(self, root: ET.Element, output_path: str | Path) -> None:

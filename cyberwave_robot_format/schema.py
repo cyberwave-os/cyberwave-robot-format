@@ -755,9 +755,15 @@ class CommonSchema:
             """Apply prefix to a name."""
             return f"{prefix}{name}"
 
-        # Rewrite all links
+        # Rewrite all links (including nested collision/visual names)
         for link in other_copy.links:
             link.name = prefixed(link.name)
+            for collision in link.collisions:
+                if collision.name:
+                    collision.name = prefixed(collision.name)
+            for visual in link.visuals:
+                if visual.name:
+                    visual.name = prefixed(visual.name)
 
         # Rewrite all joints and their references
         for joint in other_copy.joints:

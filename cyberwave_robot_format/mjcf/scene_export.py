@@ -73,7 +73,7 @@ def export_mujoco_zip_cloud(
     strict_missing_meshes: bool = False,
 ) -> bytes:
     """Export a CommonSchema to a complete MuJoCo ZIP file (cloud-native).
-    
+
     This is a cloud-native implementation requiring a mesh_resolver.
     No filesystem access is performed - all meshes must be provided via the resolver.
 
@@ -108,7 +108,7 @@ def export_mujoco_zip_cloud(
         >>> from cyberwave_robot_format.mjcf import export_mujoco_zip_cloud
         >>> schema = CommonSchema(metadata=Metadata(name="my_scene"))
         >>> # ... add robots via merge_in ...
-        >>> 
+        >>>
         >>> # Cloud-safe in-memory conversion:
         >>> def my_resolver(filename: str) -> tuple[str, bytes] | None:
         ...     if filename.endswith('.dae'):
@@ -116,13 +116,13 @@ def export_mujoco_zip_cloud(
         ...         obj_bytes = convert_dae_to_obj_in_memory(dae_bytes)
         ...         return (filename.replace('.dae', '.obj'), obj_bytes)
         ...     return None
-        >>> 
+        >>>
         >>> zip_bytes = export_mujoco_zip_cloud(schema, my_resolver)
     """
     # Validate inputs
     if not callable(mesh_resolver):
         raise ValueError("mesh_resolver must be a callable function")
-    
+
     errors = schema.validate()
     if errors:
         raise ValueError(f"Schema validation failed: {', '.join(errors)}")
@@ -168,30 +168,33 @@ def export_mujoco_zip_cloud(
                 # Skip if already processed (deduplication)
                 if mesh_file in mesh_rewrite_map:
                     mesh_elem.set("file", mesh_rewrite_map[mesh_file])
-                    logger.debug(f"Reusing existing mesh: {mesh_file} -> {mesh_rewrite_map[mesh_file]}")
+                    logger.debug(
+                        f"Reusing existing mesh: {mesh_file} -> {mesh_rewrite_map[mesh_file]}"
+                    )
                     continue
 
-                mesh_path = Path(mesh_file)
                 final_filename = None
                 mesh_bytes = None
-                
+
                 # Resolve mesh via mesh_resolver (cloud-native)
                 if mesh_resolver:
                     logger.debug(f"Trying mesh_resolver for: {mesh_file}")
                     result = mesh_resolver(mesh_file)
-                    
+
                     if result is not None:
                         # Expect tuple: (final_filename, bytes)
                         final_filename, mesh_bytes = result
-                        logger.debug(f"  Resolved via mesh_resolver: {mesh_file} -> {final_filename} ({len(mesh_bytes)} bytes)")
-                
+                        logger.debug(
+                            f"  Resolved via mesh_resolver: {mesh_file} -> {final_filename} ({len(mesh_bytes)} bytes)"
+                        )
+
                 # Process the mesh if we got bytes
                 if mesh_bytes is not None and final_filename is not None:
                     # Generate unique asset name to avoid collisions
                     final_path = Path(final_filename)
                     basename = final_path.stem
                     extension = final_path.suffix or ".obj"
-                    
+
                     # Handle duplicates
                     count = mesh_counter.get(basename, 0)
                     if count > 0:
@@ -199,18 +202,20 @@ def export_mujoco_zip_cloud(
                     else:
                         unique_name = f"{basename}{extension}"
                     mesh_counter[basename] = count + 1
-                    
+
                     # Write to assets directory
                     dst_path = assets_dir / unique_name
                     dst_path.write_bytes(mesh_bytes)
                     logger.debug(f"Wrote mesh to assets: {dst_path}")
-                    
+
                     final_asset_name = unique_name
-                    
+
                     # Update rewrite map and XML
                     mesh_rewrite_map[mesh_file] = final_asset_name
                     mesh_elem.set("file", final_asset_name)
-                    logger.debug(f"Updated XML mesh reference: {mesh_file} -> {final_asset_name}")
+                    logger.debug(
+                        f"Updated XML mesh reference: {mesh_file} -> {final_asset_name}"
+                    )
                 else:
                     # Mesh not found
                     missing_meshes.append(mesh_file)
@@ -218,8 +223,8 @@ def export_mujoco_zip_cloud(
                     if mesh_name:
                         missing_mesh_names.add(mesh_name)
                     logger.error(f"Mesh file not found: {mesh_file}")
-                    logger.error(f"  mesh_resolver returned None for this file")
-        
+                    logger.error("  mesh_resolver returned None for this file")
+
         # Handle missing meshes
         if missing_meshes and strict_missing_meshes:
             raise FileNotFoundError(
@@ -299,4 +304,7 @@ def export_mujoco_scene_xml(schema: CommonSchema) -> str:
             os.unlink(temp_path)
 
 
-__all__ = ["export_mujoco_zip_cloud", "export_mujoco_scene_xml"]
+__all__ = [
+    "export_mujoco_zip_cloud",
+    "export_mujoco_scene_xml",
+]
