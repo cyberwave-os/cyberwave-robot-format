@@ -104,5 +104,7 @@ def test_export_mujoco_zip_cloud_adds_valid_inertial_for_moving_zero_mass_link()
     inertial = wheel_body.find("inertial")
     assert inertial is not None
     assert inertial.get("pos") == "0 0 0"
-    assert inertial.get("mass") == "1e-4"
-    assert inertial.get("diaginertia") == "1e-8 1e-8 1e-8"
+    # Must match the exporter's fallback constants (_FALLBACK_MASS /
+    # _FALLBACK_DIAGINERTIA in mjcf/exporter.py) for movable zero-mass links.
+    assert inertial.get("mass") == "1e-06"
+    assert inertial.get("diaginertia") == "1e-9 1e-9 1e-9"
