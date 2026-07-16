@@ -107,6 +107,31 @@ class Quaternion:
 
         return cls(x, y, z, w)
 
+    def to_rpy(self) -> tuple[float, float, float]:
+        """Convert to roll-pitch-yaw angles (Fixed XYZ convention).
+
+        Inverse of :meth:`from_rpy`; returns ``(roll, pitch, yaw)`` in radians.
+        Pitch is clamped to avoid NaN at the gimbal-lock singularity.
+        """
+        x, y, z, w = self.x, self.y, self.z, self.w
+
+        # Roll (rotation about X).
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        # Pitch (rotation about Y), clamped to [-1, 1] against fp drift.
+        sinp = 2.0 * (w * y - z * x)
+        sinp = max(-1.0, min(1.0, sinp))
+        pitch = math.asin(sinp)
+
+        # Yaw (rotation about Z).
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        return roll, pitch, yaw
+
 
 @dataclass
 class Pose:

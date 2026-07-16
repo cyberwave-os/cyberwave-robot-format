@@ -23,9 +23,24 @@ from pathlib import Path
 from xml.dom import minidom
 
 from cyberwave_robot_format.core import BaseExporter
-from cyberwave_robot_format.schema import Collision, CommonSchema, GeometryType, Joint, JointType, Link, Visual
+from cyberwave_robot_format.schema import (
+    Collision,
+    CommonSchema,
+    GeometryType,
+    Joint,
+    JointType,
+    Link,
+    Pose,
+    Visual,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _rpy_str(pose: Pose) -> str:
+    """Return the pose orientation as a URDF ``rpy`` string (Fixed XYZ, radians)."""
+    roll, pitch, yaw = pose.orientation.to_rpy()
+    return f"{roll} {pitch} {yaw}"
 
 
 class URDFExporter(BaseExporter):
@@ -37,7 +52,7 @@ class URDFExporter(BaseExporter):
 
     def export(self, schema: CommonSchema, output_path: str | Path) -> None:
         """Export common schema to URDF format.
-        
+
         Handles special cases:
         - If any joint has parent_link='world', a world link is automatically injected
         - JointType.FREE is mapped to URDF 'floating' joint type
@@ -72,7 +87,9 @@ class URDFExporter(BaseExporter):
             ET.SubElement(inertial, "mass", value=str(link.mass))
 
             com = link.center_of_mass
-            ET.SubElement(inertial, "origin", xyz=f"{com.x} {com.y} {com.z}", rpy="0 0 0")
+            ET.SubElement(
+                inertial, "origin", xyz=f"{com.x} {com.y} {com.z}", rpy="0 0 0"
+            )
 
             inertia = link.inertia
             ET.SubElement(
@@ -94,7 +111,7 @@ class URDFExporter(BaseExporter):
 
     def _add_joint(self, robot: ET.Element, joint: Joint) -> None:
         """Add joint element to URDF.
-        
+
         JointType.FLOATING maps to URDF 'floating' type for mobile/floating base robots.
         """
         type_mapping = {
@@ -115,7 +132,12 @@ class URDFExporter(BaseExporter):
         ET.SubElement(joint_elem, "child", link=joint.child_link)
 
         pos = joint.pose.position
-        ET.SubElement(joint_elem, "origin", xyz=f"{pos.x} {pos.y} {pos.z}", rpy="0 0 0")
+        ET.SubElement(
+            joint_elem,
+            "origin",
+            xyz=f"{pos.x} {pos.y} {pos.z}",
+            rpy=_rpy_str(joint.pose),
+        )
 
         axis = joint.axis
         ET.SubElement(joint_elem, "axis", xyz=f"{axis.x} {axis.y} {axis.z}")
@@ -157,7 +179,12 @@ class URDFExporter(BaseExporter):
             visual_elem.set("name", visual.name)
 
         pos = visual.pose.position
-        ET.SubElement(visual_elem, "origin", xyz=f"{pos.x} {pos.y} {pos.z}", rpy="0 0 0")
+        ET.SubElement(
+            visual_elem,
+            "origin",
+            xyz=f"{pos.x} {pos.y} {pos.z}",
+            rpy=_rpy_str(visual.pose),
+        )
 
         if visual.geometry:
             self._add_geometry(visual_elem, visual.geometry)
@@ -172,7 +199,12 @@ class URDFExporter(BaseExporter):
             collision_elem.set("name", collision.name)
 
         pos = collision.pose.position
-        ET.SubElement(collision_elem, "origin", xyz=f"{pos.x} {pos.y} {pos.z}", rpy="0 0 0")
+        ET.SubElement(
+            collision_elem,
+            "origin",
+            xyz=f"{pos.x} {pos.y} {pos.z}",
+            rpy=_rpy_str(collision.pose),
+        )
 
         if collision.geometry:
             self._add_geometry(collision_elem, collision.geometry)

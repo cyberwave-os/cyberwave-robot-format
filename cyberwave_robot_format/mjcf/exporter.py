@@ -207,6 +207,8 @@ class MJCFExporter(BaseExporter):
         # Add collision configuration (excludes and pairs)
         self._add_contact_section(mujoco, schema)
 
+        self._add_equality_section(mujoco, schema)
+
         actuator_elem = ET.SubElement(mujoco, "actuator")
 
         if schema.actuators:
@@ -567,6 +569,13 @@ class MJCFExporter(BaseExporter):
                     and joint.dynamics.spring_stiffness != 0.0
                 ):
                     joint_elem.set("stiffness", str(joint.dynamics.spring_stiffness))
+            elif joint.mimic is not None:
+                # Mimic slaves without authored dynamics get a light default
+                # damping/armature. The <equality> coupling constrains position,
+                # but between solver iterations an undamped gram-scale finger
+                # link can still ring; a touch of damping dissipates it.
+                joint_elem.set("damping", "0.2")
+                joint_elem.set("armature", "0.001")
 
         # A movable body must always have a valid inertial.
         is_movable_joint = joint.type not in (JointType.FIXED,)
@@ -991,6 +1000,44 @@ class MJCFExporter(BaseExporter):
                 pair_attrs.update({k: str(v) for k, v in pair.extensions.items()})
 
             ET.SubElement(contact, "pair", pair_attrs)
+
+    def _add_equality_section(self, mujoco: ET.Element, schema: CommonSchema) -> None:
+        """Add <equality> joint couplings for mimic joints.
+
+        A URDF ``<mimic>`` (``Joint.mimic``) declares ``slave = offset +
+        multiplier * driver``. Without the corresponding MJCF
+        ``<equality><joint .../>`` element the slave joint is left free and
+        undamped — e.g. the Robotiq 2F-85 finger linkage joints swing as
+        undamped pendulums, never settle, and accumulate energy that shakes the
+        whole arm (and its wrist camera). MJCF expresses the same coupling as
+        ``q_joint1 = polycoef(q_joint2)`` with ``polycoef = offset multiplier
+        0 0 0``. Solver params are left at MuJoCo defaults so the constraint is
+        stable across the exported timesteps (plant 0.002 s, RL 0.005 s).
+        """
+        joint_names = {j.name for j in schema.joints}
+        mimic_joints = [
+            j
+            for j in schema.joints
+            if j.mimic is not None
+            and j.type != JointType.FIXED
+            and j.mimic.joint in joint_names
+        ]
+        if not mimic_joints:
+            return
+
+        equality = ET.SubElement(mujoco, "equality")
+        for joint in mimic_joints:
+            ET.SubElement(
+                equality,
+                "joint",
+                {
+                    "joint1": joint.name,
+                    "joint2": joint.mimic.joint,
+                    "polycoef": (
+                        f"{joint.mimic.offset} {joint.mimic.multiplier} 0 0 0"
+                    ),
+                },
+            )
 
     def _write_pretty_xml(self, root: ET.Element, output_path: str | Path) -> None:
         """Write XML with pretty formatting."""

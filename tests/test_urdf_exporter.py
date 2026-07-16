@@ -14,6 +14,7 @@
 
 """Unit tests for URDFExporter."""
 
+import math
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -21,13 +22,18 @@ from pathlib import Path
 import pytest
 
 from cyberwave_robot_format.schema import (
+    Collision,
     CommonSchema,
+    Geometry,
+    GeometryType,
     Joint,
     JointType,
     Link,
     Metadata,
     Pose,
+    Quaternion,
     Vector3,
+    Visual,
 )
 from cyberwave_robot_format.urdf import URDFExporter
 
@@ -65,11 +71,15 @@ class TestURDFExporterWorldLink:
             root = tree.getroot()
 
             # Check that world link exists
-            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            world_links = [
+                link for link in root.findall("link") if link.get("name") == "world"
+            ]
             assert len(world_links) == 1, "World link should be injected"
 
             # Check that base_link also exists
-            base_links = [link for link in root.findall("link") if link.get("name") == "base_link"]
+            base_links = [
+                link for link in root.findall("link") if link.get("name") == "base_link"
+            ]
             assert len(base_links) == 1, "base_link should exist"
 
             # Check the joint references world correctly
@@ -113,7 +123,9 @@ class TestURDFExporterWorldLink:
             root = tree.getroot()
 
             # Check that only one world link exists (not duplicated)
-            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            world_links = [
+                link for link in root.findall("link") if link.get("name") == "world"
+            ]
             assert len(world_links) == 1, "World link should not be duplicated"
 
         finally:
@@ -150,9 +162,94 @@ class TestURDFExporterWorldLink:
             root = tree.getroot()
 
             # Check that no world link exists
-            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            world_links = [
+                link for link in root.findall("link") if link.get("name") == "world"
+            ]
             assert len(world_links) == 0, "World link should not be injected"
 
+        finally:
+            Path(output_path).unlink(missing_ok=True)
+
+
+class TestQuaternionRpyRoundTrip:
+    """Quaternion.to_rpy must invert from_rpy (Fixed XYZ)."""
+
+    @pytest.mark.parametrize(
+        "rpy",
+        [
+            (0.0, 0.0, 0.0),
+            (0.3, 0.0, 0.0),
+            (0.0, -0.4, 0.0),
+            (0.0, 0.0, 1.2),
+            (0.3, -0.4, 1.2),
+            (-1.0, 0.5, -2.5),
+        ],
+    )
+    def test_roundtrip(self, rpy):
+        q = Quaternion.from_rpy(*rpy)
+        out = q.to_rpy()
+        for got, want in zip(out, rpy):
+            assert math.isclose(got, want, abs_tol=1e-9)
+
+
+class TestURDFExporterOrientation:
+    """Origins must carry the pose orientation, not a hardcoded rpy='0 0 0'."""
+
+    def _parse_rpy(self, elem: ET.Element) -> tuple[float, float, float]:
+        origin = elem.find("origin")
+        assert origin is not None
+        return tuple(float(v) for v in origin.get("rpy").split())
+
+    def test_joint_visual_collision_orientation_preserved(self):
+        rpy = (0.3, -0.4, 1.2)
+        geom = Geometry(type=GeometryType.BOX, size=Vector3(x=0.1, y=0.1, z=0.1))
+        schema = CommonSchema(
+            metadata=Metadata(name="rotated"),
+            links=[
+                Link(name="world", mass=0.0),
+                Link(
+                    name="prop",
+                    mass=1.0,
+                    visuals=[
+                        Visual(
+                            pose=Pose.from_xyzrpy([0, 0, 0], list(rpy)), geometry=geom
+                        )
+                    ],
+                    collisions=[
+                        Collision(
+                            pose=Pose.from_xyzrpy([0, 0, 0], list(rpy)), geometry=geom
+                        )
+                    ],
+                ),
+            ],
+            joints=[
+                Joint(
+                    name="world_to_prop",
+                    type=JointType.FIXED,
+                    parent_link="world",
+                    child_link="prop",
+                    pose=Pose.from_xyzrpy([1.0, 2.0, 3.0], list(rpy)),
+                ),
+            ],
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".urdf", delete=False) as f:
+            output_path = f.name
+        try:
+            URDFExporter().export(schema, output_path)
+            root = ET.parse(output_path).getroot()
+
+            joint = root.find("joint")
+            for got, want in zip(self._parse_rpy(joint), rpy):
+                assert math.isclose(got, want, abs_tol=1e-6)
+
+            prop = next(
+                link for link in root.findall("link") if link.get("name") == "prop"
+            )
+            for got, want in zip(self._parse_rpy(prop.find("visual")), rpy):
+                assert math.isclose(got, want, abs_tol=1e-6)
+            for got, want in zip(self._parse_rpy(prop.find("collision")), rpy):
+                assert math.isclose(got, want, abs_tol=1e-6)
         finally:
             Path(output_path).unlink(missing_ok=True)
 
@@ -241,7 +338,9 @@ class TestURDFExporterJointTypes:
             root = tree.getroot()
 
             # Check world link is injected
-            world_links = [link for link in root.findall("link") if link.get("name") == "world"]
+            world_links = [
+                link for link in root.findall("link") if link.get("name") == "world"
+            ]
             assert len(world_links) == 1
 
             # Check joint is floating type
