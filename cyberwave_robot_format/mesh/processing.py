@@ -92,15 +92,20 @@ def convert_mesh_bytes_to_obj(
     original_filename: str,
     scale: Vector3 | None = None,
 ) -> bytes:
-    """Convert DAE/STL mesh bytes to OBJ format in-memory.
+    """Convert mesh bytes (DAE/GLB/glTF/STL/…) to OBJ format in-memory.
 
     Cloud-safe converter that works with bytes without requiring
     filesystem access to original mesh files. This function is designed
     for use in cloud environments where mesh files are stored in object
     storage (S3, GCS, etc.) rather than on the local filesystem.
 
+    Any format trimesh can load is accepted; the extension is taken from
+    ``original_filename`` so trimesh picks the right loader. This is how
+    MuJoCo-undecodable formats (DAE, GLB/glTF) are turned into OBJ for the
+    MuJoCo scene export.
+
     Args:
-        mesh_bytes: Raw mesh file bytes (DAE, STL, etc.)
+        mesh_bytes: Raw mesh file bytes (DAE, GLB, glTF, STL, etc.)
         original_filename: Original filename (used for extension detection)
         scale: Optional scale to apply to mesh vertices
 
