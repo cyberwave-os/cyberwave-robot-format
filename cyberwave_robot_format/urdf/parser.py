@@ -50,6 +50,13 @@ from cyberwave_robot_format.utils import sanitize_name
 
 logger = logging.getLogger(__name__)
 
+# Sensor types whose parameters live in a Gazebo ``<ray>`` block. "ray" is
+# Gazebo's own spelling and is resolved to lidar_2d/lidar_3d from the scan block;
+# the concrete names are accepted too so a URDF may state the type outright.
+_RAY_SENSOR_TYPES = frozenset(
+    {"ray", "gpu_ray", "lidar", "lidar_2d", "lidar_3d", "rangefinder"}
+)
+
 
 class URDFParser(BaseParser):
     """URDF parser with enhanced validation and error handling."""
@@ -312,8 +319,67 @@ class URDFParser(BaseParser):
             camera_elem = sensor_elem.find("camera")
             if camera_elem is not None:
                 self._extract_camera_properties(camera_elem, sensor)
+        elif sensor_type in _RAY_SENSOR_TYPES:
+            ray_elem = sensor_elem.find("ray")
+            if ray_elem is not None:
+                self._extract_ray_properties(ray_elem, sensor)
+            # Gazebo spells every scanning range sensor "ray" regardless of
+            # whether it sweeps in one plane or two. Resolve it to the concrete
+            # type using the scan block, per the Gazebo/SDF spec: a <vertical>
+            # scan means a 3D sweep, horizontal-only means a planar 2D scanner.
+            # Left verbatim, "ray" reaches consumers as an unrecognized type that
+            # range rendering and the sensor-type union both ignore.
+            if sensor_type == "ray":
+                scan = ray_elem.find("scan") if ray_elem is not None else None
+                vertical = scan.find("vertical") if scan is not None else None
+                sensor.type = "lidar_2d" if vertical is None else "lidar_3d"
 
         sensors.append(sensor)
+
+    def _extract_ray_properties(self, elem: ET.Element, sensor: Sensor) -> None:
+        """Extract lidar/rangefinder properties from a Gazebo ``<ray>`` block.
+
+        Angles are radians in the URDF and degrees in the schema. ``samples`` is
+        per-scan, so the platform's ``points_per_second`` needs the sensor's
+        update rate applied.
+
+        Only fields the schema actually models are emitted. ``<noise>`` is
+        skipped: ``Sensor.noise`` is typed ``dict[str, float | list[float]]``,
+        for which no structure hook is registered, so populating it makes
+        ``CommonSchema.from_dict`` raise.
+        """
+
+        def _f(path: str) -> float | None:
+            node = elem.find(path)
+            if node is None or not node.text:
+                return None
+            try:
+                return float(node.text)
+            except ValueError:
+                return None
+
+        samples_total = 1.0
+        for axis, fov_key in (("horizontal", "fov_horizontal"), ("vertical", "fov_vertical")):
+            min_angle = _f(f"scan/{axis}/min_angle")
+            max_angle = _f(f"scan/{axis}/max_angle")
+            if min_angle is not None and max_angle is not None:
+                sensor.parameters[fov_key] = math.degrees(abs(max_angle - min_angle))
+            samples = _f(f"scan/{axis}/samples")
+            if samples is not None and samples > 0:
+                samples_total *= samples
+
+        min_range = _f("range/min")
+        if min_range is not None:
+            sensor.parameters["min_range"] = min_range
+        max_range = _f("range/max")
+        if max_range is not None:
+            sensor.parameters["max_range"] = max_range
+
+        # samples are per scan; the schema wants a rate.
+        if samples_total > 1.0 and sensor.update_rate:
+            sensor.parameters["points_per_second"] = int(
+                samples_total * sensor.update_rate
+            )
 
     def _parse_gazebo_camera_direct(
         self,
@@ -340,14 +406,30 @@ class URDFParser(BaseParser):
         sensors.append(sensor)
 
     def _extract_camera_properties(self, elem: ET.Element, sensor: Sensor) -> None:
-        """Extract camera properties like fov, image size from element."""
+        """Extract camera properties like fov, image size from element.
+
+        Gazebo's ``<hfov>`` is a *horizontal* field of view in *radians*. It is
+        emitted as ``fov_horizontal`` in degrees, and the vertical ``fov_vertical``
+        is derived from it once the image aspect ratio is known.
+
+        It is deliberately NOT written to ``fovy``: consumers treat ``fovy`` as a
+        vertical FOV in degrees, so copying a radian horizontal value there
+        (as this did previously) imported a stock ``<hfov>1.204</hfov>`` camera as
+        a 1.2-degree vertical pinhole — wrong on both axis and unit, and silently
+        so. ``hfov`` is still published in radians under its own Gazebo-native
+        name for anything that wants the raw value.
+        """
+        hfov_rad: float | None = None
         hfov = elem.find("hfov")
         if hfov is not None and hfov.text:
             try:
-                sensor.parameters["fovy"] = float(hfov.text)
-                sensor.parameters["hfov"] = float(hfov.text)
+                hfov_rad = float(hfov.text)
             except ValueError:
-                pass
+                hfov_rad = None
+        if hfov_rad is not None:
+            # Gazebo-native name keeps its native unit (radians).
+            sensor.parameters["hfov"] = hfov_rad
+            sensor.parameters["fov_horizontal"] = math.degrees(hfov_rad)
 
         image = elem.find("image")
         if image is not None:
@@ -359,10 +441,23 @@ class URDFParser(BaseParser):
             if height is not None and height.text:
                 sensor.parameters["height"] = int(height.text)
 
-        if "hfov" not in sensor.parameters:
-            hfov = elem.find("hfov")
-            if hfov is not None and hfov.text:
-                sensor.parameters["hfov"] = float(hfov.text)
+        # Vertical FOV follows from the horizontal FOV and the image aspect ratio
+        # for a rectilinear pinhole: tan(v/2) = tan(h/2) * height / width.
+        width_px = sensor.parameters.get("width")
+        height_px = sensor.parameters.get("height")
+        if (
+            hfov_rad is not None
+            and isinstance(width_px, int)
+            and isinstance(height_px, int)
+            and width_px > 0
+            and height_px > 0
+        ):
+            fov_v_rad = 2.0 * math.atan(
+                math.tan(hfov_rad / 2.0) * (height_px / width_px)
+            )
+            sensor.parameters["fov_vertical"] = math.degrees(fov_v_rad)
+            # ``fovy`` is the vertical FOV in degrees — now genuinely vertical.
+            sensor.parameters["fovy"] = math.degrees(fov_v_rad)
 
         img_size = elem.find("imageSize")
         if img_size is not None and img_size.text:

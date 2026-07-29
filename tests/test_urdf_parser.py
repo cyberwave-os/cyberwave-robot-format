@@ -141,3 +141,153 @@ def test_urdf_parser_preserves_mimic_joint(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Gazebo sensor extensions
+#
+# Sensor specs live in <gazebo> blocks, which is the only place a vendor URDF
+# states scan geometry, range, resolution and update rate. These were previously
+# untested, which is how the <hfov> unit/axis defect below survived.
+# ---------------------------------------------------------------------------
+
+_SENSOR_URDF = """<?xml version="1.0"?>
+<robot name="sensor_bot">
+  <link name="base_link" />
+  <link name="scan_link" />
+  <joint name="base_to_scan" type="fixed">
+    <parent link="base_link" /><child link="scan_link" />
+  </joint>
+  <link name="cam_link" />
+  <joint name="base_to_cam" type="fixed">
+    <parent link="base_link" /><child link="cam_link" />
+  </joint>
+  <link name="dome_link" />
+  <joint name="base_to_dome" type="fixed">
+    <parent link="base_link" /><child link="dome_link" />
+  </joint>
+
+  <gazebo reference="scan_link">
+    <sensor name="planar_scanner" type="ray">
+      <update_rate>12.5</update_rate>
+      <ray>
+        <scan><horizontal>
+          <samples>541</samples>
+          <min_angle>-2.35619449615</min_angle>
+          <max_angle>2.35619449615</max_angle>
+        </horizontal></scan>
+        <range><min>0.05</min><max>29.0</max></range>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.01</stddev></noise>
+      </ray>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="dome_link">
+    <sensor name="dome_scanner" type="ray">
+      <update_rate>10.0</update_rate>
+      <ray>
+        <scan>
+          <horizontal><samples>360</samples><min_angle>-3.14159265</min_angle><max_angle>3.14159265</max_angle></horizontal>
+          <vertical><samples>16</samples><min_angle>-0.261799</min_angle><max_angle>0.261799</max_angle></vertical>
+        </scan>
+        <range><min>0.1</min><max>100.0</max></range>
+      </ray>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="cam_link">
+    <sensor name="front_cam" type="camera">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <hfov>1.5707963267948966</hfov>
+        <image><width>1280</width><height>720</height></image>
+      </camera>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+@pytest.fixture
+def sensor_urdf_path(tmp_path):
+    path = tmp_path / "sensor_bot.urdf"
+    path.write_text(_SENSOR_URDF)
+    return path
+
+
+@pytest.fixture
+def sensors_by_name(sensor_urdf_path):
+    schema = URDFParser().parse(sensor_urdf_path)
+    return {s.name: s for s in schema.sensors}
+
+
+def test_gazebo_sensor_parent_link_and_rate(sensors_by_name):
+    """Every sensor lands on the link it references, with its update rate."""
+    assert set(sensors_by_name) == {"planar_scanner", "dome_scanner", "front_cam"}
+    assert sensors_by_name["planar_scanner"].parent_link == "scan_link"
+    assert sensors_by_name["planar_scanner"].update_rate == 12.5
+    assert sensors_by_name["front_cam"].parent_link == "cam_link"
+    assert sensors_by_name["front_cam"].update_rate == 30.0
+
+
+def test_gazebo_ray_resolves_to_2d_when_scan_is_planar(sensors_by_name):
+    """Gazebo calls every scanner "ray"; a horizontal-only scan is a 2D lidar.
+
+    Left as "ray" the type reaches consumers unrecognized, invisible to range
+    rendering and to the sensor-type union.
+    """
+    assert sensors_by_name["planar_scanner"].type == "lidar_2d"
+
+
+def test_gazebo_ray_resolves_to_3d_when_scan_has_vertical_block(sensors_by_name):
+    assert sensors_by_name["dome_scanner"].type == "lidar_3d"
+
+
+def test_gazebo_ray_parameters_are_extracted(sensors_by_name):
+    """<ray> scan/range convert to schema parameters; angles become degrees."""
+    params = sensors_by_name["planar_scanner"].parameters
+    assert params["fov_horizontal"] == pytest.approx(270.0, abs=1e-3)
+    assert params["min_range"] == pytest.approx(0.05)
+    assert params["max_range"] == pytest.approx(29.0)
+    # samples are per-scan, so the rate has to be applied: 541 * 12.5
+    assert params["points_per_second"] == 6762
+
+
+def test_gazebo_ray_3d_multiplies_samples_across_both_axes(sensors_by_name):
+    params = sensors_by_name["dome_scanner"].parameters
+    assert params["fov_horizontal"] == pytest.approx(360.0, abs=1e-3)
+    assert params["fov_vertical"] == pytest.approx(30.0, abs=1e-2)
+    assert params["points_per_second"] == 360 * 16 * 10
+
+
+def test_gazebo_ray_noise_is_not_emitted(sensors_by_name):
+    """``Sensor.noise`` has no cattrs structure hook, so populating it would make
+    ``CommonSchema.from_dict`` raise and silently degrade the twin."""
+    assert sensors_by_name["planar_scanner"].noise is None
+
+
+def test_gazebo_camera_hfov_is_converted_to_degrees_not_copied_to_fovy(
+    sensors_by_name,
+):
+    """Regression: <hfov> is horizontal and in radians.
+
+    It used to be copied verbatim into ``fovy``, which consumers read as a
+    vertical FOV in degrees — importing a 90-degree camera as a 1.57-degree
+    pinhole.
+    """
+    params = sensors_by_name["front_cam"].parameters
+    # native Gazebo name keeps radians
+    assert params["hfov"] == pytest.approx(1.5707963267948966)
+    # horizontal, in degrees
+    assert params["fov_horizontal"] == pytest.approx(90.0)
+    # vertical derived from the 1280x720 aspect: 2*atan(tan(45deg) * 720/1280)
+    assert params["fov_vertical"] == pytest.approx(58.715, abs=1e-2)
+    assert params["fovy"] == pytest.approx(58.715, abs=1e-2)
+    # the old bug: fovy must never be the raw radian horizontal value
+    assert params["fovy"] != pytest.approx(1.5707963267948966)
+
+
+def test_gazebo_camera_resolution_is_extracted(sensors_by_name):
+    params = sensors_by_name["front_cam"].parameters
+    assert params["width"] == 1280
+    assert params["height"] == 720

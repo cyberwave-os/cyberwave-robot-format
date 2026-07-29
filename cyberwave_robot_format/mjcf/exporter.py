@@ -45,6 +45,115 @@ from cyberwave_robot_format.schema import (
 logger = logging.getLogger(__name__)
 
 
+# Schema sensor type -> the MuJoCo ``<sensor>`` tags it expands to.
+#
+# The two vocabularies are not the same shape. MuJoCo has no "IMU" — it has a
+# gyro and an accelerometer sharing a site — so a device-level schema type maps
+# to several primitives. Raw MuJoCo tag names are accepted verbatim too, so a
+# schema authored directly against MJCF keeps working.
+_MJCF_SENSOR_TAGS: dict[str, tuple[str, ...]] = {
+    # Device-level types used by the universal schema / asset editor.
+    "imu": ("gyro", "accelerometer"),
+    "contact": ("touch",),
+    "touch_sensor": ("touch",),
+    "ultrasound": ("rangefinder",),
+    "sonar": ("rangefinder",),
+    "force_torque": ("force", "torque"),
+    # Raw MuJoCo primitives, passed through unchanged.
+    "accelerometer": ("accelerometer",),
+    "gyro": ("gyro",),
+    "velocimeter": ("velocimeter",),
+    "force": ("force",),
+    "torque": ("torque",),
+    "magnetometer": ("magnetometer",),
+    "rangefinder": ("rangefinder",),
+    "touch": ("touch",),
+    "jointpos": ("jointpos",),
+    "jointvel": ("jointvel",),
+    "framepos": ("framepos",),
+    "framequat": ("framequat",),
+    "framelinvel": ("framelinvel",),
+    "frameangvel": ("frameangvel",),
+    "framelinacc": ("framelinacc",),
+    "frameangacc": ("frameangacc",),
+}
+
+# Sensors MuJoCo cannot express as a ``<sensor>`` element. They are sampled at
+# runtime by casting ``mj_ray`` (see ``cyberwave-sim/sensors/range.py``), so their
+# absence from the MJCF is correct rather than a gap — hence no warning.
+_RUNTIME_SAMPLED_SENSOR_TYPES = frozenset(
+    {
+        "lidar",
+        "lidar_2d",
+        "lidar_3d",
+        "lidar_4d",
+        "laser",
+        "laser_scan",
+        "ray",
+        "radar",
+        "radar_2d",
+        "radar_3d",
+        "pointcloud",
+        "point_cloud",
+        "depth",
+        "rgb",
+        "map",
+    }
+)
+
+# MuJoCo sensors that measure at a frame and therefore need a ``<site>``.
+# ``jointpos``/``jointvel`` reference a joint instead, and are excluded.
+_SITE_ATTACHED_TAGS = frozenset(
+    {
+        "accelerometer",
+        "gyro",
+        "velocimeter",
+        "magnetometer",
+        "rangefinder",
+        "touch",
+        "force",
+        "torque",
+    }
+)
+
+# Sites exist only as sensor mount frames; group 4 keeps them out of the way of
+# the visual (2) / collision (3) / camera-housing (5) groups the exporter uses.
+_SENSOR_SITE_GROUP = "4"
+
+
+def _needs_site(sensor_type: str | None) -> bool:
+    """True when a schema sensor maps to at least one site-attached primitive."""
+    tags = _MJCF_SENSOR_TAGS.get((sensor_type or "").lower())
+    if not tags:
+        return False
+    return any(tag in _SITE_ATTACHED_TAGS for tag in tags)
+
+
+def _is_passive_joint(joint: Joint) -> bool:
+    """True when the schema explicitly marks a joint as undriven.
+
+    Opt-in via ``extensions.passive`` rather than inferred: there is no reliable
+    structural signal for "undriven" in an imported URDF (``<transmission>``
+    declares the driven set, but nothing converts it), and guessing from joint
+    names would be exactly the kind of heuristic this codebase forbids. Assets
+    that declare their own ``actuators`` bypass this path entirely, which is the
+    preferred fix.
+    """
+    extensions = getattr(joint, "extensions", None)
+    if not isinstance(extensions, dict):
+        return False
+    return bool(extensions.get("passive"))
+
+
+def site_name_for_sensor(sensor: Sensor) -> str:
+    """Name of the ``<site>`` that carries this sensor.
+
+    Derived from the sensor name, which the scene composer has already namespaced
+    per twin, so two twins of the same asset cannot collide.
+    """
+    return f"{sensor.name}_site"
+
+
 class MJCFExporter(BaseExporter):
     """Exporter for MJCF (MuJoCo Model Format) files."""
 
@@ -54,6 +163,13 @@ class MJCFExporter(BaseExporter):
 
     def export(self, schema: CommonSchema, output_path: str | Path) -> None:
         """Export common schema to MJCF format."""
+        # Names of the <site> elements actually emitted during body construction.
+        # ``_add_sensor`` consults it before writing a site reference: MuJoCo fails
+        # to compile a model whose sensor names a site that does not exist, so a
+        # sensor whose parent_link matched no exported body must be skipped rather
+        # than left dangling. Reset per export so a reused exporter cannot carry
+        # names across models.
+        self._emitted_sites: set[str] = set()
         mujoco = ET.Element("mujoco", model=schema.metadata.name)
 
         ET.SubElement(mujoco, "compiler", angle="radian", autolimits="true")
@@ -220,7 +336,17 @@ class MJCFExporter(BaseExporter):
             for actuator in schema.actuators:
                 self._add_actuator(actuator_elem, actuator, joint_limits_map)
         else:
+            # No declared actuators: fall back to one motor per movable joint so an
+            # imported URDF is still controllable. Joints the schema marks passive
+            # are skipped — a caster swivel or free-rolling wheel must not be
+            # driven, and motorizing it both fights the physics and adds phantom
+            # entries to the control vector.
             for joint in schema.joints:
+                if _is_passive_joint(joint):
+                    logger.debug(
+                        "Joint %s is marked passive; no actuator emitted.", joint.name
+                    )
+                    continue
                 if joint.type != JointType.FIXED and joint.type != JointType.FLOATING:
                     motor = ET.SubElement(actuator_elem, "motor")
                     motor.set("name", f"{joint.name}_ctrl")
@@ -451,11 +577,17 @@ class MJCFExporter(BaseExporter):
 
         if schema.sensors:
             for sensor in schema.sensors:
-                if (
-                    sensor.type in ("camera", "depth_camera")
-                    and sensor.parent_link == link.name
-                ):
+                if sensor.parent_link != link.name:
+                    continue
+                if sensor.type in ("camera", "depth_camera"):
                     self._add_camera(body, sensor)
+                else:
+                    # Root links come through this path, and a site-attached sensor
+                    # mounted here (an IMU on base_link is the common case) needs
+                    # its <site> on this body. Omitting it left <gyro site="..."/>
+                    # pointing at nothing, which MuJoCo rejects for the whole model
+                    # — so one root-mounted IMU broke the entire scene export.
+                    self._add_sensor_site(body, sensor)
 
         if link.name in link_to_children:
             for joint, child_link_name in link_to_children[link.name]:
@@ -472,6 +604,38 @@ class MJCFExporter(BaseExporter):
                         link_to_children,
                         mesh_name_map,
                     )
+
+    def _add_sensor_site(self, body: ET.Element, sensor: Sensor) -> None:
+        """Create the ``<site>`` a site-attached sensor will reference.
+
+        ``_add_sensor`` writes ``site="..."`` on gyro/accelerometer/rangefinder
+        and friends, but nothing ever created those sites — and MuJoCo fails to
+        *compile* a model whose sensor references a missing site. Declaring such a
+        sensor therefore used to break the whole scene rather than being ignored.
+
+        The site also gives the runtime raycaster an exact mount frame to cast
+        from (see ``cyberwave-sim/sensors/range.py``), which is what a
+        corner-mounted scanner needs.
+        """
+        if not _needs_site(sensor.type):
+            return
+        site_name = site_name_for_sensor(sensor)
+        site = ET.SubElement(body, "site", name=site_name)
+        site.set("group", _SENSOR_SITE_GROUP)
+        self._emitted_sites.add(site_name)
+        if sensor.pose:
+            if sensor.pose.position:
+                pos = sensor.pose.position
+                site.set("pos", f"{pos.x} {pos.y} {pos.z}")
+            if sensor.pose.orientation:
+                quat = sensor.pose.orientation
+                if not (
+                    abs(quat.w - 1.0) < 1e-9
+                    and abs(quat.x) < 1e-9
+                    and abs(quat.y) < 1e-9
+                    and abs(quat.z) < 1e-9
+                ):
+                    site.set("quat", f"{quat.w} {quat.x} {quat.y} {quat.z}")
 
     def _add_camera(self, body: ET.Element, sensor: Sensor) -> None:
         """Add camera element to body."""
@@ -618,17 +782,16 @@ class MJCFExporter(BaseExporter):
 
         if schema.sensors:
             for sensor in schema.sensors:
-                if (
-                    sensor.type in ("camera", "depth_camera")
-                    and sensor.parent_link == link.name
-                ):
+                if sensor.parent_link != link.name:
+                    continue
+                if sensor.type in ("camera", "depth_camera"):
                     self._add_camera(body, sensor)
-                elif sensor.type not in ("camera", "depth_camera"):
-                    logger.warning(
-                        "Sensor %s with type %s is not supported.",
-                        sensor.name,
-                        sensor.type,
-                    )
+                else:
+                    # Every site-attached MuJoCo sensor (gyro, accelerometer,
+                    # rangefinder, touch, ...) needs a <site> to reference. The
+                    # site must be created on the body it is mounted to, which is
+                    # only reachable here.
+                    self._add_sensor_site(body, sensor)
 
         if link.name in link_to_children:
             for child_joint, child_link_name in link_to_children[link.name]:
@@ -899,51 +1062,119 @@ class MJCFExporter(BaseExporter):
                 act.set("kv", str(actuator.kd))
 
     def _add_sensor(self, sensor_elem: ET.Element, sensor: Sensor) -> None:
-        """Add sensor entry."""
-        sensor_type = sensor.type.lower()
-        allowed_types = {
-            "accelerometer": "accelerometer",
-            "gyro": "gyro",
-            "force": "force",
-            "torque": "torque",
-            "magnetometer": "magnetometer",
-            "rangefinder": "rangefinder",
-            "camera": "camera",
-            "touch": "touch",
-            "jointpos": "jointpos",
-            "jointvel": "jointvel",
-            "framepos": "framepos",
-            "framequat": "framequat",
-            "framelinvel": "framelinvel",
-            "frameangvel": "frameangvel",
-            "framelinacc": "framelinacc",
-            "frameangacc": "frameangacc",
-        }
-        tag = allowed_types.get(sensor_type)
-        if not tag:
-            return
-        attrs = {"name": sensor.name}
+        """Add one or more ``<sensor>`` entries for a schema sensor.
 
-        if sensor_type in ("jointpos", "jointvel"):
-            joint_name = (
-                sensor.parameters.get("joint")
-                if hasattr(sensor, "parameters")
-                else None
+        A schema sensor and a MuJoCo sensor are not 1:1. ``imu`` is a *device*
+        that MuJoCo models as several primitives on one site, so it expands to
+        ``gyro`` + ``accelerometer`` — which is exactly the pair
+        ``cyberwave-sim/sensors/imu.py`` looks for in ``sensordata``. Types that
+        MuJoCo has no primitive for (lidar, radar, point clouds) are sampled at
+        runtime with ``mj_ray`` instead and are skipped here without a warning:
+        they are not broken, just not MJCF-native.
+        """
+        sensor_type = (sensor.type or "").lower()
+
+        if sensor_type in _RUNTIME_SAMPLED_SENSOR_TYPES:
+            logger.debug(
+                "Sensor %s (%s) is sampled at runtime via mj_ray; no MJCF sensor "
+                "element is emitted.",
+                sensor.name,
+                sensor.type,
             )
-            if joint_name:
-                attrs["joint"] = joint_name
-        else:
-            if sensor.parent_link and sensor.parent_link != "world":
-                attrs["site"] = sensor.parent_link
-        if sensor.pose and sensor.pose.position:
-            pos = sensor.pose.position
-            attrs["pos"] = f"{pos.x} {pos.y} {pos.z}"
-        if sensor.pose and sensor.pose.orientation:
-            quat = sensor.pose.orientation
-            attrs["quat"] = f"{quat.w} {quat.x} {quat.y} {quat.z}"
-        sens_elem = ET.SubElement(sensor_elem, tag, **attrs)
-        if sensor.update_rate is not None:
-            sens_elem.set("cutoff", str(sensor.update_rate))
+            return
+
+        tags = _MJCF_SENSOR_TAGS.get(sensor_type)
+        if not tags:
+            logger.warning(
+                "Sensor %s with type %s is not supported.", sensor.name, sensor.type
+            )
+            return
+
+        # A site-attached sensor whose site was never emitted would compile to a
+        # dangling reference and MuJoCo would reject the entire model, so drop the
+        # sensor instead of taking the whole scene down with it. Reachable when
+        # parent_link names no exported link at all (a typo, or "world").
+        # ``None`` means the caller reached this helper without going through
+        # ``export``, so there is nothing to check against.
+        emitted_sites = getattr(self, "_emitted_sites", None)
+        if (
+            emitted_sites is not None
+            and _needs_site(sensor.type)
+            and site_name_for_sensor(sensor) not in emitted_sites
+        ):
+            logger.warning(
+                "Sensor %s declares parent_link %r, which matched no exported body; "
+                "skipping it. A sensor referencing a missing site makes MuJoCo "
+                "reject the whole model.",
+                sensor.name,
+                sensor.parent_link,
+            )
+            return
+
+        for tag in tags:
+            # Multi-primitive devices (imu -> gyro + accelerometer) need distinct
+            # names; a single-primitive sensor keeps its own name so downstream
+            # lookups by sensor id keep working.
+            name = sensor.name if len(tags) == 1 else f"{sensor.name}_{tag}"
+            attrs = {"name": name}
+
+            if tag in ("jointpos", "jointvel"):
+                joint_name = (
+                    sensor.parameters.get("joint")
+                    if hasattr(sensor, "parameters")
+                    else None
+                )
+                if joint_name:
+                    attrs["joint"] = joint_name
+            elif _needs_site(sensor.type):
+                attrs["site"] = site_name_for_sensor(sensor)
+
+            sens_elem = ET.SubElement(sensor_elem, tag, **attrs)
+            self._set_sensor_cutoff(sens_elem, sensor, tag)
+            self._set_sensor_noise(sens_elem, sensor)
+
+    def _set_sensor_cutoff(
+        self, sens_elem: ET.Element, sensor: Sensor, tag: str
+    ) -> None:
+        """Set MuJoCo's ``cutoff``, which clamps the sensor *value*.
+
+        It is not a sample rate. ``cutoff`` was previously set from
+        ``update_rate``, so a 12.5 Hz scanner told MuJoCo to clamp its readings at
+        12.5 (metres, for a rangefinder). Sampling cadence has no MJCF
+        representation at all — it is honoured by the simulator's egress budget
+        (``range_stream_frequency_hz``) from the schema's own ``update_rate``.
+        """
+        params = sensor.parameters or {}
+        explicit = params.get("cutoff")
+        if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+            sens_elem.set("cutoff", str(float(explicit)))
+            return
+        if tag == "rangefinder":
+            # For a ranged sensor the meaningful clamp is its maximum range.
+            for key in ("max_range", "range_max"):
+                value = params.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    sens_elem.set("cutoff", str(float(value)))
+                    return
+
+    def _set_sensor_noise(self, sens_elem: ET.Element, sensor: Sensor) -> None:
+        """Carry a declared noise stddev onto the MJCF sensor.
+
+        Lives in ``parameters`` rather than the schema's ``noise`` field because
+        that field cannot be deserialized: it is typed
+        ``dict[str, float | list[float]]`` and cattrs has no structure hook for
+        that union, so any populated value makes ``CommonSchema.from_dict`` raise.
+        """
+        params = sensor.parameters or {}
+        for key in ("noise_stddev", "noise_std_m"):
+            value = params.get(key)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                sens_elem.set("noise", str(float(value)))
+                return
 
     def _add_contact_pair(self, contact_elem: ET.Element, contact: Contact) -> None:
         """Add contact pair entries."""
