@@ -48,7 +48,7 @@ from cyberwave_robot_format.mjcf import (
 )
 from cyberwave_robot_format.schema_export import export_universal_schema_json
 
-__version__ = "0.1.3"
+__version__ = "0.1.5"
 __all__ = [
     "CommonSchema",
     "Link",

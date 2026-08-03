@@ -77,7 +77,7 @@ def infer_mimic_joints(
         )
 
     mjcf_pairs = _infer_from_mjcf_equality(mjcf_path) if mjcf_path else []
-    kinematic_pairs = _infer_from_kinematics(schema)
+    kinematic_pairs = _infer_from_kinematics(schema, min_confidence=min_confidence)
 
     inferred_by_slave: dict[str, InferredMimic] = {}
     for mimic in mjcf_pairs + kinematic_pairs:
@@ -162,6 +162,34 @@ def infer_and_patch_if_needed(
     return result
 
 
+def estimate_mimic_params(driver: Joint, slave: Joint) -> tuple[float, float] | None:
+    """Canonical ``(multiplier, offset)`` for a *known* driver -> slave coupling.
+
+    Returns the linear-coupling coefficients such that
+    ``slave_pos = multiplier * driver_pos + offset`` for the URDF ``<mimic>``
+    law, or ``None`` when no valid linear coupling keeps the slave within its
+    limits. This is the single source of truth for mimic-coefficient selection:
+
+    1. **Sign** is derived from the joint axes (opposing axes prefer ``-1``)
+       fused with complementary-limit detection.
+    2. **Magnitude** prefers a unit coupling (``|multiplier| == 1``, the common
+       gripper case). When no unit coupling keeps the slave in range, it falls
+       back to the travel ratio ``slave_travel / driver_travel`` so a genuine
+       non-unit coupling (e.g. an unequal-travel or geared linkage) still
+       resolves instead of returning ``None``.
+    3. **Offset** is the smallest-magnitude value that passes limit validation.
+
+    Unlike :func:`infer_mimic_joints` (which *discovers* unknown pairs from the
+    kinematic graph and, for confidence scoring, only ever asserts unit
+    couplings), this helper answers the narrow question "given that ``slave``
+    mimics ``driver``, what are the coefficients?" — the entry point other
+    subsystems should route to when the pairing is already known.
+    """
+    return _estimate_mimic_params(
+        driver, slave, _axis_dot(driver, slave), allow_non_unit=True
+    )
+
+
 def _default_output_path(source: Path) -> Path:
     return source.with_name(f"{source.stem}{MIMIC_URDF_SUFFIX}{source.suffix}")
 
@@ -237,7 +265,9 @@ def _strip_mjcf_prefix(name: str) -> str:
     return name
 
 
-def _infer_from_kinematics(schema: CommonSchema) -> list[InferredMimic]:
+def _infer_from_kinematics(
+    schema: CommonSchema, *, min_confidence: float = DEFAULT_MIN_CONFIDENCE
+) -> list[InferredMimic]:
     joints = [j for j in schema.joints if j.type in CONTROLLABLE_TYPES]
     if len(joints) < 2:
         return []
@@ -264,6 +294,7 @@ def _infer_from_kinematics(schema: CommonSchema) -> list[InferredMimic]:
                     actuator_joints=actuator_joints,
                     tip_links=tip_links,
                     median_arm_travel=median_arm_travel,
+                    min_confidence=min_confidence,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -273,7 +304,11 @@ def _infer_from_kinematics(schema: CommonSchema) -> list[InferredMimic]:
 def _tip_links(controllable_joints: list[Joint]) -> set[str]:
     """Child links with no further controllable joints downstream."""
     parents_of_controllable = {j.parent_link for j in controllable_joints}
-    return {j.child_link for j in controllable_joints if j.child_link not in parents_of_controllable}
+    return {
+        j.child_link
+        for j in controllable_joints
+        if j.child_link not in parents_of_controllable
+    }
 
 
 def _joint_travel(joint: Joint) -> float:
@@ -321,12 +356,42 @@ def _gripper_name_bonus(joint_a: Joint, joint_b: Joint) -> float:
     return 0.05 if _GRIPPER_NAME_RE.search(names) else 0.0
 
 
+def _best_offset_for_multipliers(
+    driver: Joint,
+    slave: Joint,
+    multipliers: tuple[float, ...],
+) -> tuple[float, float] | None:
+    """Pick the (multiplier, offset) with the smallest valid offset.
+
+    Iterates ``multipliers`` in preference order and, on an offset-magnitude tie,
+    keeps the earlier (preferred) multiplier because the comparison is strict.
+    """
+    best: tuple[float, float] | None = None
+    best_offset_mag = float("inf")
+    for mult in multipliers:
+        for offset in _offset_candidates(driver, slave, mult):
+            if not _validate_mimic_limits(driver, slave, mult, offset):
+                continue
+            if abs(offset) < best_offset_mag:
+                best = (mult, offset)
+                best_offset_mag = abs(offset)
+    return best
+
+
 def _estimate_mimic_params(
     driver: Joint,
     slave: Joint,
     axis_dot: float,
+    *,
+    allow_non_unit: bool = False,
 ) -> tuple[float, float] | None:
-    """Return (multiplier, offset) or None if no valid linear coupling."""
+    """Return (multiplier, offset) or None if no valid linear coupling.
+
+    ``allow_non_unit`` is opt-in (the public :func:`estimate_mimic_params` sets
+    it) and only takes effect when a unit coupling does not fit: discovery
+    (:func:`_score_joint_pair`) leaves it off so it never asserts a geared
+    coupling from mere kinematic proximity.
+    """
     # Opposing axes + complementary limits → canonical parallel-jaw coupling.
     if axis_dot < -0.9 and _complementary_limits(driver, slave):
         if _validate_mimic_limits(driver, slave, -1.0, 0.0):
@@ -346,16 +411,22 @@ def _estimate_mimic_params(
     ):
         return preferred_multipliers[0], 0.0
 
-    best: tuple[float, float] | None = None
-    best_offset_mag = float("inf")
-    for mult in preferred_multipliers:
-        for offset in _offset_candidates(driver, slave, mult):
-            if not _validate_mimic_limits(driver, slave, mult, offset):
-                continue
-            if abs(offset) < best_offset_mag:
-                best = (mult, offset)
-                best_offset_mag = abs(offset)
-    return best
+    best = _best_offset_for_multipliers(driver, slave, preferred_multipliers)
+    if best is not None or not allow_non_unit:
+        return best
+
+    # No unit coupling fits, but the pair is known to be coupled: derive the
+    # magnitude from the travel ratio (sign keeps the same axis/limit
+    # preference) so a genuine non-unit linkage resolves instead of None.
+    driver_travel = _joint_travel(driver)
+    slave_travel = _joint_travel(slave)
+    if driver_travel <= 0 or slave_travel <= 0:
+        return None
+    ratio = slave_travel / driver_travel
+    ratio_multipliers = (
+        (-ratio, ratio) if preferred_multipliers[0] < 0 else (ratio, -ratio)
+    )
+    return _best_offset_for_multipliers(driver, slave, ratio_multipliers)
 
 
 def _offset_candidates(driver: Joint, slave: Joint, multiplier: float) -> list[float]:
@@ -382,9 +453,14 @@ def _validate_mimic_limits(
 
     for i in range(samples):
         t = i / (samples - 1) if samples > 1 else 0.5
-        driver_pos = driver.limits.lower + t * (driver.limits.upper - driver.limits.lower)
+        driver_pos = driver.limits.lower + t * (
+            driver.limits.upper - driver.limits.lower
+        )
         slave_pos = multiplier * driver_pos + offset
-        if slave_pos < slave.limits.lower - 1e-4 or slave_pos > slave.limits.upper + 1e-4:
+        if (
+            slave_pos < slave.limits.lower - 1e-4
+            or slave_pos > slave.limits.upper + 1e-4
+        ):
             return False
     return True
 
@@ -402,8 +478,16 @@ def _pick_driver(
         return joint_b, joint_a
 
     # Prefer joint whose lower limit is closer to zero (active finger convention).
-    a_lower = joint_a.limits.lower if joint_a.limits and joint_a.limits.lower is not None else 0.0
-    b_lower = joint_b.limits.lower if joint_b.limits and joint_b.limits.lower is not None else 0.0
+    a_lower = (
+        joint_a.limits.lower
+        if joint_a.limits and joint_a.limits.lower is not None
+        else 0.0
+    )
+    b_lower = (
+        joint_b.limits.lower
+        if joint_b.limits and joint_b.limits.lower is not None
+        else 0.0
+    )
     if abs(a_lower) < abs(b_lower) - 1e-6:
         return joint_a, joint_b
     if abs(b_lower) < abs(a_lower) - 1e-6:
@@ -420,6 +504,7 @@ def _score_joint_pair(
     actuator_joints: set[str],
     tip_links: set[str],
     median_arm_travel: float,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
 ) -> InferredMimic | None:
     if joint_a.type != joint_b.type:
         return None
@@ -478,7 +563,11 @@ def _score_joint_pair(
         evidence.append("gripper_naming_hint")
 
     score = min(score, 1.0)
-    if score < 0.70:
+    # Single-source the gate: candidates below the caller's confidence threshold
+    # are dropped here (they would be filtered by ``infer_mimic_joints`` anyway),
+    # so a caller lowering ``min_confidence`` can actually surface lower-scoring
+    # pairs instead of hitting a separate hardcoded floor.
+    if score < min_confidence:
         return None
 
     return InferredMimic(
@@ -501,7 +590,10 @@ def _resolve_conflicts(candidates: list[InferredMimic]) -> list[InferredMimic]:
     for mimic in ordered:
         if mimic.slave_joint in used_slaves:
             continue
-        if mimic.driver_joint in used_slaves or mimic.slave_joint in used_drivers_as_slave:
+        if (
+            mimic.driver_joint in used_slaves
+            or mimic.slave_joint in used_drivers_as_slave
+        ):
             continue
         accepted.append(mimic)
         used_slaves.add(mimic.slave_joint)

@@ -73,6 +73,13 @@ exporter = MJCFExporter()
 exporter.export(schema, "output/robot.xml")
 ```
 
+**Continuous joints** (a `continuous` joint type, e.g. a wheel or a spinner)
+export as an honest `limited="false"` free hinge with no positional `range` —
+even if the schema happens to carry limits. Because MuJoCo position actuators
+still need a finite `ctrlrange`, the actuator on a continuous joint is given a
+finite band centered on the home pose (`home ± π`) instead, so the joint stays
+truly unlimited while the servo remains usable. Since v0.1.4.
+
 ### Infer URDF mimic joints (gripper coupling)
 
 When a URDF has coupled finger / gripper joints but no `<mimic>` tags, infer pairs from

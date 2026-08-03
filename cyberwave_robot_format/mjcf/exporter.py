@@ -44,6 +44,31 @@ from cyberwave_robot_format.schema import (
 
 logger = logging.getLogger(__name__)
 
+# Default dynamics applied to a URDF ``<mimic>`` slave joint that carries no
+# authored dynamics. The ``<equality>`` coupling constrains the slave's
+# *position*, but between solver iterations an undamped gram-scale finger link
+# can still ring; a touch of damping/armature dissipates it. Defined here as the
+# single source of truth so the value cannot drift from other producers.
+MIMIC_SLAVE_DEFAULT_DAMPING = 0.2
+MIMIC_SLAVE_DEFAULT_ARMATURE = 0.001
+
+# A MuJoCo ``<equality><joint>`` couples two *scalar* (1-DOF hinge/slide) joints.
+# These joint types cannot participate: FIXED emits no ``<joint>`` element,
+# FLOATING emits a 6-DOF ``<free>``, and SPHERICAL emits a 3-DOF ``<ball>`` —
+# none is a valid ``joint1``/``joint2`` for a scalar polycoef constraint.
+_EQUALITY_INELIGIBLE_JOINT_TYPES = frozenset(
+    {JointType.FIXED, JointType.FLOATING, JointType.SPHERICAL}
+)
+
+# Half-range (rad) of the ctrlrange given to a *continuous* joint's position /
+# velocity actuator. A continuous joint has no positional limits (it exports as
+# a ``limited="false"`` free hinge), but MuJoCo position actuators still need a
+# finite ``ctrlrange`` — otherwise it defaults to ``[0, 0]`` and freezes the
+# joint. The finite band therefore lives on the *actuator* (``home ± span``),
+# not on the joint. Matches the RL ``continuous_span_rad`` default so training
+# and export agree.
+CONTINUOUS_ACTUATOR_CTRL_SPAN = math.pi
+
 
 # Schema sensor type -> the MuJoCo ``<sensor>`` tags it expands to.
 #
@@ -328,13 +353,33 @@ class MJCFExporter(BaseExporter):
         actuator_elem = ET.SubElement(mujoco, "actuator")
 
         if schema.actuators:
-            # Build a joint-name → limits lookup so _add_actuator can fall back
-            # to joint limits when no explicit control_range is set on the actuator.
-            joint_limits_map = {
-                j.name: j.limits for j in schema.joints if j.limits is not None
-            }
+            # Build a joint-name → Joint lookup so _add_actuator can resolve the
+            # ctrlrange: from the joint's limits for a bounded joint, or from
+            # ``home ± span`` for a continuous joint (which carries no limits).
+            joints_by_name = {j.name: j for j in schema.joints}
             for actuator in schema.actuators:
-                self._add_actuator(actuator_elem, actuator, joint_limits_map)
+                target_joint = joints_by_name.get(actuator.joint)
+                if target_joint is not None and target_joint.mimic is not None:
+                    # A mimic slave is already position-constrained by its
+                    # <equality>; an actuator (especially a position servo) on
+                    # the same joint fights the coupling. This is an authoring
+                    # error, but SKIP the offending actuator rather than raising:
+                    # export runs per *scene*, so raising here fails every scene
+                    # containing the asset — one bad asset patch takes down
+                    # unrelated environments. Skipping yields a physically correct
+                    # model (the coupling drives the joint) and leaves a loud log
+                    # for whoever owns the patch. The conflict is better caught at
+                    # patch-apply time, where it is actionable.
+                    logger.error(
+                        "Actuator %r targets mimic slave joint %r, which is "
+                        "position-constrained by an <equality> coupling. An "
+                        "actuator on a mimic slave fights the coupling; skipping "
+                        "it. Remove the actuator or the joint's <mimic>.",
+                        actuator.name,
+                        target_joint.name,
+                    )
+                    continue
+                self._add_actuator(actuator_elem, actuator, joints_by_name)
         else:
             # No declared actuators: fall back to one motor per movable joint so an
             # imported URDF is still controllable. Joints the schema marks passive
@@ -347,7 +392,14 @@ class MJCFExporter(BaseExporter):
                         "Joint %s is marked passive; no actuator emitted.", joint.name
                     )
                     continue
-                if joint.type != JointType.FIXED and joint.type != JointType.FLOATING:
+                # Mimic slaves are driven by the <equality> coupling, not an
+                # independent actuator — emitting a fallback motor for them would
+                # double-drive the joint.
+                if (
+                    joint.type != JointType.FIXED
+                    and joint.type != JointType.FLOATING
+                    and joint.mimic is None
+                ):
                     motor = ET.SubElement(actuator_elem, "motor")
                     motor.set("name", f"{joint.name}_ctrl")
                     motor.set("joint", joint.name)
@@ -716,10 +768,21 @@ class MJCFExporter(BaseExporter):
                 axis_str = f"{joint.axis.x} {joint.axis.y} {joint.axis.z}"
                 joint_elem.set("axis", axis_str)
 
-            if joint.limits:
-                if joint.limits.lower is not None and joint.limits.upper is not None:
-                    range_str = f"{joint.limits.lower} {joint.limits.upper}"
-                    joint_elem.set("range", range_str)
+            if joint.type == JointType.CONTINUOUS:
+                # A continuous joint rotates without limit. Never emit a positional
+                # ``range`` even if the schema carries limits, and set
+                # ``limited="false"`` explicitly so neither a stray range nor the
+                # ``autolimits`` inference can turn it into a limited hinge. The
+                # finite command band a position actuator needs lives on the
+                # actuator's ``ctrlrange`` instead (see ``_add_actuator``).
+                joint_elem.set("limited", "false")
+            elif (
+                joint.limits
+                and joint.limits.lower is not None
+                and joint.limits.upper is not None
+            ):
+                range_str = f"{joint.limits.lower} {joint.limits.upper}"
+                joint_elem.set("range", range_str)
 
             if joint.dynamics:
                 if joint.dynamics.damping is not None:
@@ -735,11 +798,9 @@ class MJCFExporter(BaseExporter):
                     joint_elem.set("stiffness", str(joint.dynamics.spring_stiffness))
             elif joint.mimic is not None:
                 # Mimic slaves without authored dynamics get a light default
-                # damping/armature. The <equality> coupling constrains position,
-                # but between solver iterations an undamped gram-scale finger
-                # link can still ring; a touch of damping dissipates it.
-                joint_elem.set("damping", "0.2")
-                joint_elem.set("armature", "0.001")
+                # damping/armature (see MIMIC_SLAVE_DEFAULT_* for the rationale).
+                joint_elem.set("damping", str(MIMIC_SLAVE_DEFAULT_DAMPING))
+                joint_elem.set("armature", str(MIMIC_SLAVE_DEFAULT_ARMATURE))
 
         # A movable body must always have a valid inertial.
         is_movable_joint = joint.type not in (JointType.FIXED,)
@@ -967,17 +1028,19 @@ class MJCFExporter(BaseExporter):
         self,
         actuator_elem: ET.Element,
         actuator: Actuator,
-        joint_limits_map: dict | None = None,
+        joints_by_name: dict | None = None,
     ) -> None:
         """Add actuator to actuator section.
 
         Args:
             actuator_elem: Parent ``<actuator>`` XML element.
             actuator: Actuator definition from the universal schema.
-            joint_limits_map: Optional mapping of joint name → ``JointLimits``.
-                Used to set ``ctrlrange`` on position/velocity actuators when
-                the actuator has no explicit ``control_range``.  Without this,
-                MuJoCo defaults the ``ctrlrange`` to ``[0, 0]`` which freezes
+            joints_by_name: Optional mapping of joint name → ``Joint``. Used to
+                set ``ctrlrange`` on position/velocity actuators when the
+                actuator has no explicit ``control_range``: from the joint's
+                limits for a bounded joint, or from ``home ± span`` for a
+                continuous joint (which carries no limits). Without a
+                ``ctrlrange`` MuJoCo defaults it to ``[0, 0]`` which freezes
                 position-actuated joints and collapses the viewer Ctrl-panel
                 slider to zero width.
         """
@@ -1009,16 +1072,27 @@ class MJCFExporter(BaseExporter):
         if hasattr(actuator, "control_range") and actuator.control_range:
             ctrl_min, ctrl_max = actuator.control_range
             act.set("ctrlrange", f"{ctrl_min} {ctrl_max}")
-        elif act_tag in ("position", "velocity") and joint_limits_map:
-            # Fall back to joint position limits so the actuator's control range
-            # matches the joint's allowed range.  Without this MuJoCo uses [0, 0]
-            # which clips every ctrl command to zero (position actuators frozen).
-            limits = joint_limits_map.get(actuator.joint)
-            if (
+        elif act_tag in ("position", "velocity") and joints_by_name:
+            # Resolve a finite ctrlrange so MuJoCo does not default it to [0, 0]
+            # (which clips every ctrl command to zero and freezes the joint).
+            joint = joints_by_name.get(actuator.joint)
+            limits = joint.limits if joint is not None else None
+            if joint is not None and joint.type == JointType.CONTINUOUS:
+                # Continuous joint: the joint itself is unlimited, so give the
+                # actuator a finite band centered on the home pose
+                # (``home ± span``). Checked BEFORE the limits branch so any
+                # stray positional limits a continuous joint happens to carry are
+                # ignored — the joint must not be lied about.
+                home = joint.home_position or 0.0
+                span = CONTINUOUS_ACTUATOR_CTRL_SPAN
+                act.set("ctrlrange", f"{home - span} {home + span}")
+            elif (
                 limits is not None
                 and limits.lower is not None
                 and limits.upper is not None
             ):
+                # Bounded joint: match the actuator's control range to the
+                # joint's allowed range.
                 act.set("ctrlrange", f"{limits.lower} {limits.upper}")
 
         if hasattr(actuator, "force_range") and actuator.force_range:
@@ -1245,14 +1319,41 @@ class MJCFExporter(BaseExporter):
         0 0 0``. Solver params are left at MuJoCo defaults so the constraint is
         stable across the exported timesteps (plant 0.002 s, RL 0.005 s).
         """
-        joint_names = {j.name for j in schema.joints}
-        mimic_joints = [
-            j
+        # Only scalar (hinge/slide) joints can appear in an <equality><joint>.
+        scalar_joint_names = {
+            j.name
             for j in schema.joints
-            if j.mimic is not None
-            and j.type != JointType.FIXED
-            and j.mimic.joint in joint_names
-        ]
+            if j.type not in _EQUALITY_INELIGIBLE_JOINT_TYPES
+        }
+        mimic_joints = []
+        for j in schema.joints:
+            if j.mimic is None or j.type in _EQUALITY_INELIGIBLE_JOINT_TYPES:
+                continue
+            if j.mimic.joint == j.name:
+                # Self-referential mimic (a slave that drives itself) would emit
+                # a degenerate <equality joint1==joint2> that over-constrains the
+                # joint. Drop it loudly.
+                logger.warning(
+                    "Skipping self-referential mimic on joint %r "
+                    "(mimic.joint points at itself).",
+                    j.name,
+                )
+                continue
+            if j.mimic.joint not in scalar_joint_names:
+                # The driver reference does not resolve to a scalar joint: it is
+                # missing, pruned/renamed, or a FIXED/FLOATING/SPHERICAL joint
+                # that has no scalar DOF. Emitting the equality anyway would
+                # dangle-reference a non-existent <joint> and fail MuJoCo
+                # compilation, so drop it and surface the miswiring instead.
+                logger.warning(
+                    "Skipping mimic coupling for joint %r: driver joint %r is "
+                    "missing or not a scalar (hinge/slide) joint; the slave is "
+                    "left uncoupled.",
+                    j.name,
+                    j.mimic.joint,
+                )
+                continue
+            mimic_joints.append(j)
         if not mimic_joints:
             return
 

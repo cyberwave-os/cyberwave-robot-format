@@ -42,7 +42,7 @@ def test_urdf_parser_basic(simple_urdf_path):
 
 def test_urdf_parser_golden_snapshot(simple_urdf_path, tmp_path):
     """Golden test: ensure parser output is stable across changes.
-    
+
     This test verifies that the parsed schema structure remains consistent.
     If this test fails after intentional changes, update the golden file.
     """
@@ -80,7 +80,7 @@ def test_urdf_parser_link_properties(simple_urdf_path):
     parser = URDFParser()
     schema = parser.parse(simple_urdf_path)
 
-    base_link = next((l for l in schema.links if l.name == "base_link"), None)
+    base_link = next((lk for lk in schema.links if lk.name == "base_link"), None)
     assert base_link is not None
     assert base_link.mass == 1.0
     assert base_link.inertia.ixx == pytest.approx(0.1)
@@ -137,6 +137,26 @@ def test_urdf_parser_preserves_mimic_joint(tmp_path):
     assert slave.mimic.joint == "finger_joint1"
     assert slave.mimic.multiplier == pytest.approx(-1.0)
     assert slave.mimic.offset == pytest.approx(0.0)
+
+
+def test_urdf_parser_drops_self_referential_mimic(tmp_path):
+    """B6: a <mimic> that points at its own joint is degenerate and dropped."""
+    urdf = """<?xml version="1.0"?>
+<robot name="selfref">
+  <link name="base"/><link name="finger"/>
+  <joint name="finger_joint" type="revolute">
+    <parent link="base"/><child link="finger"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.8" upper="0.8" effort="10" velocity="1"/>
+    <mimic joint="finger_joint" multiplier="-1" offset="0"/>
+  </joint>
+</robot>"""
+    urdf_path = tmp_path / "selfref.urdf"
+    urdf_path.write_text(urdf, encoding="utf-8")
+
+    schema = URDFParser().parse(urdf_path)
+    joint = next(j for j in schema.joints if j.name == "finger_joint")
+    assert joint.mimic is None
 
 
 if __name__ == "__main__":

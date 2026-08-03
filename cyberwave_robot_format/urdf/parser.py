@@ -144,7 +144,9 @@ class URDFParser(BaseParser):
                                 ET.register_namespace(p, "http://dummy.url")
                             except Exception:
                                 pass
-                        raise ParseError(f"XML parsing error after cleanup: {e2}") from e2
+                        raise ParseError(
+                            f"XML parsing error after cleanup: {e2}"
+                        ) from e2
                     raise ParseError(f"XML parsing error: {e2}") from e2
 
         except ET.ParseError as e:
@@ -210,13 +212,7 @@ class URDFParser(BaseParser):
 
         # Initialize collision_config with default group
         collision_config = CollisionConfig(
-            groups={
-                "default": CollisionGroup(
-                    name="default",
-                    contype=1,
-                    conaffinity=1
-                )
-            }
+            groups={"default": CollisionGroup(name="default", contype=1, conaffinity=1)}
         )
 
         schema = CommonSchema(
@@ -235,7 +231,9 @@ class URDFParser(BaseParser):
 
         return schema
 
-    def _parse_urdf_sensors(self, root: ET.Element, context: ParseContext) -> list[Sensor]:
+    def _parse_urdf_sensors(
+        self, root: ET.Element, context: ParseContext
+    ) -> list[Sensor]:
         """Parse sensors from URDF (Gazebo extensions)."""
         sensors = []
 
@@ -359,7 +357,10 @@ class URDFParser(BaseParser):
                 return None
 
         samples_total = 1.0
-        for axis, fov_key in (("horizontal", "fov_horizontal"), ("vertical", "fov_vertical")):
+        for axis, fov_key in (
+            ("horizontal", "fov_horizontal"),
+            ("vertical", "fov_vertical"),
+        ):
             min_angle = _f(f"scan/{axis}/min_angle")
             max_angle = _f(f"scan/{axis}/max_angle")
             if min_angle is not None and max_angle is not None:
@@ -469,7 +470,9 @@ class URDFParser(BaseParser):
             except ValueError:
                 pass
 
-    def _parse_inertial(self, elem: ET.Element, link: Link, context: ParseContext) -> None:
+    def _parse_inertial(
+        self, elem: ET.Element, link: Link, context: ParseContext
+    ) -> None:
         """Parse inertial properties with enhanced validation."""
         mass_elem = elem.find("mass")
         if mass_elem is not None:
@@ -631,7 +634,15 @@ class URDFParser(BaseParser):
         mimic = elem.find("mimic")
         if mimic is not None:
             driver = mimic.get("joint")
-            if driver:
+            if driver == name:
+                # A joint that mimics itself yields a degenerate coupling
+                # (slave == its own driver). Drop it rather than propagate a
+                # self-referential MimicJoint into the schema/MJCF equality.
+                context.add_warning(
+                    "Ignoring self-referential <mimic> (joint mimics itself)",
+                    name,
+                )
+            elif driver:
                 try:
                     joint.mimic = MimicJoint(
                         joint=driver,
@@ -643,7 +654,9 @@ class URDFParser(BaseParser):
 
         return joint
 
-    def _validate_kinematic_tree(self, links: list[Link], joints: list[Joint], context: ParseContext) -> None:
+    def _validate_kinematic_tree(
+        self, links: list[Link], joints: list[Joint], context: ParseContext
+    ) -> None:
         """Enhanced kinematic tree validation."""
         link_names = {link.name for link in links}
 
@@ -681,7 +694,9 @@ class URDFParser(BaseParser):
         if orphaned:
             context.add_warning(f"Orphaned links detected: {orphaned}")
 
-    def _parse_material(self, elem: ET.Element, context: ParseContext) -> Material | None:
+    def _parse_material(
+        self, elem: ET.Element, context: ParseContext
+    ) -> Material | None:
         """Parse URDF material element with validation."""
         name = elem.get("name")
         if not name:
@@ -746,7 +761,9 @@ class URDFParser(BaseParser):
             pose=pose,
         )
 
-    def _parse_collision(self, elem: ET.Element, context: ParseContext) -> Collision | None:
+    def _parse_collision(
+        self, elem: ET.Element, context: ParseContext
+    ) -> Collision | None:
         """Parse URDF collision element with validation."""
         geom_elem = elem.find("geometry")
         if geom_elem is None:
@@ -771,7 +788,9 @@ class URDFParser(BaseParser):
             pose=pose,
         )
 
-    def _parse_geometry(self, elem: ET.Element, context: ParseContext) -> Geometry | None:
+    def _parse_geometry(
+        self, elem: ET.Element, context: ParseContext
+    ) -> Geometry | None:
         """Parse URDF geometry element with comprehensive type support."""
         box_elem = elem.find("box")
         if box_elem is not None:
@@ -782,7 +801,9 @@ class URDFParser(BaseParser):
                     if len(size_values) == 3:
                         return Geometry(
                             type=GeometryType.BOX,
-                            size=Vector3(size_values[0], size_values[1], size_values[2]),
+                            size=Vector3(
+                                size_values[0], size_values[1], size_values[2]
+                            ),
                         )
                 except ValueError:
                     context.add_warning("Invalid box size values")

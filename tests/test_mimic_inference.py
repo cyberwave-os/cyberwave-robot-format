@@ -7,14 +7,27 @@ from pathlib import Path
 
 import pytest
 
+from cyberwave_robot_format.schema import Joint, JointLimits, JointType, Vector3
 from cyberwave_robot_format.urdf import (
     URDFParser,
+    estimate_mimic_params,
     infer_and_patch_if_needed,
     infer_mimic_joints,
     write_mimic_patched_urdf,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _joint(name, *, axis, lower, upper, jtype=JointType.PRISMATIC):
+    return Joint(
+        name=name,
+        type=jtype,
+        parent_link="base",
+        child_link=f"{name}_link",
+        axis=Vector3(*axis),
+        limits=JointLimits(lower=lower, upper=upper, effort=10.0, velocity=1.0),
+    )
 
 
 def test_infer_piper_prismatic_gripper_pair():
@@ -113,3 +126,35 @@ def test_write_mimic_patched_urdf_requires_candidates(tmp_path):
     urdf_path.write_text('<?xml version="1.0"?><robot name="r"/>', encoding="utf-8")
     with pytest.raises(ValueError, match="No inferred mimic"):
         write_mimic_patched_urdf(urdf_path, [])
+
+
+def test_estimate_mimic_params_opposing_complementary_returns_minus_one():
+    """Opposing axes + complementary limits -> canonical parallel-jaw (-1, 0)."""
+    driver = _joint("joint7", axis=(0, 0, 1), lower=0.0, upper=0.035)
+    slave = _joint("joint8", axis=(0, 0, -1), lower=-0.035, upper=0.0)
+    assert estimate_mimic_params(driver, slave) == pytest.approx((-1.0, 0.0))
+
+
+def test_estimate_mimic_params_parallel_same_limits_returns_plus_one():
+    """Aligned axes + identical one-sided limits (not complementary) -> +1."""
+    driver = _joint("finger1", axis=(0, 0, 1), lower=0.0, upper=0.8)
+    slave = _joint("finger2", axis=(0, 0, 1), lower=0.0, upper=0.8)
+    mult, offset = estimate_mimic_params(driver, slave)
+    assert mult == pytest.approx(1.0)
+    assert offset == pytest.approx(0.0)
+
+
+def test_estimate_mimic_params_non_unit_derives_travel_ratio():
+    """Unequal travel on a known pair -> multiplier from the travel ratio, not None."""
+    driver = _joint("drv", axis=(0, 0, 1), lower=0.0, upper=0.04)
+    slave = _joint("slv", axis=(0, 0, 1), lower=0.0, upper=0.02)
+    mult, offset = estimate_mimic_params(driver, slave)
+    assert mult == pytest.approx(0.5)
+    assert offset == pytest.approx(0.0)
+
+
+def test_estimate_mimic_params_zero_travel_slave_returns_none():
+    """A slave with no travel (lower == upper) admits no linear coupling -> None."""
+    driver = _joint("drv", axis=(0, 0, 1), lower=0.0, upper=10.0)
+    slave = _joint("slv", axis=(0, 0, 1), lower=0.5, upper=0.5)
+    assert estimate_mimic_params(driver, slave) is None
