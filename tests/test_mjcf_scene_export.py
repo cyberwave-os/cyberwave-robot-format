@@ -231,3 +231,92 @@ def test_continuous_joint_actuator_ctrlrange_uses_home_offset() -> None:
     lo, hi = (float(v) for v in spin_act.get("ctrlrange").split())
     assert lo == pytest.approx(home - math.pi)
     assert hi == pytest.approx(home + math.pi)
+
+
+def _wheel_schema(*, max_velocity: float | None) -> CommonSchema:
+    """A single continuous wheel joint driven by a velocity actuator.
+
+    No ``control_range``, which is the case the exporter has to answer for
+    itself — and the case a real asset hits, since a wheel's command band is a
+    speed, not something the joint can supply.
+    """
+    return CommonSchema(
+        metadata=Metadata(name="wheel_scene"),
+        links=[
+            Link(name="base", mass=1.0, inertia=Inertia(ixx=0.1, iyy=0.1, izz=0.1)),
+            Link(name="wheel", mass=0.5, inertia=Inertia(ixx=0.01, iyy=0.01, izz=0.01)),
+        ],
+        joints=[
+            Joint(
+                name="wheel_joint",
+                type=JointType.CONTINUOUS,
+                parent_link="base",
+                child_link="wheel",
+                pose=Pose(position=Vector3(0.0, 0.2, 0.0)),
+                axis=Vector3(0.0, 1.0, 0.0),
+                limits=None,
+                home_position=None,
+            )
+        ],
+        actuators=[
+            Actuator(
+                name="wheel_act",
+                joint="wheel_joint",
+                type=ActuatorType.VELOCITY,
+                max_torque=100.0,
+                max_velocity=max_velocity,
+                kd=35.0,
+            )
+        ],
+    )
+
+
+def _wheel_actuator(schema: CommonSchema) -> ET.Element:
+    zip_bytes = export_mujoco_zip_cloud(schema, mesh_resolver=lambda _: None)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        root = ET.fromstring(zf.read("mujoco_scene.xml"))
+    actuator = root.find(".//actuator/velocity[@name='wheel_act']")
+    assert actuator is not None
+    return actuator
+
+
+def test_velocity_actuator_ctrlrange_is_a_speed_band() -> None:
+    """A velocity servo's ``ctrl`` is rad/s, so its ctrlrange comes from max_velocity.
+
+    Sharing the position branch handed a drive wheel its continuous joint's
+    ``home ± π`` band, capping it at π rad/s — 0.17 m/s on a 53 mm wheel, a robot
+    merely crawling with nothing logged anywhere.
+    """
+    import math
+
+    actuator = _wheel_actuator(_wheel_schema(max_velocity=20.0))
+
+    lo, hi = (float(v) for v in actuator.get("ctrlrange").split())
+    assert lo == pytest.approx(-20.0)
+    assert hi == pytest.approx(20.0)
+    # The bug's signature: the joint's positional band, not the wheel's speed.
+    assert hi != pytest.approx(math.pi)
+    # kd is still emitted as the velocity servo's kv gain.
+    assert actuator.get("kv") == "35.0"
+
+
+def test_velocity_actuator_ctrlrange_omitted_without_max_velocity(caplog) -> None:
+    """No declared ceiling exports a loose actuator, not a frozen one.
+
+    ``compiler autolimits="true"`` reads an absent ctrlrange as "no limit", so
+    inventing a number here would be worse than omitting it. It is warned about
+    because an unbounded wheel command reaches the contact solver as a skid.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        actuator = _wheel_actuator(_wheel_schema(max_velocity=None))
+
+    assert actuator.get("ctrlrange") is None
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "wheel_act" in record.getMessage()
+    ]
+    assert warnings, "expected a warning naming the unbounded velocity actuator"
+    assert "max_velocity" in warnings[0]

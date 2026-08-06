@@ -1036,13 +1036,16 @@ class MJCFExporter(BaseExporter):
             actuator_elem: Parent ``<actuator>`` XML element.
             actuator: Actuator definition from the universal schema.
             joints_by_name: Optional mapping of joint name → ``Joint``. Used to
-                set ``ctrlrange`` on position/velocity actuators when the
-                actuator has no explicit ``control_range``: from the joint's
-                limits for a bounded joint, or from ``home ± span`` for a
-                continuous joint (which carries no limits). Without a
-                ``ctrlrange`` MuJoCo defaults it to ``[0, 0]`` which freezes
-                position-actuated joints and collapses the viewer Ctrl-panel
-                slider to zero width.
+                set ``ctrlrange`` on *position* actuators when the actuator has no
+                explicit ``control_range``: from the joint's limits for a bounded
+                joint, or from ``home ± span`` for a continuous joint (which
+                carries no limits). Without a ``ctrlrange`` MuJoCo defaults it to
+                ``[0, 0]`` which freezes position-actuated joints and collapses
+                the viewer Ctrl-panel slider to zero width.
+
+                Velocity actuators deliberately do NOT consult this: their
+                ``ctrl`` is a rad/s setpoint, so a joint-angle band is the wrong
+                quantity entirely (see the velocity branch below).
         """
         raw_type = getattr(actuator, "type", None)
         norm = None
@@ -1072,7 +1075,29 @@ class MJCFExporter(BaseExporter):
         if hasattr(actuator, "control_range") and actuator.control_range:
             ctrl_min, ctrl_max = actuator.control_range
             act.set("ctrlrange", f"{ctrl_min} {ctrl_max}")
-        elif act_tag in ("position", "velocity") and joints_by_name:
+        elif act_tag == "velocity":
+            # A velocity servo's ``ctrl`` is a rad/s setpoint, so its ctrlrange is a
+            # SPEED band; the joint's positional limits say nothing about it. Sharing
+            # the position branch below handed a drive wheel its continuous joint's
+            # ``home ± π`` band, capping it at π rad/s — 0.17 m/s on a 53 mm wheel,
+            # with the robot merely crawling and nothing logged anywhere.
+            if actuator.max_velocity:
+                act.set(
+                    "ctrlrange", f"{-actuator.max_velocity} {actuator.max_velocity}"
+                )
+            else:
+                # Left unlimited rather than invented: ``compiler autolimits="true"``
+                # (set above) reads an absent ctrlrange as "no limit", so this is a
+                # loose actuator, not a frozen one. Warned because an unbounded wheel
+                # command reaches the contact solver as a skid.
+                logger.warning(
+                    "Velocity actuator %r on joint %r declares neither "
+                    "control_range nor max_velocity; exporting it without a "
+                    "ctrlrange (unlimited rad/s). Declare max_velocity to bound it.",
+                    actuator.name,
+                    actuator.joint,
+                )
+        elif act_tag == "position" and joints_by_name:
             # Resolve a finite ctrlrange so MuJoCo does not default it to [0, 0]
             # (which clips every ctrl command to zero and freezes the joint).
             joint = joints_by_name.get(actuator.joint)
