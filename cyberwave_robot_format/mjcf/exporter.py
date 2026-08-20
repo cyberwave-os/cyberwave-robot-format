@@ -783,6 +783,29 @@ class MJCFExporter(BaseExporter):
             ):
                 range_str = f"{joint.limits.lower} {joint.limits.upper}"
                 joint_elem.set("range", range_str)
+            elif joint.type in (JointType.REVOLUTE, JointType.PRISMATIC):
+                # A bounded joint type with no usable positional bounds. With
+                # ``autolimits="true"`` and no ``range`` this compiles to
+                # ``jnt_limited == 0``, and every unlimited-hinge detector downstream
+                # (cyberwave-sim/control/actuation.py, cyberwave-sim/mqtt/state_egress.py,
+                # controller-sim-adapter/joint_mapping.py) gates purely on
+                # ``hinge && !jnt_limited`` — so a schema-``revolute`` hinge is silently
+                # reinterpreted as CONTINUOUS: driven shortest-path, allowed to wind freely,
+                # and angle-wrapped in telemetry, while the schema and frontend still treat it
+                # as bounded (physicalPositionRange returns null, uiControlRange falls back to
+                # a fixed [-pi, pi], formatContinuousAngle refuses to unwrap it).
+                #
+                # We do NOT invent a range here — fabricating physical limits is worse than
+                # the ambiguity. Surface it instead; the schema layer warns on the same
+                # condition in ``urdf_schema_sync._sync_limit``.
+                logger.warning(
+                    "Joint %r is type=%s but has no positional bounds; MJCF will compile it "
+                    "as an UNLIMITED hinge, which the sim and deploy adapter classify as "
+                    "continuous. Patch limits.lower/limits.upper, or set the type to "
+                    "'continuous' if it really rotates without limit.",
+                    joint.name,
+                    joint.type.value if hasattr(joint.type, "value") else joint.type,
+                )
 
             if joint.dynamics:
                 if joint.dynamics.damping is not None:

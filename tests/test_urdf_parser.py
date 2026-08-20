@@ -311,3 +311,51 @@ def test_gazebo_camera_resolution_is_extracted(sensors_by_name):
     params = sensors_by_name["front_cam"].parameters
     assert params["width"] == 1280
     assert params["height"] == 720
+
+
+def test_joint_origin_rpy_round_trips_through_parse_and_export(tmp_path):
+    """``parse -> export -> parse`` must preserve a joint's zero exactly.
+
+    The backend's stored-URDF sync writes ``<origin xyz rpy>`` back from
+    ``joints[i].pose`` using ``Quaternion.to_rpy``, and a wholesale schema
+    rebuild then re-parses that file. If this fixed point ever breaks, a joint's
+    authored zero silently drifts (or reverts) on every rebuild — so pin it here,
+    where a refactor of the conversion breaks first.
+    """
+    from cyberwave_robot_format.urdf import URDFExporter
+
+    source = tmp_path / "rotated.urdf"
+    source.write_text(
+        """<robot name="rotated">
+  <link name="base"/>
+  <link name="l1"/>
+  <joint name="j1" type="revolute">
+    <parent link="base"/>
+    <child link="l1"/>
+    <origin xyz="0.1 -0.2 0.3" rpy="0.4 -0.5 0.6"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+</robot>"""
+    )
+
+    first = URDFParser().parse(source)
+    exported = tmp_path / "roundtrip.urdf"
+    URDFExporter().export(first, exported)
+    second = URDFParser().parse(exported)
+
+    before = first.joints[0].pose
+    after = second.joints[0].pose
+
+    assert after.position.x == pytest.approx(before.position.x, abs=1e-12)
+    assert after.position.y == pytest.approx(before.position.y, abs=1e-12)
+    assert after.position.z == pytest.approx(before.position.z, abs=1e-12)
+
+    # q and -q are the same rotation, so compare via |dot| rather than per-component.
+    dot = (
+        before.orientation.x * after.orientation.x
+        + before.orientation.y * after.orientation.y
+        + before.orientation.z * after.orientation.z
+        + before.orientation.w * after.orientation.w
+    )
+    assert abs(dot) == pytest.approx(1.0, abs=1e-12)
