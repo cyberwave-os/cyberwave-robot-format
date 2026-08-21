@@ -49,6 +49,25 @@ for joint in schema.joints:
     print(f"Joint: {joint.name}, type: {joint.type}")
 ```
 
+#### Tolerated URDF quirks
+
+Real-world URDFs are often slightly out of spec. The parser recovers from these
+rather than failing, and records each one under
+`schema.extensions["parse_context"]` — in `warnings`, or in `errors` where the
+recovery had to discard something the file asked for:
+
+| In the file | What you get |
+| ----------- | ------------ |
+| `<robot>` with no `name`, or a blank/whitespace one | The name falls back to the URDF file stem |
+| `<joint>` with no `type` | The joint is kept as `fixed`, so its child link stays attached to the tree |
+| `<joint>` with no `type`, but with `<axis>`, `<limit>`, `<mimic>` or `<safety_controller>` | Also kept as `fixed`, but recorded in `errors` — the file described motion that `fixed` discards, and the spec cannot say which moving type was meant. `<dynamics>` is not treated as motion evidence, because real files carry it on genuinely fixed joints |
+| `type="Revolute"`, `type=" revolute "` | Normalized to `revolute` |
+
+An unrecognized joint type (say `type="screw"`) is still an error and the joint
+is dropped — recovery covers omissions and formatting, not unsupported
+kinematics. Check `parse_context["errors"]` alongside `warnings` when a
+conversion looks wrong.
+
 ### Parse MJCF (MuJoCo)
 
 ```python

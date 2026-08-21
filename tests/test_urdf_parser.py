@@ -105,6 +105,215 @@ def test_urdf_parser_joint_properties(simple_urdf_path):
     assert joint.dynamics.friction == pytest.approx(0.05)
 
 
+def _parse_urdf(tmp_path, urdf, filename):
+    """Write ``urdf`` to ``filename`` and return (schema, parse_context)."""
+    urdf_path = tmp_path / filename
+    urdf_path.write_text(urdf, encoding="utf-8")
+    schema = URDFParser().parse(urdf_path)
+    return schema, schema.extensions["parse_context"]
+
+
+@pytest.mark.parametrize("raw_type", [" revolute ", "Revolute", "REVOLUTE"])
+def test_urdf_parser_normalizes_joint_type_case_and_padding(tmp_path, raw_type):
+    """Vendor casing/padding must not cost the joint.
+
+    An unnormalized value misses the type map, which used to drop the joint
+    and detach ``arm`` from the tree.
+    """
+    urdf = f"""<?xml version="1.0"?>
+<robot name="casing">
+  <link name="base"/>
+  <link name="arm"/>
+  <joint name="shoulder" type="{raw_type}">
+    <parent link="base"/>
+    <child link="arm"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "casing.urdf")
+
+    assert [j.name for j in schema.joints] == ["shoulder"]
+    assert schema.joints[0].type.value == "revolute"
+    assert parse_context["errors"] == []
+    # The repair is silent to the caller unless it is recorded; the README
+    # promises it in parse_context["warnings"].
+    assert any("normalized to 'revolute'" in w for w in parse_context["warnings"])
+
+
+def test_urdf_parser_keeps_a_typeless_joint_as_fixed(tmp_path):
+    """A joint without ``type`` is kept rigid rather than dropped.
+
+    Dropping it left the child link in ``links`` with nothing attaching it to
+    the tree, so the robot imported with a detached body.
+    """
+    urdf = """<?xml version="1.0"?>
+<robot name="missing_joint_type">
+  <link name="base"/>
+  <link name="camera_mount"/>
+  <joint name="MHS_NAVCAM">
+    <parent link="base"/>
+    <child link="camera_mount"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "missing_joint_type.urdf")
+
+    assert [j.name for j in schema.joints] == ["MHS_NAVCAM"]
+    assert schema.joints[0].type.value == "fixed"
+    assert schema.joints[0].child_link == "camera_mount"
+    assert parse_context["errors"] == []
+    assert any("assuming 'fixed'" in w for w in parse_context["warnings"])
+    # The point of keeping it: no link is left dangling.
+    assert not any("Orphaned links" in w for w in parse_context["warnings"])
+
+
+def test_urdf_parser_reports_a_typeless_joint_that_declares_motion(tmp_path):
+    """A typeless joint carrying <axis>/<limit> loses a DOF, so it must not be silent.
+
+    "fixed" keeps the tree connected, which is the point of the recovery, but
+    the file plainly described a moving joint. Only ``errors`` reaches Sentry,
+    and nothing reads ``parse_context``, so a warning here goes unnoticed.
+    """
+    urdf = """<?xml version="1.0"?>
+<robot name="armbot">
+  <link name="base"/>
+  <link name="arm"/>
+  <joint name="shoulder">
+    <parent link="base"/>
+    <child link="arm"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.57" upper="1.57" effort="100" velocity="2.0"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "armbot.urdf")
+
+    # Still kept, so the child link stays attached and composition succeeds.
+    assert [j.name for j in schema.joints] == ["shoulder"]
+    assert schema.joints[0].type.value == "fixed"
+    assert not any("Orphaned links" in w for w in parse_context["warnings"])
+    # ...but the discarded motion is reported, not merely warned about.
+    assert any("only a moving joint can use" in e for e in parse_context["errors"]), (
+        parse_context["errors"]
+    )
+
+
+def test_urdf_parser_reports_a_typeless_mimic_joint(tmp_path):
+    """A typeless joint that mimics another cannot be rigid.
+
+    ``<mimic>`` means "follow this other joint", so freezing the joint yields a
+    weld carrying a coupling coefficient -- and the MJCF exporter drops the
+    coupling silently, because it skips FIXED joints before it warns.
+    """
+    urdf = """<?xml version="1.0"?>
+<robot name="gripper">
+  <link name="base"/>
+  <link name="left"/>
+  <link name="right"/>
+  <joint name="left_finger" type="prismatic">
+    <parent link="base"/>
+    <child link="left"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.04" effort="10" velocity="1"/>
+  </joint>
+  <joint name="right_finger">
+    <parent link="base"/>
+    <child link="right"/>
+    <mimic joint="left_finger" multiplier="-1.0"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "gripper.urdf")
+
+    assert [j.name for j in schema.joints] == ["left_finger", "right_finger"]
+    assert any("<mimic>" in e for e in parse_context["errors"]), parse_context["errors"]
+
+
+def test_urdf_parser_stays_quiet_for_dynamics_on_a_typeless_joint(tmp_path):
+    """``<dynamics>`` must not trigger the report.
+
+    Real vendor files carry damping/friction on genuinely ``type="fixed"``
+    joints, so treating it as motion evidence would manufacture false reports.
+    """
+    urdf = """<?xml version="1.0"?>
+<robot name="bracket">
+  <link name="base"/>
+  <link name="pad"/>
+  <joint name="pad_joint">
+    <parent link="base"/>
+    <child link="pad"/>
+    <dynamics damping="0.7" friction="0.05"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "bracket.urdf")
+
+    assert schema.joints[0].type.value == "fixed"
+    assert parse_context["errors"] == []
+    assert any("assuming 'fixed'" in w for w in parse_context["warnings"])
+
+
+def test_urdf_parser_error_quotes_the_unsupported_type_as_written(tmp_path):
+    """Normalizing must not rewrite the spelling the file actually used."""
+    urdf = """<?xml version="1.0"?>
+<robot name="bogus_type">
+  <link name="base"/>
+  <link name="arm"/>
+  <joint name="shoulder" type=" Screw ">
+    <parent link="base"/>
+    <child link="arm"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "bogus_type.urdf")
+
+    assert schema.joints == []
+    assert any("' Screw '" in e for e in parse_context["errors"]), parse_context[
+        "errors"
+    ]
+
+
+def test_urdf_parser_still_rejects_an_unknown_joint_type(tmp_path):
+    """Normalizing must not turn a genuinely unsupported type into a default."""
+    urdf = """<?xml version="1.0"?>
+<robot name="bogus_type">
+  <link name="base"/>
+  <link name="arm"/>
+  <joint name="shoulder" type="screw">
+    <parent link="base"/>
+    <child link="arm"/>
+  </joint>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "bogus_type.urdf")
+
+    assert schema.joints == []
+    assert any("Unsupported joint type" in e for e in parse_context["errors"])
+
+
+@pytest.mark.parametrize("root_attrs", ['name=""', 'name="   "', ""])
+def test_urdf_parser_falls_back_to_the_file_stem_for_a_nameless_robot(
+    tmp_path, root_attrs
+):
+    """Blank, whitespace and absent root names all warn and use the file stem."""
+    urdf = f"""<?xml version="1.0"?>
+<robot {root_attrs}>
+  <link name="base_link"/>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "nasa_jpl-ingenuity.urdf")
+
+    assert schema.metadata.name == "nasa_jpl-ingenuity"
+    assert parse_context["errors"] == []
+    assert any("Robot name missing or empty" in w for w in parse_context["warnings"])
+
+
+def test_urdf_parser_keeps_an_explicit_robot_name(tmp_path):
+    """The fallback must not fire when the file names itself."""
+    urdf = """<?xml version="1.0"?>
+<robot name="explicitly_named">
+  <link name="base_link"/>
+</robot>"""
+    schema, parse_context = _parse_urdf(tmp_path, urdf, "some_other_filename.urdf")
+
+    assert schema.metadata.name == "explicitly_named"
+    assert not any(
+        "Robot name missing or empty" in w for w in parse_context["warnings"]
+    )
+
+
 def test_urdf_parser_preserves_mimic_joint(tmp_path):
     """Gripper-style URDF: slave joint mimic metadata must survive parsing."""
     urdf = """<?xml version="1.0"?>

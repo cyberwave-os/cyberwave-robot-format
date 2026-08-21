@@ -157,10 +157,13 @@ class URDFParser(BaseParser):
             base_dir=file_path.parent,
         )
 
-        robot_name = root.get("name", "robot")
+        robot_name = (root.get("name") or "").strip()
         if not robot_name:
-            context.add_error("Robot name is required")
-            robot_name = "unnamed_robot"
+            # Vendor URDFs omit or blank the root name. Fall back to the file
+            # stem: stable, and distinctive where the old "robot" default
+            # collided across every unnamed model.
+            robot_name = sanitize_name(file_path.stem)
+            context.add_warning(f"Robot name missing or empty; using {robot_name!r}")
 
         metadata = Metadata(
             name=sanitize_name(robot_name),
@@ -532,15 +535,35 @@ class URDFParser(BaseParser):
     ) -> Joint | None:
         """Parse URDF joint element with enhanced validation."""
         name = elem.get("name")
-        joint_type = elem.get("type")
+        raw_joint_type = elem.get("type") or ""
+        joint_type = raw_joint_type.strip().lower()
 
         if not name:
             context.add_error("Joint name is required")
             return None
 
         if not joint_type:
-            context.add_error("Joint type is required", name)
-            return None
+            # Dropping the joint detaches its child link from the tree, so keep
+            # it and assume the rigid reading. Where the file declares a child
+            # only a moving joint can use, report the discarded DOF rather than
+            # just warn — the spec cannot say which moving type was meant.
+            # <dynamics> is excluded: real files carry it on fixed joints.
+            joint_type = "fixed"
+            declared = [
+                child
+                for child in ("axis", "limit", "mimic", "safety_controller")
+                if elem.find(child) is not None
+            ]
+            if declared:
+                spelled = "/".join(f"<{child}>" for child in declared)
+                context.add_error(
+                    f"Joint type is missing but the file declares {spelled}, "
+                    "which only a moving joint can use; keeping it 'fixed' and "
+                    "discarding that motion",
+                    name,
+                )
+            else:
+                context.add_warning("Joint type is missing; assuming 'fixed'", name)
 
         type_mapping = {
             "revolute": JointType.REVOLUTE,
@@ -553,8 +576,15 @@ class URDFParser(BaseParser):
 
         joint_type_enum = type_mapping.get(joint_type)
         if not joint_type_enum:
-            context.add_error(f"Unsupported joint type: {joint_type}.", name)
+            context.add_error(f"Unsupported joint type: {raw_joint_type!r}.", name)
             return None
+
+        if raw_joint_type.strip() and raw_joint_type != joint_type:
+            # The README promises every tolerated quirk lands in parse_context;
+            # a silent repair is one the caller cannot audit.
+            context.add_warning(
+                f"Joint type {raw_joint_type!r} normalized to {joint_type!r}", name
+            )
 
         parent_elem = elem.find("parent")
         child_elem = elem.find("child")
