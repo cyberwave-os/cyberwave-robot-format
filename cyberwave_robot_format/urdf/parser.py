@@ -629,7 +629,7 @@ class URDFParser(BaseParser):
                     )
                 else:
                     context.add_warning("Zero-magnitude joint axis", name)
-                    joint.axis = Vector3(0, 0, 1)
+                    joint.axis = Vector3(0.0, 0.0, 1.0)
 
         limit = elem.find("limit")
         if limit is not None:

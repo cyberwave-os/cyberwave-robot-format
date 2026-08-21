@@ -456,11 +456,7 @@ class MJCFExporter(BaseExporter):
         if material.emissive:
             mat_elem.set("emission", str(material.emissive[0]))
 
-        reflectance = (
-            material.extensions.get("reflectance")
-            if hasattr(material, "extensions")
-            else None
-        )
+        reflectance = material.extensions.get("reflectance")
         if reflectance is not None:
             mat_elem.set("reflectance", str(reflectance))
 

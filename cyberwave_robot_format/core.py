@@ -216,44 +216,59 @@ class FormatConverter:
         self._register_default_processors()
 
     def _register_default_processors(self) -> None:
-        """Register default parsers and exporters for standard formats."""
-        # Import from submodules
+        """Register default parsers and exporters for standard formats.
+
+        Registration is per-format and tolerant of a missing submodule. It has to
+        be: this method used to import ``.obj``, ``.schema_io`` and ``.sdf``
+        eagerly, none of which exist in the package, so ``FormatConverter()``
+        raised ``ImportError`` on construction and the USD hook below it was
+        unreachable. Formats that are not implemented (or whose optional
+        dependency is absent, as with USD and ``usd-core``) are simply skipped.
+        """
         from .mjcf import MJCFExporter, MJCFParser
-        from .obj import OBJMTLExporter, OBJMTLParser
-        from .schema_io import SchemaExporter, SchemaParser
-        from .sdf import SDFExporter, SDFParser
         from .urdf import URDFExporter, URDFParser
 
-        # Register parsers
         self.engine.register_parser("urdf", URDFParser())
-        self.engine.register_parser("sdf", SDFParser())
-        self.engine.register_parser("mjcf", MJCFParser())
-        self.engine.register_parser("xml", MJCFParser())  # MJCF is XML
-        self.engine.register_parser("schema", SchemaParser())
-        self.engine.register_parser("yaml", SchemaParser())
-        self.engine.register_parser("json", SchemaParser())
-        self.engine.register_parser("obj", OBJMTLParser())
-
-        # Register exporters
         self.engine.register_exporter("urdf", URDFExporter())
-        self.engine.register_exporter("sdf", SDFExporter())
+        self.engine.register_parser("mjcf", MJCFParser())
         self.engine.register_exporter("mjcf", MJCFExporter())
+        self.engine.register_parser("xml", MJCFParser())  # MJCF is XML
         self.engine.register_exporter("xml", MJCFExporter())
-        self.engine.register_exporter("schema", SchemaExporter())
-        self.engine.register_exporter("yaml", SchemaExporter())
-        self.engine.register_exporter("json", SchemaExporter())
-        self.engine.register_exporter("obj", OBJMTLExporter())
 
-        # Try to register USD support if available
+        # USD registers even without `usd-core` installed, because nothing under
+        # `usd/` imports `pxr` at module scope. A caller that actually converts a
+        # USD file then gets the actionable ImportError from `require_pxr()`
+        # instead of a silently missing format.
+        self._register_optional(
+            "usd", "USDParser", "USDExporter", ("usd", "usda", "usdc", "usdz")
+        )
+        self._register_optional("obj", "OBJMTLParser", "OBJMTLExporter")
+        self._register_optional("sdf", "SDFParser", "SDFExporter")
+        self._register_optional(
+            "schema_io", "SchemaParser", "SchemaExporter", ("schema", "yaml", "json")
+        )
+
+    def _register_optional(
+        self,
+        module_name: str,
+        parser_name: str,
+        exporter_name: str,
+        format_names: tuple[str, ...] | None = None,
+    ) -> None:
+        """Register a format whose module or optional dependency may be missing."""
+        import importlib
+
         try:
-            from .usd import USDExporter, USDParser
+            module = importlib.import_module(f".{module_name}", __package__)
+            parser_cls = getattr(module, parser_name)
+            exporter_cls = getattr(module, exporter_name)
+        except (ImportError, AttributeError) as exc:
+            logger.debug("Format %r not available: %s.", module_name, exc)
+            return
 
-            self.engine.register_parser("usd", USDParser())
-            self.engine.register_parser("usda", USDParser())
-            self.engine.register_exporter("usd", USDExporter())
-            self.engine.register_exporter("usda", USDExporter())
-        except ImportError:
-            logger.debug("USD support not available (missing pxr module).")
+        for name in format_names or (module_name,):
+            self.engine.register_parser(name, parser_cls())
+            self.engine.register_exporter(name, exporter_cls())
 
     def convert(
         self, input_path: str | Path, output_path: str | Path, **kwargs

@@ -7,8 +7,8 @@ Universal robot description schema and format converters for Cyberwave.
 This package provides:
 
 - **Universal Schema**: A canonical representation for robotic assets (`CommonSchema`)
-- **Format Importers**: Parse URDF, MJCF into the universal schema
-- **Format Exporters**: Export universal schema to URDF, MJCF
+- **Format Importers**: Parse URDF, MJCF, USD into the universal schema
+- **Format Exporters**: Export universal schema to URDF, MJCF, USD
 - **Validation**: Schema validation and consistency checks
 
 ## Structure
@@ -19,10 +19,43 @@ cyberwave_robot_format/
 ├── core.py             # Base classes for parsers/exporters
 ├── urdf/               # URDF parser and exporter
 ├── mjcf/               # MJCF (MuJoCo) parser and exporter
+├── usd/                # USD (OpenUSD) parser and exporter
 ├── mesh/               # Mesh processing utilities
 ├── math_utils.py       # Math utilities (Vector3, Quaternion, etc.)
 └── utils.py            # General utilities
 ```
+
+## Schema changes in 0.1.6
+
+Two fixes to `CommonSchema` itself. Both are backwards compatible to *read* — an
+older JSON document still parses — but they change what the package *writes*, so any
+hash computed over `export_universal_schema_json` output will differ from 0.1.5.
+
+- **`Material` gained an `extensions` field**, matching every other component
+  dataclass. `MJCFParser` already wrote `extensions["reflectance"]` there, so before
+  this any MuJoCo model declaring a material with `reflectance` failed to parse with
+  an `AttributeError`. Serialized materials now carry an `"extensions": {}` key.
+- **`Vector3` and `Quaternion` coerce their components to `float`.** The fields were
+  always declared `float`, but `Vector3(0, 0, 1)` — written in `URDFParser` and in
+  `Joint.axis`'s own default — left `int` components behind, so the same model
+  serialized an axis as `"z": 1` fresh from the parser and `"z": 1.0` after any
+  `from_dict`. `export_universal_schema_json` is now idempotent under a round trip.
+  As a side effect, `numpy` scalars are normalized too, which `json.dumps` cannot
+  serialize at all.
+
+## Installation
+
+```bash
+pip install cyberwave-robot-format
+
+# USD support needs the OpenUSD Python bindings, which are an optional extra:
+pip install "cyberwave-robot-format[usd]"
+```
+
+The rest of the package works without them — importing `cyberwave_robot_format`
+never imports `pxr`, so only calling the USD parser or exporter requires it.
+`usd-core` publishes no `linux-aarch64` wheel; on that platform install
+conda-forge's `openusd` instead.
 
 ## Usage
 
@@ -98,6 +131,129 @@ even if the schema happens to carry limits. Because MuJoCo position actuators
 still need a finite `ctrlrange`, the actuator on a continuous joint is given a
 finite band centered on the home pose (`home ± π`) instead, so the joint stays
 truly unlimited while the servo remains usable. Since v0.1.4.
+
+### Parse and export USD (OpenUSD)
+
+Requires the `usd` extra (see [Installation](#installation)). Reads and writes
+`.usda` (text), `.usdc` (binary), `.usd` and `.usdz`.
+
+```python
+from cyberwave_robot_format import USDExporter, USDParser
+
+# Schema -> USD. The suffix picks the encoding; .usda is the human-readable one.
+USDExporter().export(schema, "output/robot.usda")
+
+# USD -> schema
+schema = USDParser().parse("output/robot.usda")
+
+# Or work with the text directly, no files involved
+usda_text = USDExporter().export_to_string(schema)
+schema = USDParser().parse_string(usda_text)
+```
+
+The export is a complete `UsdPhysics` articulation — rigid bodies with mass and
+inertia, joints with limits and drives, visual and collision geometry, materials,
+and collision filtering — so Isaac Sim, Omniverse and `usdview` can consume it
+directly. Alongside each native attribute the exporter also writes a
+`cyberwave:`-namespaced double-precision copy for anything USD stores lossily or
+cannot express at all (mimic joints, armature, jerk limits, motor electricals), and
+the parser prefers those. The round trip is therefore lossless for every field the
+schema can hold, while the stage stays valid USD for everyone else.
+
+Reading *foreign* USD works too: with no `cyberwave:` attributes present, links come
+from `PhysicsRigidBodyAPI`, the kinematic tree from `physics:body0`/`body1`, joint
+axes from `physics:axis` plus the joint frame rotations, and a
+`UsdPhysicsDriveAPI` becomes an actuator with its gains — so an Isaac Sim robot
+imports as an actuated model rather than a passive one.
+
+Because both halves of the schema survive, a USD detour is transparent to the other
+converters — `URDF -> schema -> MJCF` and `URDF -> schema -> USD -> schema -> MJCF`
+produce byte-identical MJCF:
+
+```python
+# The format-specific payloads MJCFParser stashes in `extensions` (MuJoCo's
+# contype/conaffinity/solref/margin, its <size> and <default> blocks, <contact><pair>
+# attributes) are carried through USD untouched, so nothing is lost on the way.
+schema = MJCFParser().parse("robot.xml")
+MJCFExporter().export(USDParser().parse_string(USDExporter().export_to_string(schema)),
+                      "same_robot.xml")
+```
+
+Conversely, UsdPhysics properties with no schema field of their own —
+`physics:breakForce`, `jointEnabled`, `kinematicEnabled`, `velocity`, a spherical
+joint's cone limits, a drive's `targetVelocity` — are preserved under
+`extensions["usd"]` on import and written back as native `physics:` attributes on
+export, so a foreign stage survives a schema hop too.
+
+#### Parsing USD you did not author
+
+Opening a USD file **composes** it: `subLayers`, `references`, `payloads` and
+variants are resolved, and their content becomes part of the schema you get back.
+A hostile file can name an absolute path and pull that file's prims into the
+result:
+
+```
+#usda 1.0
+(
+    subLayers = [@/home/someone/private/robot.usda@]
+)
+```
+
+A service that parses an upload and returns or stores the resulting schema would
+be handing back the content of local USD files it never meant to expose. For
+untrusted input, restrict composition to the file's own directory:
+
+```python
+# Raises ValueError if composition reaches outside the parsed file's directory.
+schema = USDParser(allow_external_layers=False).parse(uploaded_path)
+```
+
+Layers beside or beneath the input still resolve normally, so ordinary multi-file
+assets keep working; symlinks are resolved before the check, so they cannot step
+outside. The default is `True` because layering is the defining feature of USD and
+real assets reference sibling directories — the restriction is opt-in precisely
+because it is the caller who knows whether the input is trusted.
+
+Two things you do not need to defend against (verified against `usd-core` 26.8):
+the default asset resolver does not fetch `http(s)://` references, so there is no
+SSRF vector, and `.usdz` is read in place rather than extracted. Note also that
+`USDExporter(bake_meshes=True)` reads whatever path `Geometry.filename` holds — do
+not enable it for schemas from an untrusted source.
+
+Things worth knowing:
+
+- **Angles.** USD stores angular joint limits and drive targets in degrees; the
+  schema uses radians. The conversion is automatic, and the `cyberwave:` sidecars
+  are always in schema units.
+- **Units.** The stage is always authored `metersPerUnit = 1`, `kilogramsPerUnit = 1`
+  and Z-up, because that is what every number in the schema means. A schema
+  declaring `metadata.units` as anything but `"SI"` is written unconverted, with a
+  warning.
+- **Link layout.** `UsdPhysics` ignores a rigid body nested under another one, so
+  link prims are flat siblings under `/<Robot>/Links`, each carrying its accumulated
+  world transform at the zero configuration.
+- **Joint axes.** `physics:axis` only accepts `"X"`/`"Y"`/`"Z"`, so an arbitrary
+  schema axis is baked into `physics:localRot0`/`localRot1` and the token is always
+  `"X"`.
+- **Meshes.** `Geometry.filename` is preserved verbatim as a string; USD cannot
+  reference an `.stl`/`.dae`/`.obj` as a layer. Pass
+  `USDExporter(bake_meshes=True)` to additionally resolve and inline the mesh
+  points. A `.usdz` whose meshes are unresolvable `package://` URIs is still
+  written, with a warning that those files are not bundled.
+- **World physics.** `Physics` maps to a `UsdPhysicsScene` authored *beside* the
+  robot prim, so referencing the asset into a larger stage does not drag a second
+  gravity definition along. On import the scene is located by prim type rather than
+  by path, so a foreign stage that names it anything else (`/physicsScene`,
+  `/World/PhysicsScene`) still contributes its gravity and solver settings.
+- **One articulation per parse.** A stage declaring several
+  `PhysicsArticulationRootAPI` prims (a work cell, a robot plus an AMR) parses as
+  the first one, with a warning naming the roots that were skipped.
+- **Materials.** A named material is defined once under `/<Robot>/Materials` and
+  shared by every visual using it. If two *different* materials share a name, the
+  first owns the shared prim and the others are authored inline per visual, with a
+  warning — so both appearances survive the round trip.
+
+Since v0.1.6.
 
 ### Infer URDF mimic joints (gripper coupling)
 

@@ -5,6 +5,7 @@ Utility functions for format detection, validation, and conversion support.
 import logging
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,8 @@ def detect_format(file_path):
         ".json": "schema",
         ".usd": "usd",
         ".usda": "usd",
+        ".usdc": "usd",
+        ".usdz": "usd",
         ".obj": "obj",
         ".mtl": "obj",
     }
@@ -53,6 +56,12 @@ def detect_format(file_path):
         format_guess = ext_mapping[ext]
         if format_guess is not None:
             return format_guess
+
+    # A USD file may carry any of three encodings behind an ambiguous or absent
+    # extension, so sniff the magic bytes before falling back to XML/text parsing:
+    # "#usda" is ASCII, "PXR-USDC" is crate, and a usdz package is a zip.
+    if _sniff_usd(file_path):
+        return "usd"
 
     # Content-based detection for ambiguous extensions
     try:
@@ -65,6 +74,27 @@ def detect_format(file_path):
         return None
 
     return None
+
+
+def _sniff_usd(file_path: Path) -> bool:
+    """Whether the file's leading bytes identify it as USD ASCII, crate or usdz."""
+    try:
+        with open(file_path, "rb") as handle:
+            head = handle.read(8)
+    except OSError:
+        return False
+    if head.startswith((b"#usda", b"PXR-USDC")):
+        return True
+    # A zip is only USD when it is a usdz package, i.e. its first archived entry is
+    # the default layer. Treating every zip as USD misreads ordinary archives.
+    if head.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(file_path) as archive:
+                names = archive.namelist()
+        except (OSError, zipfile.BadZipFile):
+            return False
+        return bool(names) and names[0].lower().endswith((".usd", ".usda", ".usdc"))
+    return False
 
 
 def _detect_xml_format(file_path: Path) -> str | None:
@@ -204,14 +234,25 @@ def get_format_info(format_name: str) -> dict[str, Any]:
         },
         "usd": {
             "name": "Universal Scene Description",
-            "extensions": [".usd", ".usda"],
+            "extensions": [".usd", ".usda", ".usdc", ".usdz"],
             "type": "binary/text",
-            "description": "Pixar USD format for 3D content",
-            "features": ["advanced_graphics", "animation", "composition"],
-            "limitations": ["graphics_focused", "limited_physics"],
+            "description": "OpenUSD scene format with UsdPhysics articulations",
+            "features": [
+                "advanced_graphics",
+                "animation",
+                "composition",
+                "physics",
+                "articulations",
+                "materials",
+            ],
+            "limitations": [
+                "requires_usd_core",
+                "solver_params_are_physx_specific",
+                "angles_in_degrees",
+            ],
         },
         "schema": {
-            "name": "FIGAROH Common Schema",
+            "name": "Cyberwave Common Schema",
             "extensions": [".yaml", ".yml", ".json"],
             "type": "structured_data",
             "description": "Unified intermediate representation",
@@ -231,6 +272,11 @@ def sanitize_name(name: str) -> str:
 
     Returns:
         Sanitized name safe for all formats
+
+    Note:
+        This keeps hyphens, so the result is **not** a valid USD prim name. USD
+        callers must use ``cyberwave_robot_format.usd.common.sanitize_prim_name``,
+        which also pairs with a ``cyberwave:name`` sidecar to stay reversible.
     """
     # Remove/replace characters that are problematic in XML or other formats
     # Keep alphanumeric, underscore, hyphen

@@ -1,0 +1,1478 @@
+# Copyright [2025] Cyberwave
+# Licensed under the Apache License, Version 2.0
+
+"""End-to-end conversion tests across URDF, MJCF and USD.
+
+The invariant these tests pin down is stronger, and more useful, than "the USD
+round trip preserves the schema":
+
+    **Inserting a USD round trip anywhere in a conversion pipeline must not change
+    the output.**
+
+So ``URDF -> schema -> MJCF`` and ``URDF -> schema -> USD -> schema -> MJCF`` must
+produce byte-identical MJCF. That is only true if USD preserves *both* halves of the
+schema: the fields the other formats support, and the format-specific payloads the
+other converters stash in ``extensions`` — MuJoCo's ``contype``/``solref``/``margin``,
+its ``<size>`` and ``<default>`` blocks, ``<contact><pair>`` attributes, the
+``passive`` joint marker. If any of those were dropped on the USD hop, the
+re-exported MJCF would differ and a test here would fail.
+
+The reverse direction matters too: UsdPhysics has properties of its own with no
+schema field (``physics:breakForce``, ``jointEnabled``, ``kinematicEnabled``, ...).
+Those are preserved under ``extensions["usd"]``, the same way ``MJCFParser``
+preserves MuJoCo's extras, so a foreign stage survives a schema hop as well.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("pxr")
+
+from cyberwave_robot_format import (  # noqa: E402
+    MJCFExporter,
+    MJCFParser,
+    URDFExporter,
+    URDFParser,
+    USDExporter,
+    USDParser,
+    export_universal_schema_json,
+)
+from cyberwave_robot_format.schema import (  # noqa: E402
+    Collision,
+    CollisionConfig,
+    CollisionGroup,
+    CommonSchema,
+    Contact,
+    Geometry,
+    GeometryType,
+    Joint,
+    JointDynamics,
+    JointLimits,
+    JointType,
+    Link,
+    Material,
+    Metadata,
+    Pose,
+    Vector3,
+    Visual,
+)
+
+from tests.usd_helpers import assert_schema_equal  # noqa: E402
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+URDF_FIXTURES = [
+    "simple_robot.urdf",
+    "piper_description.urdf",
+    "piper_description-mimic-joint.urdf",
+    "arm_two_prismatic.urdf",
+    "gripper_prismatic_pair.urdf",
+]
+
+# A MuJoCo model exercising every path where MJCFParser stashes format-specific
+# data in `extensions`, since those are exactly what a USD hop must not lose.
+MJCF_WITH_EXTENSIONS = """<mujoco model="ext_robot">
+  <compiler angle="radian" autolimits="true"/>
+  <size njmax="600" nconmax="150"/>
+  <option timestep="0.004"/>
+
+  <default>
+    <geom friction="0.9 0.01 0.002" material="painted"/>
+  </default>
+
+  <asset>
+    <material name="painted" rgba="0.2 0.4 0.6 1"/>
+  </asset>
+
+  <worldbody>
+    <body name="base_link" pos="0 0 0">
+      <inertial pos="0 0 0" mass="2.0" diaginertia="0.2 0.2 0.2"/>
+      <geom name="base_geom" type="box" size="0.05 0.05 0.05" contype="2"
+            conaffinity="4" margin="0.001" solref="0.02 1" solimp="0.9 0.95 0.001"
+            friction="0.8 0.005 0.0001"/>
+
+      <body name="link1" pos="0 0 0.1">
+        <inertial pos="0 0 0" mass="0.5" diaginertia="0.05 0.05 0.05"/>
+        <joint name="joint1" type="hinge" axis="0 1 0" range="-1.5 1.5"
+               damping="0.1" frictionloss="0.05" armature="0.01"/>
+        <geom name="link1_geom" type="cylinder" size="0.05 0.1" contype="1"
+              conaffinity="1" margin="0.002"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <pair geom1="base_geom" geom2="link1_geom" solref="0.01 1"
+          solimp="0.8 0.9 0.01" friction="1 1 0.005 0.005 0.005" condim="6"/>
+  </contact>
+
+  <actuator>
+    <motor name="motor1" joint="joint1" gear="1" ctrllimited="true" ctrlrange="-5 5"/>
+  </actuator>
+</mujoco>
+"""
+
+
+def via_usd(schema: CommonSchema) -> CommonSchema:
+    """Round-trip a schema through ``.usda`` text."""
+    return USDParser().parse_string(USDExporter().export_to_string(schema))
+
+
+def via_json(schema: CommonSchema) -> CommonSchema:
+    """Round-trip a schema through its own canonical JSON form."""
+    return CommonSchema.from_dict(schema.to_dict())
+
+
+def parsed_urdf(name: str) -> CommonSchema:
+    schema = URDFParser().parse(FIXTURES / name)
+    # parse_context holds live Material instances the parser keeps for diagnostics.
+    # It is not model data, and the other exporters do not read it.
+    schema.extensions.pop("parse_context", None)
+    return schema
+
+
+def parsed_mjcf(path: Path) -> CommonSchema:
+    schema = MJCFParser().parse(path)
+    schema.extensions.pop("parse_context", None)
+    return schema
+
+
+def urdf_text(schema: CommonSchema, tmp_path: Path, name: str) -> str:
+    path = tmp_path / name
+    URDFExporter().export(schema, path)
+    return path.read_text()
+
+
+def mjcf_text(schema: CommonSchema, tmp_path: Path, name: str) -> str:
+    path = tmp_path / name
+    MJCFExporter().export(schema, path)
+    return path.read_text()
+
+
+class TestUsdHopIsTransparentToUrdf:
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_schema_survives_the_usd_hop(self, fixture):
+        schema = parsed_urdf(fixture)
+        assert_schema_equal(schema, via_usd(schema))
+
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_reexported_urdf_is_unchanged(self, fixture, tmp_path):
+        schema = parsed_urdf(fixture)
+        direct = urdf_text(schema, tmp_path, "direct.urdf")
+        through_usd = urdf_text(via_usd(schema), tmp_path, "via_usd.urdf")
+        assert direct == through_usd
+
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_reexported_mjcf_is_unchanged(self, fixture, tmp_path):
+        # The cross-format case: a USD detour must not perturb what MuJoCo sees.
+        schema = parsed_urdf(fixture)
+        direct = mjcf_text(schema, tmp_path, "direct.xml")
+        through_usd = mjcf_text(via_usd(schema), tmp_path, "via_usd.xml")
+        assert direct == through_usd
+
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_universal_schema_json_is_unchanged(self, fixture):
+        schema = parsed_urdf(fixture)
+        assert export_universal_schema_json(schema) == export_universal_schema_json(
+            via_usd(schema)
+        )
+
+    def test_urdf_reparsed_after_a_usd_hop_matches(self, tmp_path):
+        # Full URDF -> USD -> URDF -> schema loop, not just a text comparison.
+        schema = parsed_urdf("piper_description.urdf")
+        path = tmp_path / "loop.urdf"
+        URDFExporter().export(via_usd(schema), path)
+        reparsed = URDFParser().parse(path)
+        reparsed.extensions.pop("parse_context", None)
+
+        assert [link.name for link in reparsed.links] == [
+            link.name for link in schema.links
+        ]
+        assert [joint.name for joint in reparsed.joints] == [
+            joint.name for joint in schema.joints
+        ]
+        assert [joint.type for joint in reparsed.joints] == [
+            joint.type for joint in schema.joints
+        ]
+
+    def test_mimic_joints_survive_urdf_usd_urdf(self, tmp_path):
+        schema = parsed_urdf("piper_description-mimic-joint.urdf")
+        source = {joint.name: joint.mimic for joint in schema.joints if joint.mimic}
+        assert source, "fixture is expected to declare at least one mimic joint"
+
+        path = tmp_path / "mimic.urdf"
+        URDFExporter().export(via_usd(schema), path)
+        reparsed = URDFParser().parse(path)
+        assert {
+            joint.name: joint.mimic for joint in reparsed.joints if joint.mimic
+        } == source
+
+
+class TestUsdHopIsTransparentToMjcf:
+    def test_schema_survives_the_usd_hop(self):
+        schema = parsed_mjcf(FIXTURES / "simple_robot.xml")
+        assert_schema_equal(schema, via_usd(schema))
+
+    def test_reexported_mjcf_is_unchanged(self, tmp_path):
+        schema = parsed_mjcf(FIXTURES / "simple_robot.xml")
+        direct = mjcf_text(schema, tmp_path, "direct.xml")
+        through_usd = mjcf_text(via_usd(schema), tmp_path, "via_usd.xml")
+        assert direct == through_usd
+
+    def test_reexported_urdf_is_unchanged(self, tmp_path):
+        schema = parsed_mjcf(FIXTURES / "simple_robot.xml")
+        direct = urdf_text(schema, tmp_path, "direct.urdf")
+        through_usd = urdf_text(via_usd(schema), tmp_path, "via_usd.urdf")
+        assert direct == through_usd
+
+    def test_mjcf_reparsed_after_a_usd_hop_matches(self, tmp_path):
+        schema = parsed_mjcf(FIXTURES / "simple_robot.xml")
+        path = tmp_path / "loop.xml"
+        MJCFExporter().export(via_usd(schema), path)
+        reparsed = parsed_mjcf(path)
+
+        assert [link.name for link in reparsed.links] == [
+            link.name for link in schema.links
+        ]
+        assert [joint.name for joint in reparsed.joints] == [
+            joint.name for joint in schema.joints
+        ]
+        assert [actuator.name for actuator in reparsed.actuators] == [
+            actuator.name for actuator in schema.actuators
+        ]
+
+
+class TestMjcfSpecificExtensionsSurviveUsd:
+    """MuJoCo data with no schema field of its own must not be lost on the USD hop."""
+
+    @pytest.fixture
+    def schema(self, tmp_path) -> CommonSchema:
+        path = tmp_path / "ext_robot.xml"
+        path.write_text(MJCF_WITH_EXTENSIONS)
+        return parsed_mjcf(path)
+
+    def test_the_fixture_actually_produces_extensions(self, schema):
+        # Guards the rest of this class from silently passing on an empty schema.
+        assert "mjcf_size" in schema.extensions
+        assert "mjcf_defaults" in schema.extensions
+        collision_extensions = [
+            collision.extensions
+            for link in schema.links
+            for collision in link.collisions
+        ]
+        assert any(ext for ext in collision_extensions)
+        assert schema.contacts and schema.contacts[0].extensions
+
+    def test_schema_level_mjcf_extensions_survive(self, schema):
+        parsed = via_usd(schema)
+        assert parsed.extensions["mjcf_size"] == schema.extensions["mjcf_size"]
+        assert parsed.extensions["mjcf_defaults"] == schema.extensions["mjcf_defaults"]
+
+    def test_collision_level_mjcf_extensions_survive(self, schema):
+        parsed = via_usd(schema)
+        for original, actual in zip(schema.links, parsed.links):
+            for source, target in zip(original.collisions, actual.collisions):
+                assert target.extensions == source.extensions
+
+    def test_contact_pair_extensions_survive(self, schema):
+        parsed = via_usd(schema)
+        assert [contact.extensions for contact in parsed.contacts] == [
+            contact.extensions for contact in schema.contacts
+        ]
+        assert [contact.link for contact in parsed.contacts] == [
+            contact.link for contact in schema.contacts
+        ]
+
+    def test_reexported_mjcf_is_byte_identical(self, schema, tmp_path):
+        direct = mjcf_text(schema, tmp_path, "direct.xml")
+        through_usd = mjcf_text(via_usd(schema), tmp_path, "via_usd.xml")
+        assert direct == through_usd
+
+    def test_the_reexported_mjcf_still_carries_the_extension_data(
+        self, schema, tmp_path
+    ):
+        # A byte-identical comparison would also pass if both sides dropped the
+        # data, so assert the values are actually present in the XML.
+        text = mjcf_text(via_usd(schema), tmp_path, "via_usd.xml")
+        assert 'njmax="600"' in text
+        assert "0.9 0.01 0.002" in text  # the <default><geom friction=...>
+        assert "<pair" in text
+        assert 'condim="6"' in text
+
+    def test_armature_and_friction_loss_survive(self, schema):
+        parsed = via_usd(schema)
+        source = schema.joints[0].dynamics
+        actual = parsed.joints[0].dynamics
+        # armature has no URDF or USD equivalent at all — it exists only in MJCF and
+        # in the schema, so it rides on a cyberwave: sidecar.
+        assert actual.armature == source.armature
+        assert actual.friction == source.friction
+        assert actual.damping == source.damping
+
+    def test_passive_joint_marker_survives(self, schema):
+        # MJCFExporter reads joint.extensions["passive"] to decide whether to emit an
+        # actuator, so losing it would silently change the exported model.
+        schema.joints[0].extensions["passive"] = True
+        parsed = via_usd(schema)
+        assert parsed.joints[0].extensions["passive"] is True
+
+
+class TestUsdSpecificPropertiesSurviveASchemaHop:
+    """UsdPhysics properties with no schema field ride in ``extensions["usd"]``."""
+
+    FOREIGN = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Xform "base" (prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"])
+    {
+        float physics:mass = 2
+        bool physics:kinematicEnabled = 1
+        bool physics:startsAsleep = 1
+        vector3f physics:velocity = (1, 2, 3)
+        vector3f physics:angularVelocity = (0, 0, 4)
+        float physics:density = 1200
+    }
+    def Xform "arm" (prepend apiSchemas = ["PhysicsRigidBodyAPI"])
+    {
+        bool physics:rigidBodyEnabled = 0
+        def Sphere "col" (prepend apiSchemas = ["PhysicsCollisionAPI"])
+        {
+            double radius = 0.1
+            bool physics:collisionEnabled = 0
+        }
+    }
+    def PhysicsRevoluteJoint "j" (prepend apiSchemas = ["PhysicsDriveAPI:angular"])
+    {
+        rel physics:body0 = </Robot/base>
+        rel physics:body1 = </Robot/arm>
+        bool physics:jointEnabled = 0
+        bool physics:collisionEnabled = 1
+        float physics:breakForce = 250
+        float physics:breakTorque = 75
+        float drive:angular:physics:stiffness = 100
+        float drive:angular:physics:targetVelocity = 12
+    }
+}
+"""
+
+    @pytest.fixture
+    def schema(self) -> CommonSchema:
+        return USDParser().parse_string(self.FOREIGN)
+
+    def test_link_properties_are_preserved(self, schema):
+        base = schema.links[0].extensions["usd"]
+        assert base["kinematicEnabled"] is True
+        assert base["startsAsleep"] is True
+        assert base["velocity"] == [1.0, 2.0, 3.0]
+        assert base["angularVelocity"] == [0.0, 0.0, 4.0]
+        assert base["density"] == 1200.0
+        assert schema.links[1].extensions["usd"]["rigidBodyEnabled"] is False
+
+    def test_joint_properties_are_preserved(self, schema):
+        joint = schema.joints[0].extensions["usd"]
+        assert joint["jointEnabled"] is False
+        assert joint["collisionEnabled"] is True
+        assert joint["breakForce"] == 250.0
+        assert joint["breakTorque"] == 75.0
+        assert joint["driveTargetVelocity"] == 12.0
+
+    def test_collision_properties_are_preserved(self, schema):
+        assert schema.links[1].collisions[0].extensions["usd"]["collisionEnabled"] is False
+
+    def test_they_are_written_back_as_native_usd_attributes(self, schema):
+        # Not as a second cyberwave: copy: a USD consumer has to see them in the
+        # physics: namespace where it already looks.
+        text = USDExporter().export_to_string(schema)
+        assert "bool physics:kinematicEnabled = 1" in text
+        assert "float physics:breakForce = 250" in text
+        assert "bool physics:jointEnabled = 0" in text
+        assert "vector3f physics:velocity = (1, 2, 3)" in text
+
+    def test_foreign_stage_survives_a_full_schema_round_trip(self, schema):
+        assert_schema_equal(schema, via_usd(schema))
+
+    def test_unauthored_properties_are_not_invented(self):
+        text = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Xform "base" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+}
+"""
+        schema = USDParser().parse_string(text)
+        assert schema.links[0].extensions == {}
+
+    def test_infinite_break_thresholds_are_not_data(self):
+        # breakForce/breakTorque default to +inf, meaning "unbreakable"; harvesting
+        # that as a number would put `Infinity` into the JSON wire format.
+        text = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Xform "a" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+    def Xform "b" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+    def PhysicsRevoluteJoint "j"
+    {
+        rel physics:body0 = </Robot/a>
+        rel physics:body1 = </Robot/b>
+        float physics:breakForce = inf
+        bool physics:jointEnabled = 1
+    }
+}
+"""
+        usd = USDParser().parse_string(text).joints[0].extensions["usd"]
+        assert "breakForce" not in usd
+        assert usd["jointEnabled"] is True
+
+    def test_a_cyberwave_written_stage_gains_no_usd_extensions(self):
+        # Every attribute in the passthrough tables is one the exporter never
+        # authors itself, so our own output must round-trip with empty extensions.
+        schema = CommonSchema(
+            metadata=Metadata(name="clean"),
+            links=[Link(name="a"), Link(name="b")],
+            joints=[
+                Joint(
+                    name="j",
+                    type=JointType.FLOATING,
+                    parent_link="a",
+                    child_link="b",
+                )
+            ],
+        )
+        parsed = via_usd(schema)
+        assert parsed.links[0].extensions == {}
+        assert parsed.joints[0].extensions == {}
+
+    def test_collision_group_properties_ride_on_the_config(self):
+        text = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Scope "CollisionGroups"
+    {
+        def PhysicsCollisionGroup "ROBOT"
+        {
+            bool physics:invertFilteredGroups = 1
+            string physics:mergeGroup = "arm_cluster"
+        }
+    }
+    def Scope "CollisionConfig" {}
+}
+"""
+        schema = USDParser().parse_string(text)
+        stored = schema.collision_config.extensions["usd"]["groups"]["ROBOT"]
+        assert stored["invertFilteredGroups"] is True
+        assert stored["mergeGroup"] == "arm_cluster"
+
+        # And they come back out on re-export.
+        assert 'string physics:mergeGroup = "arm_cluster"' in (
+            USDExporter().export_to_string(schema)
+        )
+        assert_schema_equal(schema, via_usd(schema))
+
+
+class TestFeaturesNoOtherFormatSupports:
+    """Schema fields URDF and MJCF cannot express still survive the USD hop.
+
+    These are the fields that make the USD path more than a convenience: the
+    universal schema is the only lossless carrier for them, and USD is now the only
+    *file* format that keeps all of them.
+    """
+
+    @staticmethod
+    def _rich_schema() -> CommonSchema:
+        return CommonSchema(
+            metadata=Metadata(name="rich", author="cyberwave", description="d"),
+            links=[
+                Link(
+                    name="base",
+                    mass=1.0,
+                    visuals=[
+                        Visual(
+                            name="v",
+                            geometry=Geometry(
+                                type=GeometryType.CAPSULE, radius=0.05, length=0.2
+                            ),
+                        )
+                    ],
+                    collisions=[
+                        Collision(
+                            name="c",
+                            geometry=Geometry(
+                                type=GeometryType.ELLIPSOID,
+                                size=Vector3(x=0.1, y=0.2, z=0.05),
+                            ),
+                            group="ROBOT",
+                            stiffness=54321.0,
+                            damping=17.5,
+                        )
+                    ],
+                ),
+                Link(name="tip", mass=0.25),
+            ],
+            joints=[
+                Joint(
+                    name="j",
+                    type=JointType.REVOLUTE,
+                    parent_link="base",
+                    child_link="tip",
+                    pose=Pose(position=Vector3(z=0.2)),
+                    axis=Vector3(y=1.0),
+                    limits=JointLimits(
+                        lower=-1.0,
+                        upper=1.0,
+                        effort=5.0,
+                        velocity=2.0,
+                        acceleration=12.5,
+                        jerkmax=99.0,
+                    ),
+                    dynamics=JointDynamics(armature=0.02, backlash=0.003),
+                    safety_controller={"k_position": 10.0},
+                    calibration={"rising": 0.15},
+                    home_position=0.35,
+                )
+            ],
+            contacts=[Contact(name="foot", link="base")],
+            collision_config=CollisionConfig(
+                groups={"ROBOT": CollisionGroup(name="ROBOT", contype=2, conaffinity=4)}
+            ),
+        )
+
+    def test_all_of_them_survive(self):
+        schema = self._rich_schema()
+        assert_schema_equal(schema, via_usd(schema))
+
+    @pytest.mark.parametrize(
+        ("description", "accessor"),
+        [
+            ("limits.acceleration", lambda s: s.joints[0].limits.acceleration),
+            ("limits.jerkmax", lambda s: s.joints[0].limits.jerkmax),
+            ("dynamics.armature", lambda s: s.joints[0].dynamics.armature),
+            ("dynamics.backlash", lambda s: s.joints[0].dynamics.backlash),
+            ("safety_controller", lambda s: s.joints[0].safety_controller),
+            ("calibration", lambda s: s.joints[0].calibration),
+            ("home_position", lambda s: s.joints[0].home_position),
+            ("collision.stiffness", lambda s: s.links[0].collisions[0].stiffness),
+            ("collision.damping", lambda s: s.links[0].collisions[0].damping),
+            ("collision.group", lambda s: s.links[0].collisions[0].group),
+            ("capsule length", lambda s: s.links[0].visuals[0].geometry.length),
+            ("ellipsoid size", lambda s: s.links[0].collisions[0].geometry.size),
+            (
+                "collision group bitmask",
+                lambda s: s.collision_config.groups["ROBOT"].conaffinity,
+            ),
+        ],
+    )
+    def test_field_survives_individually(self, description, accessor):
+        schema = self._rich_schema()
+        assert accessor(via_usd(schema)) == accessor(schema), description
+
+    def test_urdf_export_of_the_same_schema_is_lossy_as_expected(self, tmp_path):
+        # Documents *why* the USD path matters: URDF genuinely cannot carry these,
+        # so a URDF detour loses them while a USD detour does not.
+        schema = self._rich_schema()
+        path = tmp_path / "lossy.urdf"
+        URDFExporter().export(schema, path)
+        reparsed = URDFParser().parse(path)
+
+        assert reparsed.joints[0].dynamics.armature is None
+        assert reparsed.joints[0].limits.acceleration is None
+        assert reparsed.contacts == []
+        assert via_usd(schema).joints[0].dynamics.armature == 0.02
+
+
+class TestComposedSceneAcrossFormats:
+    def test_merged_scene_survives_urdf_and_mjcf_export_after_a_usd_hop(self, tmp_path):
+        arm = parsed_urdf("piper_description.urdf")
+        scene = CommonSchema(metadata=Metadata(name="cell"))
+        scene.merge_in(arm, "arm1", spawn_pose=Pose(position=Vector3()), fixed_base=True)
+        scene.merge_in(
+            arm, "arm2", spawn_pose=Pose(position=Vector3(x=1.5)), fixed_base=False
+        )
+        assert scene.validate() == []
+
+        assert_schema_equal(scene, via_usd(scene))
+        assert mjcf_text(scene, tmp_path, "direct.xml") == mjcf_text(
+            via_usd(scene), tmp_path, "via_usd.xml"
+        )
+        assert urdf_text(scene, tmp_path, "direct.urdf") == urdf_text(
+            via_usd(scene), tmp_path, "via_usd.urdf"
+        )
+
+    def test_instance_namespacing_and_spawn_joints_are_intact(self):
+        arm = parsed_urdf("simple_robot.urdf")
+        scene = CommonSchema(metadata=Metadata(name="cell"))
+        scene.merge_in(arm, "a1", spawn_pose=Pose(), fixed_base=True)
+        scene.merge_in(arm, "a2", spawn_pose=Pose(), fixed_base=False)
+
+        parsed = via_usd(scene)
+        spawn = {
+            joint.name: joint.type
+            for joint in parsed.joints
+            if joint.name.endswith("__spawn")
+        }
+        assert spawn == {
+            "a1__spawn": JointType.FIXED,
+            "a2__spawn": JointType.FLOATING,
+        }
+        assert all("__" in link.name for link in parsed.links)
+
+
+class TestFileBasedPipelines:
+    """The same invariants driven through real files rather than in-memory text."""
+
+    @pytest.mark.parametrize("suffix", [".usda", ".usdc", ".usdz"])
+    def test_urdf_to_usd_file_to_mjcf(self, suffix, tmp_path):
+        schema = parsed_urdf("piper_description.urdf")
+        usd_path = tmp_path / f"robot{suffix}"
+        USDExporter().export(schema, usd_path)
+        reloaded = USDParser().parse(usd_path)
+
+        assert mjcf_text(schema, tmp_path, "direct.xml") == mjcf_text(
+            reloaded, tmp_path, f"via{suffix}.xml"
+        )
+
+    def test_format_converter_drives_urdf_to_usda(self, tmp_path):
+        from cyberwave_robot_format.core import FormatConverter
+
+        converter = FormatConverter()
+        out = tmp_path / "converted.usda"
+        converter.convert(FIXTURES / "simple_robot.urdf", out)
+        assert out.stat().st_size > 0
+
+        reloaded = USDParser().parse(out)
+        # The converter's internal parse keeps parse_context, and the exporter
+        # faithfully carried it into the stage — drop it on both sides, as elsewhere.
+        reloaded.extensions.pop("parse_context", None)
+        assert_schema_equal(parsed_urdf("simple_robot.urdf"), reloaded)
+
+    def test_detect_format_recognizes_the_exported_file(self, tmp_path):
+        from cyberwave_robot_format.utils import detect_format
+
+        path = tmp_path / "robot.usda"
+        USDExporter().export(parsed_urdf("simple_robot.urdf"), path)
+        assert detect_format(path) == "usd"
+
+    def test_detect_format_sniffs_a_usdz_package_by_content(self, tmp_path):
+        # A usdz is a zip, so the magic bytes alone are ambiguous; what makes it USD
+        # is that its first archived entry is the default layer.
+        from cyberwave_robot_format.utils import detect_format
+
+        package = tmp_path / "robot.usdz"
+        USDExporter().export(parsed_urdf("simple_robot.urdf"), package)
+        extensionless = tmp_path / "mystery"
+        extensionless.write_bytes(package.read_bytes())
+        assert detect_format(extensionless) == "usd"
+
+    def test_detect_format_does_not_claim_an_ordinary_zip_is_usd(self, tmp_path):
+        import zipfile
+
+        from cyberwave_robot_format.utils import detect_format
+
+        archive = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("notes.txt", "not a robot")
+        assert detect_format(archive) is None
+
+
+class TestHonestAboutWhatItCannotConvert:
+    def test_non_si_units_warn_but_are_preserved(self, caplog):
+        import logging
+
+        schema = CommonSchema(metadata=Metadata(name="imperial_bot", units="imperial"))
+        with caplog.at_level(logging.WARNING):
+            parsed = via_usd(schema)
+        assert "units='imperial'" in caplog.text
+        assert "metersPerUnit=1" in caplog.text
+        # The declared value still survives, so nothing is silently rewritten.
+        assert parsed.metadata.units == "imperial"
+
+    def test_si_units_do_not_warn(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            via_usd(CommonSchema(metadata=Metadata(name="ok")))
+        assert "units=" not in caplog.text
+
+    def test_spherical_cone_limits_are_preserved_not_reinterpreted(self):
+        # UsdPhysics gives a spherical joint two cone half-angles; JointLimits'
+        # lower/upper mean something else, so they are kept verbatim instead.
+        text = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Xform "a" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+    def Xform "b" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+    def PhysicsSphericalJoint "ball"
+    {
+        rel physics:body0 = </Robot/a>
+        rel physics:body1 = </Robot/b>
+        float physics:coneAngle0Limit = 35
+        float physics:coneAngle1Limit = 20
+    }
+}
+"""
+        schema = USDParser().parse_string(text)
+        joint = schema.joints[0]
+        assert joint.type == JointType.SPHERICAL
+        assert joint.limits is None
+        assert joint.extensions["usd"]["coneAngle0Limit"] == 35.0
+        assert joint.extensions["usd"]["coneAngle1Limit"] == 20.0
+
+        # And they are written back where a USD consumer looks for them.
+        assert "float physics:coneAngle0Limit = 35" in (
+            USDExporter().export_to_string(schema)
+        )
+        assert_schema_equal(schema, via_usd(schema))
+
+    def test_unset_cone_limits_are_not_harvested(self):
+        # The -1 default means "unlimited", not a 1-degree cone.
+        text = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Xform "a" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+    def Xform "b" (prepend apiSchemas = ["PhysicsRigidBodyAPI"]) {}
+    def PhysicsSphericalJoint "ball"
+    {
+        rel physics:body0 = </Robot/a>
+        rel physics:body1 = </Robot/b>
+    }
+}
+"""
+        assert USDParser().parse_string(text).joints[0].extensions == {}
+
+    def test_every_component_dataclass_has_an_extensions_field(self):
+        # Material used to be the one exception, which is why MJCFParser crashed on a
+        # material carrying `reflectance`.
+        import dataclasses
+
+        from cyberwave_robot_format import schema as schema_module
+
+        components = [
+            schema_module.Material,
+            schema_module.Link,
+            schema_module.Joint,
+            schema_module.Visual,
+            schema_module.Collision,
+            schema_module.Geometry,
+            schema_module.Actuator,
+            schema_module.Sensor,
+            schema_module.Contact,
+            schema_module.Metadata,
+            schema_module.Physics,
+            schema_module.PhysicsSolver,
+            schema_module.Scene,
+            schema_module.CollisionConfig,
+            schema_module.CollisionPair,
+        ]
+        for component in components:
+            names = {f.name for f in dataclasses.fields(component)}
+            assert "extensions" in names, component.__name__
+
+
+class TestSchemaJsonIsCanonicalStraightFromTheParsers:
+    """A freshly parsed schema must already serialize in its canonical form.
+
+    ``Vector3``/``Quaternion`` coerce their components to ``float``, so a parser (or
+    the ``Joint.axis`` default) writing ``Vector3(0, 0, 1)`` no longer leaves ``int``
+    components behind. Before that, the same model serialized an axis as ``"z": 1``
+    fresh from ``URDFParser`` and ``"z": 1.0`` after any ``from_dict`` — which made
+    ``export_universal_schema_json`` non-idempotent and changed any hash taken over
+    it.
+    """
+
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_urdf_parse_is_already_canonical(self, fixture):
+        schema = parsed_urdf(fixture)
+        assert export_universal_schema_json(schema) == export_universal_schema_json(
+            via_json(schema)
+        )
+
+    def test_mjcf_parse_is_already_canonical(self):
+        schema = parsed_mjcf(FIXTURES / "simple_robot.xml")
+        assert export_universal_schema_json(schema) == export_universal_schema_json(
+            via_json(schema)
+        )
+
+    def test_usd_parse_is_already_canonical(self):
+        schema = USDParser().parse(FIXTURES / "two_link_arm.usda")
+        assert export_universal_schema_json(schema) == export_universal_schema_json(
+            via_json(schema)
+        )
+
+    @pytest.mark.parametrize(
+        ("constructed", "expected"),
+        [
+            (lambda: Vector3(0, 0, 1), [0.0, 0.0, 1.0]),
+            (lambda: Vector3(1, 2, 3), [1.0, 2.0, 3.0]),
+            (lambda: Vector3.from_list([0, 0, 1]), [0.0, 0.0, 1.0]),
+        ],
+    )
+    def test_vector3_coerces_int_components(self, constructed, expected):
+        vector = constructed()
+        assert vector.to_list() == expected
+        assert all(isinstance(value, float) for value in vector.to_list())
+
+    def test_quaternion_coerces_int_components(self):
+        from cyberwave_robot_format.schema import Quaternion
+
+        quat = Quaternion(0, 0, 0, 1)
+        assert all(isinstance(value, float) for value in quat.to_list())
+
+    def test_numpy_scalars_are_coerced_so_json_can_serialize_them(self):
+        import json
+
+        import numpy as np
+
+        vector = Vector3(np.float64(1.5), np.float32(2.5), np.int64(3))
+        assert all(type(value) is float for value in vector.to_list())
+        # json.dumps cannot serialize numpy scalars at all, so this would raise
+        # without the coercion.
+        assert json.dumps(vector.to_list()) == "[1.5, 2.5, 3.0]"
+
+    def test_default_joint_axis_is_float_valued(self):
+        joint = Joint(
+            name="j", type=JointType.FIXED, parent_link="a", child_link="b"
+        )
+        assert all(isinstance(value, float) for value in joint.axis.to_list())
+
+
+class TestMaterialExtensionsAcrossFormats:
+    """``Material.extensions`` — the field whose absence used to crash MJCFParser."""
+
+    MJCF_WITH_MATERIAL = """<mujoco model="reflective">
+  <compiler angle="radian" autolimits="true"/>
+  <asset>
+    <material name="shiny" rgba="0.5 0.5 0.6 1" reflectance="0.35" specular="0.8"
+              shininess="0.6" emission="0.1"/>
+  </asset>
+  <worldbody>
+    <body name="base_link">
+      <inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>
+      <geom name="visual_geom" type="box" size="0.1 0.1 0.1" material="shiny" group="2"/>
+      <geom name="collision_geom" type="box" size="0.1 0.1 0.1" group="3"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+    @pytest.fixture
+    def schema(self, tmp_path) -> CommonSchema:
+        path = tmp_path / "reflective.xml"
+        path.write_text(self.MJCF_WITH_MATERIAL)
+        return parsed_mjcf(path)
+
+    @staticmethod
+    def _base_link(schema: CommonSchema) -> Link:
+        # MJCFParser synthesizes a `world` link, so the model's root is not links[0].
+        return next(link for link in schema.links if link.name == "base_link")
+
+    def test_mjcf_with_a_reflectance_material_parses_at_all(self, schema):
+        # This raised AttributeError before Material gained an extensions field, so
+        # the model could not be imported at all.
+        material = self._base_link(schema).visuals[0].material
+        assert material.name == "shiny"
+        assert material.extensions["reflectance"] == 0.35
+
+    def test_material_extensions_survive_the_usd_hop(self, schema):
+        material = self._base_link(via_usd(schema)).visuals[0].material
+        assert material.extensions == {"reflectance": 0.35}
+
+    def test_reflectance_is_re_emitted_into_mjcf_after_a_usd_hop(self, schema, tmp_path):
+        text = mjcf_text(via_usd(schema), tmp_path, "via_usd.xml")
+        assert 'reflectance="0.35"' in text
+
+    def test_reexported_mjcf_is_byte_identical(self, schema, tmp_path):
+        assert mjcf_text(schema, tmp_path, "direct.xml") == mjcf_text(
+            via_usd(schema), tmp_path, "via_usd.xml"
+        )
+
+    def test_material_extensions_round_trip_on_their_own(self):
+        schema = CommonSchema(
+            metadata=Metadata(name="m"),
+            links=[
+                Link(
+                    name="a",
+                    visuals=[
+                        Visual(
+                            name="v",
+                            geometry=Geometry(type=GeometryType.SPHERE, radius=1.0),
+                            material=Material(
+                                name="custom",
+                                extensions={"reflectance": 0.5, "nested": {"a": [1, None]}},
+                            ),
+                        )
+                    ],
+                )
+            ],
+        )
+        assert_schema_equal(schema, via_usd(schema))
+
+    def test_an_unnamed_material_keeps_its_extensions(self):
+        # An unnamed material is authored inline under its gprim rather than shared,
+        # which is a different code path.
+        schema = CommonSchema(
+            metadata=Metadata(name="m"),
+            links=[
+                Link(
+                    name="a",
+                    visuals=[
+                        Visual(
+                            name="v",
+                            geometry=Geometry(type=GeometryType.SPHERE, radius=1.0),
+                            material=Material(extensions={"reflectance": 0.25}),
+                        )
+                    ],
+                )
+            ],
+        )
+        material = via_usd(schema).links[0].visuals[0].material
+        assert material.name is None
+        assert material.extensions == {"reflectance": 0.25}
+
+
+class TestConversionOrderIndependence:
+    """A USD hop composes with the other converters in any order."""
+
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_urdf_to_mjcf_to_schema_then_usd_is_stable(self, fixture, tmp_path):
+        # URDF -> MJCF -> schema -> USD -> schema: the USD hop is applied to a schema
+        # that came out of MJCF rather than URDF, exercising the MJCF parser's own
+        # extension payloads on real models.
+        schema = parsed_urdf(fixture)
+        mjcf_path = tmp_path / "mid.xml"
+        MJCFExporter().export(schema, mjcf_path)
+        from_mjcf = parsed_mjcf(mjcf_path)
+        assert_schema_equal(from_mjcf, via_usd(from_mjcf))
+
+    @pytest.mark.parametrize("fixture", URDF_FIXTURES)
+    def test_usd_hop_before_or_after_mjcf_gives_the_same_model(self, fixture, tmp_path):
+        schema = parsed_urdf(fixture)
+
+        # (a) USD hop first, then MJCF.
+        before = mjcf_text(via_usd(schema), tmp_path, "before.xml")
+        # (b) MJCF first, then a USD hop, then MJCF again.
+        MJCFExporter().export(schema, tmp_path / "mid.xml")
+        after = mjcf_text(
+            via_usd(parsed_mjcf(tmp_path / "mid.xml")), tmp_path, "after.xml"
+        )
+        # These are not expected to be equal to each other — a MJCF hop is genuinely
+        # lossy — but each must equal its own no-USD counterpart.
+        assert before == mjcf_text(schema, tmp_path, "direct.xml")
+        assert after == mjcf_text(
+            parsed_mjcf(tmp_path / "mid.xml"), tmp_path, "mjcf_only.xml"
+        )
+
+    @pytest.mark.parametrize("hops", [1, 2, 3, 5])
+    def test_repeated_usd_hops_converge(self, hops):
+        schema = parsed_urdf("piper_description.urdf")
+        current = schema
+        for _ in range(hops):
+            current = via_usd(current)
+        assert_schema_equal(schema, current)
+
+    def test_repeated_hops_are_byte_stable(self):
+        schema = parsed_urdf("piper_description.urdf")
+        first = USDExporter().export_to_string(schema)
+        current = schema
+        for _ in range(4):
+            current = via_usd(current)
+            assert USDExporter().export_to_string(current) == first
+
+    def test_usd_file_encodings_agree_with_each_other(self, tmp_path):
+        schema = parsed_urdf("gripper_prismatic_pair.urdf")
+        parsed = {}
+        for suffix in (".usda", ".usdc", ".usd", ".usdz"):
+            path = tmp_path / f"r{suffix}"
+            USDExporter().export(schema, path)
+            parsed[suffix] = USDParser().parse(path)
+        reference = export_universal_schema_json(parsed[".usda"])
+        for suffix, value in parsed.items():
+            assert export_universal_schema_json(value) == reference, suffix
+
+    def test_every_format_pair_round_trips_through_files(self, tmp_path):
+        # A full matrix walk driven entirely through real files, so path handling,
+        # suffix detection and encoding selection are all exercised together.
+        from cyberwave_robot_format.utils import detect_format
+
+        schema = parsed_urdf("simple_robot.urdf")
+        writers = {
+            "urdf": (URDFExporter(), "robot.urdf", URDFParser()),
+            "mjcf": (MJCFExporter(), "robot.xml", MJCFParser()),
+            "usd": (USDExporter(), "robot.usda", USDParser()),
+        }
+        for name, (exporter, filename, parser) in writers.items():
+            path = tmp_path / filename
+            exporter.export(schema, path)
+            assert path.stat().st_size > 0
+            assert detect_format(path) == name
+            assert parser.can_parse(path)
+            reloaded = parser.parse(path)
+            assert reloaded.links, name
+            assert reloaded.metadata.name
+
+
+class TestGoldenUsdaFixture:
+    """A committed ``.usda`` that must keep parsing to a known schema.
+
+    ``tests/fixtures/two_link_arm.usda`` is checked in as a *golden input*. It guards
+    two things a round-trip test cannot: that a ``usd-core`` upgrade has not changed
+    how the file is read, and that no ``cyberwave:`` sidecar has been renamed without
+    a compatibility story for stages already written to disk.
+    """
+
+    @pytest.fixture
+    def schema(self) -> CommonSchema:
+        return USDParser().parse(FIXTURES / "two_link_arm.usda")
+
+    def test_metadata(self, schema):
+        assert schema.metadata.name == "two_link_arm"
+        assert schema.metadata.author == "Cyberwave"
+        assert schema.metadata.units == "SI"
+
+    def test_links_and_inertials(self, schema):
+        assert [link.name for link in schema.links] == [
+            "base_link",
+            "upper_arm",
+            "gripper",
+        ]
+        base = schema.links[0]
+        assert base.mass == 2.5
+        assert base.center_of_mass == Vector3(x=0.0, y=0.0, z=0.05)
+        assert base.inertia.ixx == 0.02
+        assert base.inertia.izz == 0.01
+
+    def test_joints(self, schema):
+        import math
+
+        assert [(j.name, j.type) for j in schema.joints] == [
+            ("shoulder", JointType.REVOLUTE),
+            ("wrist", JointType.CONTINUOUS),
+        ]
+        shoulder = schema.joints[0]
+        assert shoulder.parent_link == "base_link"
+        assert shoulder.child_link == "upper_arm"
+        assert shoulder.pose.position == Vector3(x=0.0, y=0.0, z=0.1)
+        assert shoulder.axis == Vector3(x=0.0, y=1.0, z=0.0)
+        assert shoulder.limits.lower == -math.pi / 2
+        assert shoulder.limits.effort == 40.0
+        assert shoulder.dynamics.armature == 0.01
+        assert shoulder.home_position == 0.25
+        # A continuous joint must not come back with fabricated limits.
+        assert schema.joints[1].limits.lower is None
+        assert schema.joints[1].limits.effort == 5.0
+
+    def test_geometry(self, schema):
+        assert schema.links[0].visuals[0].geometry.type == GeometryType.BOX
+        assert schema.links[0].visuals[0].geometry.size == Vector3(x=0.2, y=0.2, z=0.1)
+        assert schema.links[1].visuals[0].geometry.type == GeometryType.CYLINDER
+        assert schema.links[1].visuals[0].geometry.radius == 0.03
+        mesh = schema.links[2].visuals[0].geometry
+        assert mesh.type == GeometryType.MESH
+        assert mesh.filename == "package://two_link_arm/meshes/gripper.stl"
+        assert mesh.scale == Vector3(x=0.001, y=0.001, z=0.001)
+
+    def test_materials_collisions_actuators_sensors(self, schema):
+        assert schema.links[0].visuals[0].material.name == "grey"
+        assert schema.links[0].visuals[0].material.color == [0.6, 0.6, 0.6, 1.0]
+        collision = schema.links[0].collisions[0]
+        assert collision.mu_static == 0.8
+        assert collision.mu_dynamic == 0.7
+        assert [a.name for a in schema.actuators] == ["shoulder_motor"]
+        assert schema.actuators[0].gear_ratio == 100.0
+        assert [s.name for s in schema.sensors] == ["wrist_imu"]
+        assert schema.sensors[0].parent_link == "gripper"
+        assert schema.sensors[0].update_rate == 200.0
+
+    def test_physics_and_collision_config(self, schema):
+        assert schema.physics.gravity == Vector3(x=0.0, y=0.0, z=-9.81)
+        assert schema.physics.timestep == 0.002
+        assert "default" in schema.collision_config.groups
+        assert [
+            (e.body1, e.body2) for e in schema.collision_config.excludes
+        ] == [("base_link", "upper_arm")]
+
+    def test_the_fixture_is_structurally_valid(self, schema):
+        assert schema.validate() == []
+
+    def test_it_round_trips_and_re_exports_identically(self, schema):
+        assert_schema_equal(schema, via_usd(schema))
+        assert USDExporter().export_to_string(schema) == (
+            FIXTURES / "two_link_arm.usda"
+        ).read_text()
+
+    def test_it_converts_onward_to_urdf_and_mjcf(self, schema, tmp_path):
+        assert "<robot" in urdf_text(schema, tmp_path, "golden.urdf")
+        # The fixture's actuator carries gear_ratio=100 — a field only the schema and
+        # USD can hold — and MJCFExporter rightly warns that a position actuator's
+        # gear divides the controllable joint range. Asserted rather than silenced, so
+        # the interaction stays documented.
+        with pytest.warns(UserWarning, match="gear_ratio"):
+            text = mjcf_text(schema, tmp_path, "golden.xml")
+        assert "<mujoco" in text
+        assert 'gear="100.0"' in text
+
+
+# A MuJoCo model used as a *source* format, covering the geometry and joint kinds
+# MJCFParser supports rather than the ones URDF happens to produce: capsules, planes,
+# a ball joint, a slide joint, a free-floating body, and several actuator kinds.
+MJCF_RICH_SOURCE = """<mujoco model="rich_source">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.001" gravity="0 0 -9.81"/>
+
+  <asset>
+    <material name="floor_mat" rgba="0.3 0.3 0.35 1"/>
+    <material name="body_mat" rgba="0.8 0.2 0.2 1" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <body name="ground" pos="0 0 0">
+      <geom name="floor" type="plane" size="5 5 0.1" material="floor_mat" group="3"/>
+    </body>
+
+    <body name="chassis" pos="0 0 0.2">
+      <joint name="root" type="free"/>
+      <inertial pos="0 0 0" mass="5.0" diaginertia="0.4 0.4 0.6"/>
+      <geom name="chassis_vis" type="box" size="0.2 0.15 0.05" material="body_mat" group="2"/>
+      <geom name="chassis_col" type="box" size="0.2 0.15 0.05" group="3"
+            contype="1" conaffinity="1" friction="0.9 0.01 0.001"/>
+
+      <body name="mast" pos="0 0 0.05">
+        <inertial pos="0 0 0.15" mass="0.8" diaginertia="0.02 0.02 0.005"/>
+        <joint name="lift" type="slide" axis="0 0 1" range="0 0.4" damping="2.0"/>
+        <geom name="mast_vis" type="capsule" size="0.03 0.15" group="2"/>
+
+        <body name="head" pos="0 0 0.3">
+          <inertial pos="0 0 0" mass="0.3" diaginertia="0.001 0.001 0.001"/>
+          <joint name="pan" type="hinge" axis="0 0 1" range="-3.0 3.0" damping="0.05"
+                 armature="0.002" frictionloss="0.01"/>
+          <geom name="head_vis" type="sphere" size="0.05" group="2"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="chassis" body2="mast"/>
+  </contact>
+
+  <actuator>
+    <motor name="lift_motor" joint="lift" gear="1" ctrllimited="true" ctrlrange="-20 20"/>
+    <position name="pan_servo" joint="pan" kp="15" ctrllimited="true" ctrlrange="-3 3"/>
+    <velocity name="pan_vel" joint="pan" kv="2"/>
+  </actuator>
+</mujoco>
+"""
+
+
+class TestOriginMjcf:
+    """MuJoCo as the *source* format, exercising kinds URDF never produces."""
+
+    @pytest.fixture
+    def schema(self, tmp_path) -> CommonSchema:
+        path = tmp_path / "rich_source.xml"
+        path.write_text(MJCF_RICH_SOURCE)
+        return parsed_mjcf(path)
+
+    def test_the_source_covers_the_intended_variety(self, schema):
+        # Guards the rest of the class from passing on a schema that lost the
+        # features it is supposed to be testing.
+        geometry_types = {
+            geom.geometry.type
+            for link in schema.links
+            for geom in list(link.visuals) + list(link.collisions)
+            if geom.geometry
+        }
+        assert GeometryType.CAPSULE in geometry_types
+        assert GeometryType.PLANE in geometry_types
+        joint_types = {joint.type for joint in schema.joints}
+        assert JointType.PRISMATIC in joint_types
+        assert JointType.FLOATING in joint_types
+        assert len(schema.actuators) == 3
+
+    def test_schema_survives_the_usd_hop(self, schema):
+        assert_schema_equal(schema, via_usd(schema))
+
+    def test_reexported_mjcf_is_byte_identical(self, schema, tmp_path):
+        assert mjcf_text(schema, tmp_path, "direct.xml") == mjcf_text(
+            via_usd(schema), tmp_path, "via_usd.xml"
+        )
+
+    def test_reexported_urdf_is_byte_identical(self, schema, tmp_path):
+        assert urdf_text(schema, tmp_path, "direct.urdf") == urdf_text(
+            via_usd(schema), tmp_path, "via_usd.urdf"
+        )
+
+    def test_universal_schema_json_is_unchanged(self, schema):
+        assert export_universal_schema_json(schema) == export_universal_schema_json(
+            via_usd(schema)
+        )
+
+    def test_capsule_and_plane_dimensions_are_exact(self, schema):
+        parsed = via_usd(schema)
+        for original, actual in zip(schema.links, parsed.links):
+            for source, target in zip(original.visuals, actual.visuals):
+                assert target.geometry == source.geometry
+            for source, target in zip(original.collisions, actual.collisions):
+                assert target.geometry == source.geometry
+
+    def test_the_free_joint_stays_floating(self, schema):
+        parsed = via_usd(schema)
+        by_name = {joint.name: joint.type for joint in parsed.joints}
+        assert by_name["root"] == JointType.FLOATING
+        assert by_name["lift"] == JointType.PRISMATIC
+        assert by_name["pan"] == JointType.REVOLUTE
+
+    def test_all_three_actuator_kinds_survive(self, schema):
+        parsed = via_usd(schema)
+        assert [(a.name, a.joint, a.type) for a in parsed.actuators] == [
+            (a.name, a.joint, a.type) for a in schema.actuators
+        ]
+        # Two actuators target `pan`; only the first can own the USD drive, but both
+        # records must come back.
+        assert sum(1 for a in parsed.actuators if a.joint == "pan") == 2
+
+    def test_material_reflectance_survives(self, schema):
+        parsed = via_usd(schema)
+        materials = {
+            visual.material.name: visual.material
+            for link in parsed.links
+            for visual in link.visuals
+            if visual.material and visual.material.name
+        }
+        assert materials["body_mat"].extensions.get("reflectance") == 0.2
+
+    def test_contact_exclude_survives(self, schema):
+        parsed = via_usd(schema)
+        assert (parsed.collision_config is None) == (schema.collision_config is None)
+        if schema.collision_config:
+            assert [
+                (e.body1, e.body2) for e in parsed.collision_config.excludes
+            ] == [(e.body1, e.body2) for e in schema.collision_config.excludes]
+
+    def test_mjcf_to_usd_file_to_mjcf(self, schema, tmp_path):
+        usd_path = tmp_path / "rich.usda"
+        USDExporter().export(schema, usd_path)
+        assert mjcf_text(schema, tmp_path, "direct.xml") == mjcf_text(
+            USDParser().parse(usd_path), tmp_path, "via_file.xml"
+        )
+
+    def test_mjcf_to_usd_to_urdf_to_schema(self, schema, tmp_path):
+        # The full chain with a real URDF file in the middle. URDF cannot express a
+        # free joint's 6 DOF or MuJoCo's contact data, so this asserts structure
+        # rather than equality — what matters is that the chain completes and the
+        # kinematics survive.
+        urdf_path = tmp_path / "from_mjcf.urdf"
+        URDFExporter().export(via_usd(schema), urdf_path)
+        reparsed = URDFParser().parse(urdf_path)
+        assert {link.name for link in reparsed.links} >= {
+            "chassis",
+            "mast",
+            "head",
+        }
+        assert {joint.name for joint in reparsed.joints} >= {"lift", "pan"}
+
+
+# The golden fixture's actuator carries gear_ratio=100, which MJCFExporter rightly
+# warns about for a position actuator. It is asserted explicitly in
+# TestGoldenUsdaFixture and in test_usd_to_mjcf_to_schema_keeps_actuators; everywhere
+# else it is incidental to what is being tested.
+@pytest.mark.filterwarnings("ignore:Actuator .* has gear_ratio:UserWarning")
+class TestOriginUsd:
+    """USD as the *source* format, converted outward to the XML formats."""
+
+    @pytest.fixture
+    def schema(self) -> CommonSchema:
+        return USDParser().parse(FIXTURES / "two_link_arm.usda")
+
+    def test_usd_to_mjcf_and_back_through_usd(self, schema, tmp_path):
+        assert mjcf_text(schema, tmp_path, "direct.xml") == mjcf_text(
+            via_usd(schema), tmp_path, "via_usd.xml"
+        )
+
+    def test_usd_to_urdf_and_back_through_usd(self, schema, tmp_path):
+        assert urdf_text(schema, tmp_path, "direct.urdf") == urdf_text(
+            via_usd(schema), tmp_path, "via_usd.urdf"
+        )
+
+    def test_usd_to_urdf_to_schema_keeps_the_kinematics(self, schema, tmp_path):
+        path = tmp_path / "from_usd.urdf"
+        URDFExporter().export(schema, path)
+        reparsed = URDFParser().parse(path)
+        assert [link.name for link in reparsed.links] == [
+            link.name for link in schema.links
+        ]
+        assert [(j.name, j.type) for j in reparsed.joints] == [
+            (j.name, j.type) for j in schema.joints
+        ]
+        # URDF has no home_position, so it is genuinely lost here — while the USD
+        # path keeps it. That contrast is the point of having both.
+        assert reparsed.joints[0].home_position is None
+        assert via_usd(schema).joints[0].home_position == 0.25
+
+    def test_usd_to_mjcf_to_schema_keeps_actuators(self, schema, tmp_path):
+        path = tmp_path / "from_usd.xml"
+        with pytest.warns(UserWarning, match="gear_ratio"):
+            MJCFExporter().export(schema, path)
+        reparsed = parsed_mjcf(path)
+        assert [a.name for a in reparsed.actuators] == [
+            a.name for a in schema.actuators
+        ]
+
+    def test_usd_source_survives_a_full_triangle(self, schema, tmp_path):
+        # USD -> MJCF -> schema -> USD -> schema: back at the start format having
+        # been through both other converters.
+        mjcf_path = tmp_path / "leg1.xml"
+        MJCFExporter().export(schema, mjcf_path)
+        from_mjcf = parsed_mjcf(mjcf_path)
+        assert_schema_equal(from_mjcf, via_usd(from_mjcf))
+
+    def test_foreign_isaac_style_stage_converts_outward(self, tmp_path):
+        # A stage with no cyberwave: sidecars at all — the shape an Isaac Sim or
+        # Omniverse export has — must still convert to the XML formats.
+        foreign = """#usda 1.0
+(
+    defaultPrim = "Robot"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
+{
+    def Xform "base" (prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"])
+    {
+        float physics:mass = 3
+        float3 physics:diagonalInertia = (0.1, 0.1, 0.1)
+        def Cube "base_geom" (prepend apiSchemas = ["PhysicsCollisionAPI"])
+        {
+            double size = 0.2
+        }
+    }
+    def Xform "arm" (prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"])
+    {
+        float physics:mass = 1
+        float3 physics:diagonalInertia = (0.01, 0.01, 0.01)
+        matrix4d xformOp:transform = ( (1,0,0,0), (0,1,0,0), (0,0,1,0), (0,0,0.25,1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+        def Sphere "arm_geom"
+        {
+            double radius = 0.05
+        }
+    }
+    def PhysicsRevoluteJoint "shoulder" (prepend apiSchemas = ["PhysicsDriveAPI:angular"])
+    {
+        uniform token physics:axis = "Y"
+        rel physics:body0 = </Robot/base>
+        rel physics:body1 = </Robot/arm>
+        point3f physics:localPos0 = (0, 0, 0.25)
+        float physics:lowerLimit = -60
+        float physics:upperLimit = 60
+        float drive:angular:physics:stiffness = 50
+        float drive:angular:physics:damping = 3
+    }
+}
+"""
+        path = tmp_path / "isaac.usda"
+        path.write_text(foreign)
+        schema = USDParser().parse(path)
+
+        assert [link.name for link in schema.links] == ["base", "arm"]
+        assert schema.joints[0].type == JointType.REVOLUTE
+        # The drive became an actuator, so a MuJoCo export is actuated rather than
+        # inert — the reason drive inference exists at all.
+        assert schema.actuators and schema.actuators[0].joint == "shoulder"
+
+        urdf = urdf_text(schema, tmp_path, "isaac.urdf")
+        assert '<joint name="shoulder" type="revolute">' in urdf
+        mjcf = mjcf_text(schema, tmp_path, "isaac.xml")
+        assert "<mujoco" in mjcf
+        assert "shoulder" in mjcf
+
+        # And it survives its own USD round trip, sidecars now included.
+        assert_schema_equal(schema, via_usd(schema))
+
+    def test_usdz_source_converts_outward(self, schema, tmp_path):
+        package = tmp_path / "arm.usdz"
+        USDExporter().export(schema, package)
+        from_package = USDParser().parse(package)
+        assert mjcf_text(schema, tmp_path, "direct.xml") == mjcf_text(
+            from_package, tmp_path, "from_usdz.xml"
+        )
+
+
+class TestEveryOriginFormat:
+    """The same invariants asserted with each format taking the origin role."""
+
+    @staticmethod
+    def _origins(tmp_path: Path) -> dict[str, CommonSchema]:
+        rich = tmp_path / "rich.xml"
+        rich.write_text(MJCF_RICH_SOURCE)
+        return {
+            "urdf": parsed_urdf("piper_description.urdf"),
+            "mjcf": parsed_mjcf(rich),
+            "usd": USDParser().parse(FIXTURES / "two_link_arm.usda"),
+        }
+
+    @pytest.mark.parametrize("origin", ["urdf", "mjcf", "usd"])
+    def test_usd_hop_preserves_the_schema(self, origin, tmp_path):
+        schema = self._origins(tmp_path)[origin]
+        assert_schema_equal(schema, via_usd(schema))
+
+    @pytest.mark.parametrize("origin", ["urdf", "mjcf", "usd"])
+    def test_usd_hop_preserves_the_canonical_json(self, origin, tmp_path):
+        schema = self._origins(tmp_path)[origin]
+        assert export_universal_schema_json(schema) == export_universal_schema_json(
+            via_usd(schema)
+        )
+
+    @pytest.mark.parametrize("origin", ["urdf", "mjcf", "usd"])
+    @pytest.mark.parametrize("target", ["urdf", "mjcf"])
+    def test_usd_hop_is_invisible_to_every_target(self, origin, target, tmp_path):
+        schema = self._origins(tmp_path)[origin]
+        write = urdf_text if target == "urdf" else mjcf_text
+        suffix = "urdf" if target == "urdf" else "xml"
+        import warnings
+
+        with warnings.catch_warnings():
+            # The USD fixture's gear_ratio warning is asserted in its own test.
+            warnings.simplefilter("ignore", UserWarning)
+            direct = write(schema, tmp_path, f"direct.{suffix}")
+            hopped = write(via_usd(schema), tmp_path, f"hopped.{suffix}")
+        assert direct == hopped
+
+    @pytest.mark.parametrize("origin", ["urdf", "mjcf", "usd"])
+    def test_origin_survives_being_written_and_reloaded_as_usd(self, origin, tmp_path):
+        schema = self._origins(tmp_path)[origin]
+        path = tmp_path / f"{origin}.usda"
+        USDExporter().export(schema, path)
+        assert_schema_equal(schema, USDParser().parse(path))

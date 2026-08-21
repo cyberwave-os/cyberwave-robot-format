@@ -426,7 +426,7 @@ class MJCFParser(BaseParser):
                     if len(pos_values) == 3:
                         position = Vector3(pos_values[0], pos_values[1], pos_values[2])
 
-                        orientation = Quaternion(0, 0, 0, 1)
+                        orientation = Quaternion(0.0, 0.0, 0.0, 1.0)
                         if quat_str:
                             quat_values = [float(x) for x in quat_str.split()]
                             if len(quat_values) == 4:

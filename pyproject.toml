@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyberwave-robot-format"
-version = "0.1.5"
+version = "0.1.6"
 description = "Universal robot description schema and format converters for Cyberwave"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,8 @@ keywords = [
     "urdf",
     "mjcf",
     "sdf",
+    "usd",
+    "openusd",
     "robot-description",
     "format-conversion",
 ]
@@ -31,12 +33,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# OpenUSD Python bindings, required only by cyberwave_robot_format.usd. Kept
+# optional because usd-core publishes no linux-aarch64 wheel (conda-forge's
+# `openusd` is the way in there),
+# and because the rest of the package must stay installable without it.
+usd = ["usd-core>=24.0"]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.10.0",
     "black>=21.0.0",
     "isort>=5.0.0",
     "mypy>=0.800",
+    # Pulled into `dev` so CI actually exercises the USD tests rather than skipping
+    # them, but only where a wheel exists. usd-core ships **no sdist**, and its Linux
+    # wheels are x86_64-only, so an unguarded requirement makes `pip install -e
+    # ".[dev]"` fail outright on a linux/aarch64 runner. Where the marker excludes
+    # it, the USD tests skip via `pytest.importorskip("pxr")` and the rest of the
+    # suite still runs. The `usd` extra above is deliberately *not* marked: asking
+    # for it explicitly on an unsupported platform should fail loudly.
+    'usd-core>=24.0; sys_platform != "linux" or platform_machine == "x86_64"',
 ]
 
 [tool.setuptools]

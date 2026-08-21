@@ -48,7 +48,14 @@ from cyberwave_robot_format.mjcf import (
 )
 from cyberwave_robot_format.schema_export import export_universal_schema_json
 
-__version__ = "0.1.5"
+# Safe to import eagerly despite `usd-core` being an optional dependency: nothing
+# under `usd/` imports `pxr` at module scope — only calling export/parse does.
+from cyberwave_robot_format.usd import (
+    USDExporter,
+    USDParser,
+)
+
+__version__ = "0.1.6"
 __all__ = [
     "CommonSchema",
     "Link",
@@ -82,6 +89,8 @@ __all__ = [
     "URDFExporter",
     "MJCFParser",
     "MJCFExporter",
+    "USDParser",
+    "USDExporter",
     "export_mujoco_zip_cloud",
     "export_mujoco_scene_xml",
     "export_urdf_zip_cloud",

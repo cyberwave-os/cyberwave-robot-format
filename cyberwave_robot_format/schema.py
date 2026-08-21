@@ -62,6 +62,22 @@ class Vector3:
     y: float = 0.0
     z: float = 0.0
 
+    def __post_init__(self) -> None:
+        """Coerce components to ``float``.
+
+        The fields are declared ``float``, but ``Vector3(0, 0, 1)`` is a natural
+        thing to write and leaves ``int`` components behind. That is not harmless:
+        ``to_dict()`` passes the values through verbatim, so the same vector
+        serializes as ``"z": 1`` from a freshly parsed model and ``"z": 1.0`` after
+        any ``from_dict`` — which makes ``export_universal_schema_json`` non-
+        idempotent and changes any hash computed over it. Coercing here fixes every
+        construction site at once, including callers outside this package, and also
+        normalizes ``numpy`` scalars, which ``json.dumps`` cannot serialize at all.
+        """
+        self.x = float(self.x)
+        self.y = float(self.y)
+        self.z = float(self.z)
+
     def to_list(self) -> list[float]:
         """Convert to list format."""
         return [self.x, self.y, self.z]
@@ -84,6 +100,13 @@ class Quaternion:
     y: float = 0.0
     z: float = 0.0
     w: float = 1.0
+
+    def __post_init__(self) -> None:
+        """Coerce components to ``float`` — see :meth:`Vector3.__post_init__`."""
+        self.x = float(self.x)
+        self.y = float(self.y)
+        self.z = float(self.z)
+        self.w = float(self.w)
 
     def to_list(self) -> list[float]:
         """Convert to list format [x, y, z, w]."""
@@ -181,6 +204,12 @@ class Material:
     specular: list[float] | None = None
     emissive: list[float] | None = None
     shininess: float | None = None
+
+    # Format-specific extensions, matching every other component dataclass.
+    # MJCFParser writes `reflectance` here and MJCFExporter reads it back; without
+    # this field that write raised AttributeError, so any MJCF declaring a material
+    # with `reflectance` could not be parsed at all.
+    extensions: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -309,7 +338,7 @@ class Joint:
 
     # Kinematic properties
     pose: Pose = field(default_factory=Pose)
-    axis: Vector3 = field(default_factory=lambda: Vector3(0, 0, 1))
+    axis: Vector3 = field(default_factory=lambda: Vector3(0.0, 0.0, 1.0))
 
     # Constraints
     limits: JointLimits | None = None
@@ -751,7 +780,7 @@ class CommonSchema:
             >>> scene.merge_in(arm_schema, "arm1", spawn_pose=Pose(), fixed_base=True)
             >>> # Mobile wheeled robot
             >>> scene.merge_in(mobile_schema, "robot1",
-            ...                spawn_pose=Pose(position=Vector3(2, 0, 0)),
+            ...                spawn_pose=Pose(position=Vector3(2.0, 0.0, 0.0)),
             ...                fixed_base=False)
 
         Note:
