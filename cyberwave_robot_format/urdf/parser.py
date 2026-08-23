@@ -360,14 +360,23 @@ class URDFParser(BaseParser):
                 return None
 
         samples_total = 1.0
-        for axis, fov_key in (
-            ("horizontal", "fov_horizontal"),
-            ("vertical", "fov_vertical"),
+        for axis, fov_key, fov_rad_key in (
+            ("horizontal", "fov_horizontal", "hfov_rad"),
+            ("vertical", "fov_vertical", "vfov_rad"),
         ):
             min_angle = _f(f"scan/{axis}/min_angle")
             max_angle = _f(f"scan/{axis}/max_angle")
             if min_angle is not None and max_angle is not None:
-                sensor.parameters[fov_key] = math.degrees(abs(max_angle - min_angle))
+                sweep_rad = abs(max_angle - min_angle)
+                sensor.parameters[fov_key] = math.degrees(sweep_rad)
+                # Only a real sweep gets a canonical key. A degenerate axis
+                # (SDF's default <vertical> is samples=1, min_angle==max_angle)
+                # would otherwise plant a 0.0 that the write gate rejects as
+                # out of range and that fov_canonicalize cannot purge --
+                # canonical keys are excluded from LEGACY_FOV_KEYS, so the
+                # purge loop never reaches them.
+                if sweep_rad > 0:
+                    sensor.parameters[fov_rad_key] = sweep_rad
             samples = _f(f"scan/{axis}/samples")
             if samples is not None and samples > 0:
                 samples_total *= samples
@@ -431,7 +440,8 @@ class URDFParser(BaseParser):
             except ValueError:
                 hfov_rad = None
         if hfov_rad is not None:
-            # Gazebo-native name keeps its native unit (radians).
+            # Gazebo-native name keeps its native unit (radians); never hfov_rad,
+            # since this sensor is always type=camera and stores vertical only.
             sensor.parameters["hfov"] = hfov_rad
             sensor.parameters["fov_horizontal"] = math.degrees(hfov_rad)
 
@@ -462,6 +472,7 @@ class URDFParser(BaseParser):
             sensor.parameters["fov_vertical"] = math.degrees(fov_v_rad)
             # ``fovy`` is the vertical FOV in degrees — now genuinely vertical.
             sensor.parameters["fovy"] = math.degrees(fov_v_rad)
+            sensor.parameters["vfov_rad"] = fov_v_rad
 
         img_size = elem.find("imageSize")
         if img_size is not None and img_size.text:

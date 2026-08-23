@@ -9,6 +9,7 @@ which makes MuJoCo fail to compile the model rather than merely ignore it.
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -220,6 +221,55 @@ class TestMountSites:
         root = _export([{"name": "cam", "type": "camera", "parent_link": "base_link"}])
         base_body = next(b for b in root.iter("body") if b.get("name") == "base_link")
         assert [c.get("name") for c in base_body.findall("camera")] == ["cam"]
+
+    def test_vfov_rad_wins_over_a_disagreeing_legacy_fovy(self):
+        vfov_rad = math.radians(45.0)
+        root = _export(
+            [
+                {
+                    "name": "cam",
+                    "type": "camera",
+                    "parent_link": "base_link",
+                    "parameters": {"vfov_rad": vfov_rad, "fovy": 90.0},
+                }
+            ]
+        )
+        base_body = next(b for b in root.iter("body") if b.get("name") == "base_link")
+        cam = base_body.find("camera")
+        assert cam is not None
+        assert float(cam.get("fovy")) == pytest.approx(45.0, abs=1e-6)
+
+    def test_legacy_fovy_used_when_vfov_rad_is_absent(self):
+        root = _export(
+            [
+                {
+                    "name": "cam",
+                    "type": "camera",
+                    "parent_link": "base_link",
+                    "parameters": {"fovy": 60.0},
+                }
+            ]
+        )
+        base_body = next(b for b in root.iter("body") if b.get("name") == "base_link")
+        cam = base_body.find("camera")
+        assert cam is not None
+        assert float(cam.get("fovy")) == pytest.approx(60.0, abs=1e-6)
+
+    def test_legacy_fovy_used_when_vfov_rad_is_invalid(self):
+        root = _export(
+            [
+                {
+                    "name": "cam",
+                    "type": "camera",
+                    "parent_link": "base_link",
+                    "parameters": {"vfov_rad": 0, "fovy": 70.0},
+                }
+            ]
+        )
+        base_body = next(b for b in root.iter("body") if b.get("name") == "base_link")
+        cam = base_body.find("camera")
+        assert cam is not None
+        assert float(cam.get("fovy")) == pytest.approx(70.0, abs=1e-6)
 
     def test_sensor_on_an_unknown_link_is_dropped_not_dangling(self):
         """An unmatched ``parent_link`` must cost that sensor, not the whole model.

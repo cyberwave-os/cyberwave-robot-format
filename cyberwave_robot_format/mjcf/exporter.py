@@ -705,9 +705,18 @@ class MJCFExporter(BaseExporter):
                     cam.set("quat", f"{quat.w} {quat.x} {quat.y} {quat.z}")
 
         params = sensor.parameters or {}
-        if "hfov" in params or "fovy" in params or "fov_degrees" in params:
+        vfov_rad = params.get("vfov_rad")
+        has_valid_vfov_rad = (
+            isinstance(vfov_rad, int | float)
+            and not isinstance(vfov_rad, bool)
+            and vfov_rad > 0
+        )
+        # vfov_rad is canonical; fovy is a legacy fallback.
+        if has_valid_vfov_rad:
+            fovy_deg = math.degrees(float(vfov_rad))
+            cam.set("fovy", str(fovy_deg))
+        elif "hfov" in params or "fovy" in params or "fov_degrees" in params:
             if "fovy" in params:
-                # Explicit fovy supplied — use as-is (assumed degrees)
                 fovy_deg = float(params["fovy"])
             elif "fov_degrees" in params:
                 fovy_deg = float(params["fov_degrees"])

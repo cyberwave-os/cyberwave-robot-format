@@ -1,6 +1,7 @@
 """Tests for URDF parser."""
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -489,10 +490,66 @@ def test_gazebo_ray_3d_multiplies_samples_across_both_axes(sensors_by_name):
     assert params["points_per_second"] == 360 * 16 * 10
 
 
+def test_gazebo_ray_emits_hfov_rad_alongside_the_degree_field(sensors_by_name):
+    params = sensors_by_name["planar_scanner"].parameters
+    assert params["hfov_rad"] == pytest.approx(2.35619449615 * 2)
+    assert params["hfov_rad"] == pytest.approx(math.radians(params["fov_horizontal"]))
+
+
+def test_gazebo_ray_3d_emits_both_hfov_rad_and_vfov_rad(sensors_by_name):
+    params = sensors_by_name["dome_scanner"].parameters
+    assert params["hfov_rad"] == pytest.approx(3.14159265 * 2)
+    assert params["vfov_rad"] == pytest.approx(0.261799 * 2)
+    assert params["hfov_rad"] == pytest.approx(math.radians(params["fov_horizontal"]))
+    assert params["vfov_rad"] == pytest.approx(
+        math.radians(params["fov_vertical"]), abs=1e-6
+    )
+
+
 def test_gazebo_ray_noise_is_not_emitted(sensors_by_name):
     """``Sensor.noise`` has no cattrs structure hook, so populating it would make
     ``CommonSchema.from_dict`` raise and silently degrade the twin."""
     assert sensors_by_name["planar_scanner"].noise is None
+
+
+_DEGENERATE_VERTICAL_URDF = """<?xml version="1.0"?>
+<robot name="degenerate_bot">
+  <link name="base_link" />
+  <link name="scan_link" />
+  <gazebo reference="scan_link">
+    <sensor name="flat_dome_scanner" type="ray">
+      <update_rate>10.0</update_rate>
+      <ray>
+        <scan>
+          <horizontal><samples>360</samples><min_angle>-3.14159265</min_angle><max_angle>3.14159265</max_angle></horizontal>
+          <vertical><samples>1</samples><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+        </scan>
+        <range><min>0.1</min><max>100.0</max></range>
+      </ray>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+def test_a_degenerate_vertical_block_does_not_plant_a_zero_vfov_rad(tmp_path):
+    # Regression: SDF's own default <vertical> (samples=1, min_angle==max_angle)
+    # sweeps 0 rad. The old code wrote vfov_rad unconditionally, planting a
+    # canonical key the write gate rejects as out of range and that
+    # fov_canonicalize cannot purge -- canonical keys are excluded from
+    # LEGACY_FOV_KEYS by construction, so the purge loop never reaches them.
+    # The type resolver keys off presence of <vertical>, not extent, so this
+    # sensor is still labeled lidar_3d and vertical is still a stored axis.
+    path = tmp_path / "degenerate_bot.urdf"
+    path.write_text(_DEGENERATE_VERTICAL_URDF)
+    schema = URDFParser().parse(path)
+    sensor = next(s for s in schema.sensors if s.name == "flat_dome_scanner")
+
+    assert sensor.type == "lidar_3d"
+    assert sensor.parameters["fov_vertical"] == pytest.approx(0.0)
+    assert "vfov_rad" not in sensor.parameters
+    # The horizontal sweep is real and must still get its canonical key.
+    assert sensor.parameters["hfov_rad"] == pytest.approx(3.14159265 * 2)
 
 
 def test_gazebo_camera_hfov_is_converted_to_degrees_not_copied_to_fovy(
@@ -514,6 +571,18 @@ def test_gazebo_camera_hfov_is_converted_to_degrees_not_copied_to_fovy(
     assert params["fovy"] == pytest.approx(58.715, abs=1e-2)
     # the old bug: fovy must never be the raw radian horizontal value
     assert params["fovy"] != pytest.approx(1.5707963267948966)
+
+
+def test_gazebo_camera_emits_vfov_rad_but_never_hfov_rad(sensors_by_name):
+    """A camera's FOV policy stores vertical only, so hfov_rad on a camera
+    fails schema validation even though the Gazebo-native ``hfov`` value is
+    legitimately radians."""
+    params = sensors_by_name["front_cam"].parameters
+    assert "hfov_rad" not in params
+    assert params["hfov"] == pytest.approx(1.5707963267948966)
+    assert params["vfov_rad"] == pytest.approx(math.radians(58.715), abs=1e-4)
+    assert params["vfov_rad"] == pytest.approx(math.radians(params["fovy"]), abs=1e-9)
+    assert params["vfov_rad"] != pytest.approx(1.5707963267948966)
 
 
 def test_gazebo_camera_resolution_is_extracted(sensors_by_name):
