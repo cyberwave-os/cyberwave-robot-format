@@ -5,7 +5,17 @@ from pathlib import Path
 import pytest
 
 from cyberwave_robot_format.mjcf import MJCFParser, MJCFExporter
-from cyberwave_robot_format.schema import ActuatorType
+from cyberwave_robot_format.schema import (
+    ActuatorType,
+    CommonSchema,
+    Geometry,
+    GeometryType,
+    Link,
+    Material,
+    Metadata,
+    Pose,
+    Visual,
+)
 
 
 @pytest.fixture
@@ -142,6 +152,76 @@ def test_mjcf_roundtrip(simple_mjcf_path, tmp_path):
     assert schema2.metadata.name == schema.metadata.name
     assert len(schema2.links) == len(schema.links)
     assert len(schema2.joints) == len(schema.joints)
+
+
+def test_mjcf_roundtrip_preserves_bare_geom_rgba(tmp_path):
+    """A geom coloured with a bare `rgba` keeps its colour through the schema.
+
+    The parser turns a bare `rgba` into a *nameless* Material. Only named
+    materials reach the `<asset>` block, so the exporter has to put the colour
+    back on the geom instead of dropping it.
+    """
+    source = tmp_path / "colours.xml"
+    source.write_text(
+        """<mujoco model="colours">
+          <asset>
+            <material name="named_red" rgba="1 0 0 1"/>
+          </asset>
+          <worldbody>
+            <body name="base">
+              <geom type="box" size="0.1 0.1 0.1" material="named_red"/>
+              <geom type="sphere" size="0.05" rgba="0 0.4 0.9 1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+    )
+
+    parser = MJCFParser()
+    schema = parser.parse(source)
+
+    # Survives the universal-schema JSON round trip.
+    schema = CommonSchema.from_dict(schema.to_dict())
+
+    output_path = tmp_path / "roundtrip.xml"
+    MJCFExporter().export(schema, output_path)
+
+    base = next(l for l in parser.parse(output_path).links if l.name == "base")
+    colours = [v.material.color for v in base.visuals if v.material]
+    assert [1.0, 0.0, 0.0, 1.0] in colours
+    assert [0.0, 0.4, 0.9, 1.0] in colours
+
+
+def test_mjcf_export_pads_a_colour_that_carries_no_alpha(tmp_path):
+    """A three-component colour still exports as a compilable `rgba`.
+
+    `USDParser` yields an RGB-only colour when a UsdPreviewSurface has no
+    `opacity` input, and MuJoCo refuses to compile a model whose `rgba` is short
+    of four reals. Alpha defaults to opaque rather than emitting a broken model.
+    """
+    schema = CommonSchema(metadata=Metadata(name="short_colour"))
+    link = Link(name="base")
+    link.visuals.append(
+        Visual(
+            name="v0",
+            geometry=Geometry(type=GeometryType.SPHERE, radius=0.05),
+            material=Material(color=[0.2, 0.4, 0.6]),
+            pose=Pose(),
+        )
+    )
+    schema.links.append(link)
+
+    output_path = tmp_path / "short_colour.xml"
+    MJCFExporter().export(schema, output_path)
+
+    import xml.etree.ElementTree as ET
+
+    geom = ET.parse(output_path).getroot().find(".//worldbody//geom[@rgba]")
+    assert geom is not None
+    assert len(geom.get("rgba").split()) == 4
+
+    base = next(l for l in MJCFParser().parse(output_path).links if l.name == "base")
+    assert base.visuals[0].material.color == [0.2, 0.4, 0.6, 1.0]
 
 
 def test_mjcf_exporter_basic(simple_mjcf_path, tmp_path):

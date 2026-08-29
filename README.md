@@ -132,6 +132,17 @@ still need a finite `ctrlrange`, the actuator on a continuous joint is given a
 finite band centered on the home pose (`home ± π`) instead, so the joint stays
 truly unlimited while the servo remains usable. Since v0.1.4.
 
+**Materials** are emitted two ways, mirroring how `MJCFParser` reads them. A
+material with a `name` is defined once under `<asset>` and referenced by every
+geom using it; a nameless one — which is what a geom carrying a bare `rgba`
+attribute parses into — cannot be shared, so its colour is written back onto the
+geom's own `rgba`. Either way the colour survives a MJCF → schema → MJCF round
+trip. A colour carrying no alpha (which is what a `UsdPreviewSurface` without an
+`opacity` input yields) is exported as opaque, since MuJoCo will not compile a
+model whose `rgba` is short of four values. Note that a geom `rgba` carries only
+the colour: an *unnamed* material's texture and specular cannot be expressed,
+as MuJoCo has no inline material.
+
 ### Parse and export USD (OpenUSD)
 
 Requires the `usd` extra (see [Installation](#installation)). Reads and writes

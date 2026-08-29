@@ -154,6 +154,23 @@ def _needs_site(sensor_type: str | None) -> bool:
     return any(tag in _SITE_ATTACHED_TAGS for tag in tags)
 
 
+def _rgba_attribute(color: list[float]) -> str | None:
+    """Format a schema colour as MuJoCo's ``rgba``, which is strictly four reals.
+
+    A schema colour is not guaranteed to carry alpha: ``USDParser`` builds a
+    three-component colour whenever a ``UsdPreviewSurface`` omits its ``opacity``
+    input. MuJoCo rejects a short ``rgba`` outright ("attribute 'rgba' does not
+    have enough data") and refuses to compile the model, so a missing alpha
+    defaults to opaque instead. Returns ``None`` for a colour too short to be one.
+    """
+    if len(color) < 3:
+        return None
+    rgba = list(color[:4])
+    if len(rgba) == 3:
+        rgba.append(1.0)
+    return " ".join(str(c) for c in rgba)
+
+
 def _is_passive_joint(joint: Joint) -> bool:
     """True when the schema explicitly marks a joint as undriven.
 
@@ -441,8 +458,9 @@ class MJCFExporter(BaseExporter):
         mat_elem = ET.SubElement(asset, "material", name=material.name)
 
         if material.color:
-            rgba_str = " ".join(str(c) for c in material.color[:4])
-            mat_elem.set("rgba", rgba_str)
+            rgba_str = _rgba_attribute(material.color)
+            if rgba_str:
+                mat_elem.set("rgba", rgba_str)
 
         if hasattr(material, "specular") and material.specular:
             mat_elem.set("specular", str(material.specular))
@@ -998,6 +1016,15 @@ class MJCFExporter(BaseExporter):
 
         if material and material.name:
             geom.set("material", material.name)
+        elif material and material.color:
+            # Anonymous material: no <asset><material> is emitted for it, so the
+            # colour has to ride on the geom itself. This is the inverse of the
+            # parser reading a bare `rgba` geom attribute into a nameless Material.
+            # Only the colour survives here — a geom `rgba` cannot carry a texture
+            # or specular, which MuJoCo can express only through a named material.
+            rgba_str = _rgba_attribute(material.color)
+            if rgba_str:
+                geom.set("rgba", rgba_str)
 
         # Apply collision filter if this is a collision geom
         if collision:
