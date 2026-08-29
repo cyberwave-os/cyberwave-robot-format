@@ -23,7 +23,10 @@ from pathlib import Path
 from xml.dom import minidom
 
 from cyberwave_robot_format.core import BaseExporter
-from cyberwave_robot_format.mesh import convert_dae_to_obj
+from cyberwave_robot_format.mesh import (
+    convert_dae_to_obj,
+    converted_mesh_texture,
+)
 from cyberwave_robot_format.mjcf.utils import sanitize_inertia
 from cyberwave_robot_format.schema import (
     Actuator,
@@ -483,6 +486,10 @@ class MJCFExporter(BaseExporter):
     ) -> dict[tuple[str, tuple[float, float, float]], str]:
         """Collect mesh geometries and add mesh assets."""
         mesh_lookup: dict[tuple[str, tuple[float, float, float]], str] = {}
+        # mesh name -> the material carrying that mesh's own texture, for the
+        # geoms that have no material of their own to override it with.
+        mesh_materials: dict[str, str] = {}
+        self._mesh_materials = mesh_materials
         used_names: dict[str, int] = {}
 
         def register_mesh(filename: str, scale: Vector3 | None) -> None:
@@ -498,11 +505,17 @@ class MJCFExporter(BaseExporter):
             original_filename = filename
             actual_filename = filename
 
+            texture_file: str | None = None
             if filename.lower().endswith(".dae"):
                 try:
                     actual_filename = convert_dae_to_obj(
                         filename, scale if scale else None
                     )
+                    # The converter writes the mesh's base-colour map beside the
+                    # OBJ, and MuJoCo does not read the `.mtl` that references
+                    # it — so without declaring it here the mesh renders in the
+                    # default grey while its texture sits unused on disk.
+                    texture_file = converted_mesh_texture(actual_filename)
                 except Exception as e:
                     logger.warning("Failed to convert DAE mesh %s: %s", filename, e)
 
@@ -515,6 +528,23 @@ class MJCFExporter(BaseExporter):
             used_names[base_name] = count + 1
 
             mesh_lookup[lookup_key] = mesh_name
+            if texture_file:
+                # One texture and one material per mesh: the geom references the
+                # material, which is the only way MuJoCo can carry an image.
+                ET.SubElement(
+                    asset,
+                    "texture",
+                    name=f"{mesh_name}_tex",
+                    type="2d",
+                    file=texture_file,
+                )
+                ET.SubElement(
+                    asset,
+                    "material",
+                    name=f"{mesh_name}_mat",
+                    texture=f"{mesh_name}_tex",
+                )
+                mesh_materials[mesh_name] = f"{mesh_name}_mat"
 
             mesh_scale = "1 1 1"
             if actual_filename != original_filename:
@@ -1014,8 +1044,28 @@ class MJCFExporter(BaseExporter):
                 f"Unsupported geometry type for MJCF export: {geometry.type}"
             )
 
+        mesh_material = None
+        # Visual geoms only: a collision hull wearing the visual's texture is
+        # indistinguishable from the visual when collision display is on, which
+        # is exactly when you need to tell them apart.
+        if geometry.type == GeometryType.MESH and collision is None:
+            mesh_name = mesh_name_map.get(
+                (
+                    geometry.filename,
+                    (geometry.scale.x, geometry.scale.y, geometry.scale.z)
+                    if geometry.scale
+                    else (1.0, 1.0, 1.0),
+                )
+            )
+            mesh_material = getattr(self, "_mesh_materials", {}).get(mesh_name)
+
         if material and material.name:
             geom.set("material", material.name)
+        elif mesh_material:
+            # The mesh brought its own texture and the schema names no material
+            # to override it with — which is the common case for a DAE, where
+            # the appearance lives in the file rather than in the URDF.
+            geom.set("material", mesh_material)
         elif material and material.color:
             # Anonymous material: no <asset><material> is emitted for it, so the
             # colour has to ride on the geom itself. This is the inverse of the

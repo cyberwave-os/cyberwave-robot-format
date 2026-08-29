@@ -1,5 +1,6 @@
 from cyberwave_robot_format.mesh.processing import (
     convert_dae_to_obj,
+    converted_mesh_texture,
     convert_mesh_bytes_to_obj,
     get_mesh_lookup_key,
 )
@@ -7,6 +8,7 @@ from cyberwave_robot_format.mesh.resolution import resolve_mesh_uri
 
 __all__ = [
     "convert_dae_to_obj",
+    "converted_mesh_texture",
     "convert_mesh_bytes_to_obj",
     "get_mesh_lookup_key",
     "resolve_mesh_uri",

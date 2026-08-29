@@ -52,10 +52,17 @@ def convert_dae_to_obj(
     scale_tuple = (scale.x, scale.y, scale.z) if scale else (1.0, 1.0, 1.0)
     scale_str = f"{scale_tuple[0]}_{scale_tuple[1]}_{scale_tuple[2]}"
     h = hashlib.sha256(f"{dae_path}_{scale_str}".encode()).hexdigest()
-    new_filename = output_dir / f"{Path(dae_path).stem}_{h}.obj"
+    # One directory per conversion. trimesh names an OBJ's sidecars after the
+    # material rather than the mesh -- `material.mtl`, `material_0.png` -- so a
+    # shared output directory has every textured mesh overwriting the previous
+    # one's image, and each then renders with whichever happened to be written
+    # last. The hashed name only ever protected the .obj itself.
+    mesh_dir = output_dir / f"{Path(dae_path).stem}_{h}"
+    new_filename = mesh_dir / f"{Path(dae_path).stem}.obj"
 
     if new_filename.exists():
         return str(new_filename)
+    mesh_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
         "Converting DAE to OBJ: %s -> %s (scale=%s).",
@@ -85,6 +92,32 @@ def convert_dae_to_obj(
 
     geom.export(str(new_filename))
     return str(new_filename)
+
+
+def converted_mesh_texture(obj_path: str) -> str | None:
+    """The texture image `convert_dae_to_obj` wrote beside `obj_path`, if any.
+
+    trimesh writes the mesh's base-colour map out as a sibling PNG when it
+    exports an OBJ, along with an `.mtl` referencing it. MuJoCo does not read
+    `.mtl`, so the image sits there unused unless the MJCF declares it — which
+    is what the exporter uses this to do. Returns an *absolute* path: the MJCF
+    is written somewhere else entirely and MuJoCo resolves a relative asset
+    against `texturedir`/the model file, not against the mesh. Any consumer that
+    ships the MJCF off this host has to repackage the image itself.
+    """
+    mesh_dir = Path(obj_path).parent
+    # Safe to read the whole directory because `convert_dae_to_obj` gives each
+    # conversion its own; the sidecar names are trimesh's, not the mesh's.
+    for mtl in sorted(mesh_dir.glob("*.mtl")):
+        for line in mtl.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip().lower().startswith("map_kd"):
+                continue
+            resolved = mesh_dir / line.split(None, 1)[1].strip()
+            if resolved.exists():
+                return str(resolved)
+    for candidate in sorted(mesh_dir.glob("*.png")):
+        return str(candidate)
+    return None
 
 
 def convert_mesh_bytes_to_obj(
@@ -171,4 +204,9 @@ def get_mesh_lookup_key(
     return (filename, scale_tuple)
 
 
-__all__ = ["convert_dae_to_obj", "convert_mesh_bytes_to_obj", "get_mesh_lookup_key"]
+__all__ = [
+    "convert_dae_to_obj",
+    "convert_mesh_bytes_to_obj",
+    "converted_mesh_texture",
+    "get_mesh_lookup_key",
+]
