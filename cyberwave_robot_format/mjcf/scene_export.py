@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 # This allows in-memory conversion: resolve "foo.dae" -> ("foo.obj", obj_bytes)
 MeshResolver = Callable[[str], tuple[str, bytes] | None]
 
+# Scenes are mesh binaries built per request, so the write is on a latency path
+# and the bytes are not: level 1 writes 2-5x faster than zlib's default 6 for
+# 7-24% more size. Archiving callers can pass a higher level.
+DEFAULT_ZIP_COMPRESSLEVEL = 1
+
 
 def _fallback_missing_mesh_references(
     root: ET.Element,
@@ -71,6 +76,7 @@ def export_mujoco_zip_cloud(
     mesh_resolver: MeshResolver,
     output_path: str | Path | None = None,
     strict_missing_meshes: bool = False,
+    compresslevel: int = DEFAULT_ZIP_COMPRESSLEVEL,
 ) -> bytes:
     """Export a CommonSchema to a complete MuJoCo ZIP file (cloud-native).
 
@@ -95,6 +101,8 @@ def export_mujoco_zip_cloud(
         output_path: Optional path to write the ZIP file. If None, returns bytes only.
         strict_missing_meshes: If True, raise FileNotFoundError for any missing meshes.
                               If False (default), log warnings and continue.
+        compresslevel: Deflate level 0-9. Defaults to DEFAULT_ZIP_COMPRESSLEVEL,
+                      which favours write speed over size.
 
     Returns:
         ZIP file contents as bytes
@@ -238,7 +246,9 @@ def export_mujoco_zip_cloud(
 
         # Create ZIP file
         zip_path = temp_path / "scene.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(
+            zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=compresslevel
+        ) as zf:
             # Add scene XML
             zf.write(mjcf_path, "mujoco_scene.xml")
 

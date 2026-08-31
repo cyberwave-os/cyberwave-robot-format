@@ -6,11 +6,13 @@
 from cyberwave_robot_format.mjcf.exporter import MJCFExporter
 from cyberwave_robot_format.mjcf.parser import MJCFParser
 from cyberwave_robot_format.mjcf.scene_export import (
+    DEFAULT_ZIP_COMPRESSLEVEL,
     export_mujoco_scene_xml,
     export_mujoco_zip_cloud,
 )
 
 __all__ = [
+    "DEFAULT_ZIP_COMPRESSLEVEL",
     "MJCFParser",
     "MJCFExporter",
     "export_mujoco_zip_cloud",

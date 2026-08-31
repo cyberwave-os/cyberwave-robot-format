@@ -328,11 +328,19 @@ def s3_resolver(filename: str) -> tuple[str, bytes] | None:
 mujoco_zip = export_mujoco_zip_cloud(
     schema,
     s3_resolver,
-    strict_missing_meshes=True  # Fail fast on missing meshes
+    strict_missing_meshes=True,  # Fail fast on missing meshes
+    compresslevel=1,             # Default: favours write speed over size
 )
 
-urdf_zip = export_urdf_zip_cloud(schema, s3_resolver)
+urdf_zip = export_urdf_zip_cloud(schema, s3_resolver)  # always deflate level 6
 ```
+
+MuJoCo scene ZIPs are written at deflate level 1 by default, which is 2-5x
+faster than zlib's default for 7-24% more bytes — the right trade when a scene is
+built per request and streamed to a simulator. Pass a higher `compresslevel` to
+`export_mujoco_zip_cloud` when you are archiving the ZIP and the size matters
+more than the write. `export_urdf_zip_cloud` takes no such argument and always
+writes at zlib's default.
 
 ## Development
 

@@ -55,7 +55,7 @@ from cyberwave_robot_format.usd import (
     USDParser,
 )
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 __all__ = [
     "CommonSchema",
     "Link",
