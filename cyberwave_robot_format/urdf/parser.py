@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from cyberwave_robot_format.core import BaseParser, ParseContext, ParseError
+from cyberwave_robot_format.fov_convention import find_fov_value, normalize_fov_key
 from cyberwave_robot_format.mesh import resolve_mesh_uri
 from cyberwave_robot_format.schema import (
     Collision,
@@ -418,32 +419,78 @@ class URDFParser(BaseParser):
 
         sensors.append(sensor)
 
+    # Vertical spellings first: a direct declaration outranks one that has
+    # to be derived via an aspect-ratio assumption.
+    _CAMERA_FOV_ELEMENT_NAMES: tuple[str, ...] = (
+        "vfov",
+        "fovy",
+        "fov_vertical",
+        "vertical_fov",
+        "vertical_fov_degrees",
+        "fov_degrees",
+        "hfov",
+        "horizontal_fov",
+        "fov_horizontal",
+        "horizontal_fov_degrees",
+    )
+
+    def _find_declared_camera_fov(self, elem: ET.Element) -> tuple[str, float] | None:
+        """Resolve the highest-priority recognized FOV element to a
+        canonical ``(key, radians)`` pair, or ``None`` if none is present.
+        Logs a warning instead of silently picking one whenever more than
+        one recognized element disagrees or spans both axes."""
+        extracted: dict[str, float] = {}
+        for tag in self._CAMERA_FOV_ELEMENT_NAMES:
+            node = elem.find(tag)
+            if node is None or not node.text:
+                continue
+            try:
+                raw_value = float(node.text)
+            except ValueError:
+                continue
+            if not math.isfinite(raw_value):
+                continue
+            extracted[tag] = raw_value
+
+        if not extracted:
+            return None
+
+        resolved_by_canonical: dict[str, list[tuple[str, float]]] = {}
+        for tag, raw_value in extracted.items():
+            resolved = normalize_fov_key(tag, raw_value)
+            if resolved is None:
+                continue
+            canonical_key, radians = resolved
+            resolved_by_canonical.setdefault(canonical_key, []).append((tag, radians))
+
+        if len(resolved_by_canonical) > 1:
+            logger.warning(
+                "Camera %r declares FOV on more than one axis (%s); the "
+                "highest-priority value is used, the rest are discarded.",
+                elem,
+                resolved_by_canonical,
+            )
+        for canonical_key, entries in resolved_by_canonical.items():
+            distinct_values = {round(radians, 9) for _, radians in entries}
+            if len(distinct_values) > 1:
+                logger.warning(
+                    "Camera %r declares conflicting values for %s: %s",
+                    elem,
+                    canonical_key,
+                    entries,
+                )
+
+        return find_fov_value(extracted, self._CAMERA_FOV_ELEMENT_NAMES)
+
     def _extract_camera_properties(self, elem: ET.Element, sensor: Sensor) -> None:
         """Extract camera properties like fov, image size from element.
 
-        Gazebo's ``<hfov>`` is a *horizontal* field of view in *radians*. It is
-        emitted as ``fov_horizontal`` in degrees, and the vertical ``fov_vertical``
-        is derived from it once the image aspect ratio is known.
-
-        It is deliberately NOT written to ``fovy``: consumers treat ``fovy`` as a
-        vertical FOV in degrees, so copying a radian horizontal value there
-        (as this did previously) imported a stock ``<hfov>1.204</hfov>`` camera as
-        a 1.2-degree vertical pinhole — wrong on both axis and unit, and silently
-        so. ``hfov`` is still published in radians under its own Gazebo-native
-        name for anything that wants the raw value.
+        FOV is resolved through ``fov_convention`` regardless of spelling or
+        axis. A declared horizontal value derives vertical via the image
+        aspect ratio; a declared vertical value is stored directly. Only
+        ``vfov_rad`` is ever written — a camera never stores horizontal.
         """
-        hfov_rad: float | None = None
-        hfov = elem.find("hfov")
-        if hfov is not None and hfov.text:
-            try:
-                hfov_rad = float(hfov.text)
-            except ValueError:
-                hfov_rad = None
-        if hfov_rad is not None:
-            # Gazebo-native name keeps its native unit (radians); never hfov_rad,
-            # since this sensor is always type=camera and stores vertical only.
-            sensor.parameters["hfov"] = hfov_rad
-            sensor.parameters["fov_horizontal"] = math.degrees(hfov_rad)
+        declared = self._find_declared_camera_fov(elem)
 
         image = elem.find("image")
         if image is not None:
@@ -455,24 +502,23 @@ class URDFParser(BaseParser):
             if height is not None and height.text:
                 sensor.parameters["height"] = int(height.text)
 
-        # Vertical FOV follows from the horizontal FOV and the image aspect ratio
-        # for a rectilinear pinhole: tan(v/2) = tan(h/2) * height / width.
-        width_px = sensor.parameters.get("width")
-        height_px = sensor.parameters.get("height")
-        if (
-            hfov_rad is not None
-            and isinstance(width_px, int)
-            and isinstance(height_px, int)
-            and width_px > 0
-            and height_px > 0
-        ):
-            fov_v_rad = 2.0 * math.atan(
-                math.tan(hfov_rad / 2.0) * (height_px / width_px)
-            )
-            sensor.parameters["fov_vertical"] = math.degrees(fov_v_rad)
-            # ``fovy`` is the vertical FOV in degrees — now genuinely vertical.
-            sensor.parameters["fovy"] = math.degrees(fov_v_rad)
-            sensor.parameters["vfov_rad"] = fov_v_rad
+        if declared is not None:
+            canonical_key, value_rad = declared
+            if canonical_key == "vfov_rad":
+                sensor.parameters["vfov_rad"] = value_rad
+            elif canonical_key == "hfov_rad":
+                width_px = sensor.parameters.get("width")
+                height_px = sensor.parameters.get("height")
+                if (
+                    isinstance(width_px, int)
+                    and isinstance(height_px, int)
+                    and width_px > 0
+                    and height_px > 0
+                ):
+                    fov_v_rad = 2.0 * math.atan(
+                        math.tan(value_rad / 2.0) * (height_px / width_px)
+                    )
+                    sensor.parameters["vfov_rad"] = fov_v_rad
 
         img_size = elem.find("imageSize")
         if img_size is not None and img_size.text:

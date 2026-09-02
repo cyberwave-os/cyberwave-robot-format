@@ -552,37 +552,179 @@ def test_a_degenerate_vertical_block_does_not_plant_a_zero_vfov_rad(tmp_path):
     assert sensor.parameters["hfov_rad"] == pytest.approx(3.14159265 * 2)
 
 
-def test_gazebo_camera_hfov_is_converted_to_degrees_not_copied_to_fovy(
+def test_gazebo_camera_hfov_derives_a_genuine_vertical_fov_not_a_copied_radian(
     sensors_by_name,
 ):
-    """Regression: <hfov> is horizontal and in radians.
-
-    It used to be copied verbatim into ``fovy``, which consumers read as a
-    vertical FOV in degrees — importing a 90-degree camera as a 1.57-degree
-    pinhole.
-    """
+    """Regression: <hfov> is horizontal radians; it used to be copied
+    verbatim into ``fovy`` as if already vertical degrees. Pinned against
+    the canonical ``vfov_rad`` now, the only key this stores."""
     params = sensors_by_name["front_cam"].parameters
-    # native Gazebo name keeps radians
-    assert params["hfov"] == pytest.approx(1.5707963267948966)
-    # horizontal, in degrees
-    assert params["fov_horizontal"] == pytest.approx(90.0)
     # vertical derived from the 1280x720 aspect: 2*atan(tan(45deg) * 720/1280)
-    assert params["fov_vertical"] == pytest.approx(58.715, abs=1e-2)
-    assert params["fovy"] == pytest.approx(58.715, abs=1e-2)
-    # the old bug: fovy must never be the raw radian horizontal value
-    assert params["fovy"] != pytest.approx(1.5707963267948966)
+    assert params["vfov_rad"] == pytest.approx(math.radians(58.715), abs=1e-3)
+    assert params["vfov_rad"] != pytest.approx(1.5707963267948966)
 
 
-def test_gazebo_camera_emits_vfov_rad_but_never_hfov_rad(sensors_by_name):
-    """A camera's FOV policy stores vertical only, so hfov_rad on a camera
-    fails schema validation even though the Gazebo-native ``hfov`` value is
-    legitimately radians."""
+def test_gazebo_camera_emits_only_vfov_rad_no_legacy_keys(sensors_by_name):
+    """A camera stores vertical only: no ``hfov_rad``, and none of the
+    legacy spellings either — all derivation intermediates now, never
+    stored."""
     params = sensors_by_name["front_cam"].parameters
     assert "hfov_rad" not in params
-    assert params["hfov"] == pytest.approx(1.5707963267948966)
+    assert "hfov" not in params
+    assert "fov_horizontal" not in params
+    assert "fov_vertical" not in params
+    assert "fovy" not in params
     assert params["vfov_rad"] == pytest.approx(math.radians(58.715), abs=1e-4)
-    assert params["vfov_rad"] == pytest.approx(math.radians(params["fovy"]), abs=1e-9)
-    assert params["vfov_rad"] != pytest.approx(1.5707963267948966)
+
+
+_HORIZONTAL_FOV_CAMERA_URDF = """<?xml version="1.0"?>
+<robot name="official_tag_bot">
+  <link name="base_link" />
+  <link name="cam_link" />
+  <gazebo reference="cam_link">
+    <sensor name="official_cam" type="camera">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <horizontal_fov>1.5707963267948966</horizontal_fov>
+        <image><width>1280</width><height>720</height></image>
+      </camera>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+def test_gazebo_camera_recognizes_the_official_horizontal_fov_tag(tmp_path):
+    """Only Gazebo's shorthand <hfov> was ever recognized; a file using
+    SDF's own official <horizontal_fov> element silently produced no FOV
+    at all. Both spellings must derive the same vertical FOV."""
+    path = tmp_path / "official_tag_bot.urdf"
+    path.write_text(_HORIZONTAL_FOV_CAMERA_URDF)
+    schema = URDFParser().parse(path)
+    sensor = next(s for s in schema.sensors if s.name == "official_cam")
+
+    assert sensor.parameters["vfov_rad"] == pytest.approx(
+        math.radians(58.715), abs=1e-3
+    )
+
+
+_VERTICAL_SPELLING_CAMERA_URDF = """<?xml version="1.0"?>
+<robot name="vertical_spelling_bot">
+  <link name="base_link" />
+  <link name="cam_link" />
+  <gazebo reference="cam_link">
+    <sensor name="vertical_cam" type="camera">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <fovy>60.0</fovy>
+      </camera>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+def test_gazebo_camera_stores_a_declared_vertical_value_directly(tmp_path):
+    """A dialect that declares the vertical axis directly (no width/height
+    needed to derive it) must be stored as-is, converted to radians, rather
+    than requiring an aspect-ratio derivation it does not need."""
+    path = tmp_path / "vertical_spelling_bot.urdf"
+    path.write_text(_VERTICAL_SPELLING_CAMERA_URDF)
+    schema = URDFParser().parse(path)
+    sensor = next(s for s in schema.sensors if s.name == "vertical_cam")
+
+    assert sensor.parameters["vfov_rad"] == pytest.approx(math.radians(60.0))
+
+
+_IMAGELESS_HFOV_CAMERA_URDF = """<?xml version="1.0"?>
+<robot name="imageless_bot">
+  <link name="base_link" />
+  <link name="cam_link" />
+  <gazebo reference="cam_link">
+    <sensor name="imageless_cam" type="camera">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <hfov>1.5707963267948966</hfov>
+      </camera>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+def test_gazebo_camera_with_no_image_size_stores_nothing_rather_than_guess(tmp_path):
+    """Deriving vertical from a declared horizontal needs the aspect ratio.
+    Without <image>, fabricating a default resolution to force a value out
+    would be exactly the kind of guess CONVENTION.md's storage rule forbids
+    -- storing nothing is the correct, intentional behavior here, not a gap."""
+    path = tmp_path / "imageless_bot.urdf"
+    path.write_text(_IMAGELESS_HFOV_CAMERA_URDF)
+    schema = URDFParser().parse(path)
+    sensor = next(s for s in schema.sensors if s.name == "imageless_cam")
+
+    assert "vfov_rad" not in sensor.parameters
+    assert "hfov_rad" not in sensor.parameters
+
+
+_BOTH_AXES_DECLARED_CAMERA_URDF = """<?xml version="1.0"?>
+<robot name="both_axes_bot">
+  <link name="base_link" />
+  <link name="cam_link" />
+  <gazebo reference="cam_link">
+    <sensor name="both_axes_cam" type="camera">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <hfov>1.5707963267948966</hfov>
+        <fovy>75.0</fovy>
+        <image><width>1280</width><height>720</height></image>
+      </camera>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+def test_gazebo_camera_declaring_both_axes_warns_and_prefers_the_explicit_vertical(
+    tmp_path, caplog
+):
+    """A camera declaring both <hfov> and <fovy> is ambiguous -- picking one
+    silently would discard the other. The explicit vertical value wins (it
+    needs no derivation), and the ambiguity is logged, not swallowed."""
+    path = tmp_path / "both_axes_bot.urdf"
+    path.write_text(_BOTH_AXES_DECLARED_CAMERA_URDF)
+    with caplog.at_level("WARNING"):
+        schema = URDFParser().parse(path)
+    sensor = next(s for s in schema.sensors if s.name == "both_axes_cam")
+
+    assert sensor.parameters["vfov_rad"] == pytest.approx(math.radians(75.0))
+    assert any("more than one axis" in message for message in caplog.messages)
+
+
+_NON_FINITE_FOV_CAMERA_URDF = """<?xml version="1.0"?>
+<robot name="nan_bot">
+  <link name="base_link" />
+  <link name="cam_link" />
+  <gazebo reference="cam_link">
+    <sensor name="nan_cam" type="camera">
+      <update_rate>30.0</update_rate>
+      <camera>
+        <fovy>nan</fovy>
+      </camera>
+    </sensor>
+  </gazebo>
+</robot>
+"""
+
+
+def test_gazebo_camera_rejects_a_non_finite_declared_value(tmp_path):
+    """float("nan")/float("inf") both parse without raising -- a NaN or
+    infinite FOV must not reach storage."""
+    path = tmp_path / "nan_bot.urdf"
+    path.write_text(_NON_FINITE_FOV_CAMERA_URDF)
+    schema = URDFParser().parse(path)
+    sensor = next(s for s in schema.sensors if s.name == "nan_cam")
+
+    assert "vfov_rad" not in sensor.parameters
 
 
 def test_gazebo_camera_resolution_is_extracted(sensors_by_name):
