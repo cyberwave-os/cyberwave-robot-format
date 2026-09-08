@@ -395,3 +395,18 @@ class TestPassiveJoints:
         assert actuators[0].get("joint") == "left_wheel_joint"
         assert actuators[0].get("kv") == "35.0"
         assert actuators[0].get("ctrlrange") == "-15.0 15.0"
+
+
+@pytest.mark.parametrize("parent_link", ["base_link", "left_wheel_link"])
+def test_camera_parent_remains_visible_to_other_cameras(parent_link):
+    from cyberwave_robot_format.schema import Geometry, GeometryType, Visual
+
+    schema = _schema([{"name": "cam", "type": "camera", "parent_link": parent_link}])
+    link = next(link for link in schema.links if link.name == parent_link)
+    link.visuals.append(Visual(geometry=Geometry(type=GeometryType.SPHERE, radius=0.1)))
+    root = ET.fromstring(export_mujoco_scene_xml(schema))
+    body = root.find(f".//body[@name='{parent_link}']")
+    assert body is not None
+    visual = body.find("geom[@class='visual']")
+    assert visual is not None and visual.get("group") == "2"
+    assert all(geom.get("group") != "5" for geom in body.findall("geom"))

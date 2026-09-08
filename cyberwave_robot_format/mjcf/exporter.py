@@ -658,15 +658,10 @@ class MJCFExporter(BaseExporter):
         self._add_inertial(body, link)
         self._add_declared_sites(body, link)
 
-        # Links that host camera sensors get group=5 so the wrist-depth renderer
-        # (which already disables geomgroup[5]) does not see the camera housing.
-        _camera_parent_links: frozenset[str] = frozenset(
-            s.parent_link
-            for s in (schema.sensors or [])
-            if s.type in ("camera", "depth_camera")
-        )
-        visual_group = "5" if link.name in _camera_parent_links else "2"
-        collision_group = "5" if link.name in _camera_parent_links else "3"
+        # Camera streamers hide only their own parent body per render. Keep
+        # camera-bearing robots visible to other sensors and the scene viewer.
+        visual_group = "2"
+        collision_group = "3"
 
         for i, visual in enumerate(link.visuals):
             self._add_geom(
@@ -918,15 +913,10 @@ class MJCFExporter(BaseExporter):
         is_movable_joint = joint.type not in (JointType.FIXED,)
         self._add_inertial(body, link, ensure_minimum=is_movable_joint)
 
-        # Links that host camera sensors get group=5 so the wrist-depth renderer
-        # (which already disables geomgroup[5]) does not see the camera housing.
-        _camera_parent_links: frozenset[str] = frozenset(
-            s.parent_link
-            for s in (schema.sensors or [])
-            if s.type in ("camera", "depth_camera")
-        )
-        visual_group = "5" if link.name in _camera_parent_links else "2"
-        collision_group = "5" if link.name in _camera_parent_links else "3"
+        # Camera streamers hide only their own parent body per render. Keep
+        # camera-bearing robots visible to other sensors and the scene viewer.
+        visual_group = "2"
+        collision_group = "3"
 
         for i, visual in enumerate(link.visuals):
             self._add_geom(
