@@ -20,9 +20,82 @@ from cyberwave_robot_format.schema import (
     GeometryType,
     Link,
     Metadata,
+    Pose,
     Vector3,
     Visual,
 )
+
+
+@pytest.mark.parametrize("directory_key", ["assetdir", "texturedir"])
+def test_imported_texture_survives_schema_json_and_mujoco_compile(tmp_path: Path, directory_key: str) -> None:
+    from xml.etree import ElementTree as ET
+
+    from cyberwave_robot_format.mjcf import MJCFParser
+
+    mujoco = pytest.importorskip("mujoco")
+    image = pytest.importorskip("PIL.Image")
+    images = tmp_path / "images"
+    images.mkdir()
+    image.new("RGB", (2, 2), color=(30, 60, 90)).save(images / "body.png")
+    source = tmp_path / "source.xml"
+    source.write_text(f"""<mujoco><compiler {directory_key}="images"/>
+      <asset><texture type="2d" file="body.png"/>
+        <material name="first" texture="body"/><material name="second" texture="body"/>
+      </asset><worldbody><body name="robot"><freejoint/>
+        <geom size=".1" material="first"/><geom size=".05" pos=".2 0 0" material="second"/>
+      </body></worldbody></mujoco>""")
+    schema = CommonSchema.from_dict(MJCFParser().parse(source).to_dict())
+    destination = tmp_path / "elsewhere" / "model.xml"
+    destination.parent.mkdir()
+    MJCFExporter().export(schema, destination)
+    root = ET.parse(destination).getroot()
+    assert len(root.findall("asset/texture")) == 1
+    assert root.find("asset/texture").get("file") == str(images / "body.png")
+    model = mujoco.MjModel.from_xml_path(str(destination))
+    assert model.ntex == 1 and model.nmat == 2
+    assert model.tex_data.tolist() == [30, 60, 90] * 4
+
+    # The same declaration must survive the cloud resolver/ZIP path, where
+    # importing local files behind the resolver would cross a trust boundary.
+    import io
+    import zipfile
+
+    from cyberwave_robot_format.mjcf.scene_export import export_mujoco_zip_cloud
+    from cyberwave_robot_format.urdf import URDFExporter
+
+    resolved = []
+
+    def resolve(filename):
+        resolved.append(filename)
+        assert filename == str(images / "body.png")
+        return "body.png", (images / "body.png").read_bytes()
+
+    bundle = export_mujoco_zip_cloud(schema, resolve, strict_missing_meshes=True)
+    assert resolved == [str(images / "body.png")]
+    with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+        assert "assets/body.png" in archive.namelist()
+        packed = ET.fromstring(archive.read("mujoco_scene.xml"))
+        assert packed.find("asset/texture").get("file") == "body.png"
+    with pytest.raises(FileNotFoundError, match="Missing texture"):
+        export_mujoco_zip_cloud(schema, lambda _: None)
+    urdf = tmp_path / "robot.urdf"
+    URDFExporter().export(schema, urdf)
+    assert ET.parse(urdf).find(".//material/texture").get("filename") == str(images / "body.png")
+
+    # Different source assets commonly use the same material/texture names.
+    # Composition must namespace consumers and declarations together.
+    scene = CommonSchema(metadata=Metadata(name="two_assets"))
+    # Remove the imported world root; merge_in owns scene placement.
+    schema.links = [item for item in schema.links if item.name != "world"]
+    schema.joints = []
+    for name in ("one", "two"):
+        scene.merge_in(schema, name, Pose(), fixed_base=True)
+    merged = tmp_path / "merged.xml"
+    MJCFExporter().export(scene, merged)
+    combined = ET.parse(merged).getroot()
+    assert {item.get("name") for item in combined.findall("asset/texture")} == {"one__body", "two__body"}
+    assert {item.get("texture") for item in combined.findall("asset/material")} == {"one__body", "two__body"}
+    assert schema.links[0].visuals[0].material.texture == "body"
 
 
 def _mesh_schema(filename: str) -> CommonSchema:

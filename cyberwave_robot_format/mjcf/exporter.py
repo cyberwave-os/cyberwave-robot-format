@@ -196,7 +196,7 @@ def site_name_for_sensor(sensor: Sensor) -> str:
     Derived from the sensor name, which the scene composer has already namespaced
     per twin, so two twins of the same asset cannot collide.
     """
-    return f"{sensor.name}_site"
+    return sensor.extensions.get("mjcf_site") or f"{sensor.name}_site"
 
 
 class MJCFExporter(BaseExporter):
@@ -221,6 +221,13 @@ class MJCFExporter(BaseExporter):
 
         option_attrs = {}
         if schema.physics is not None:
+            authored_options = schema.physics.extensions.get("mjcf_option", {})
+            if not isinstance(authored_options, dict) or any(
+                not isinstance(key, str) or not isinstance(value, (str, int, float)) or isinstance(value, bool)
+                for key, value in authored_options.items()
+            ):
+                raise ValueError("MJCF option extensions must contain scalar XML attributes")
+            option_attrs.update({key: str(value) for key, value in authored_options.items()})
             if schema.physics.gravity is not None:
                 gravity = schema.physics.gravity
                 option_attrs["gravity"] = f"{gravity.x} {gravity.y} {gravity.z}"
@@ -228,8 +235,8 @@ class MJCFExporter(BaseExporter):
                 option_attrs["timestep"] = str(schema.physics.timestep)
             if schema.physics.solver is not None:
                 integrator_map = {
-                    "euler": "euler",
-                    "rk4": "rk4",
+                    "euler": "Euler",
+                    "rk4": "RK4",
                     "implicit": "implicit",
                     "implicitfast": "implicitfast",
                     "quick": "implicitfast",
@@ -320,6 +327,9 @@ class MJCFExporter(BaseExporter):
         mesh_name_map = self._add_mesh_assets(asset, schema)
 
         worldbody = ET.SubElement(mujoco, "worldbody")
+        world_link = schema.get_link("world")
+        if world_link is not None:
+            self._add_declared_sites(worldbody, world_link)
 
         child_links = {joint.child_link for joint in schema.joints}
         world_children = {
@@ -472,6 +482,17 @@ class MJCFExporter(BaseExporter):
             mat_elem.set("shininess", str(material.shininess))
 
         if material.texture:
+            texture = material.extensions.get("mjcf_texture")
+            if texture:
+                attributes = {key: str(value) for key, value in texture.items()}
+                attributes["name"] = material.texture
+                existing = next(
+                    (item for item in asset.findall("texture") if item.get("name") == material.texture), None
+                )
+                if existing is None:
+                    ET.SubElement(asset, "texture", attributes)
+                elif existing.attrib != attributes:
+                    raise ValueError(f"Conflicting MJCF texture declaration: {material.texture}")
             mat_elem.set("texture", material.texture)
 
         if material.emissive:
@@ -635,6 +656,7 @@ class MJCFExporter(BaseExporter):
         body = ET.SubElement(parent_elem, "body", name=link.name)
 
         self._add_inertial(body, link)
+        self._add_declared_sites(body, link)
 
         # Links that host camera sensors get group=5 so the wrist-depth renderer
         # (which already disables geomgroup[5]) does not see the camera housing.
@@ -701,6 +723,14 @@ class MJCFExporter(BaseExporter):
                         mesh_name_map,
                     )
 
+    def _add_declared_sites(self, body: ET.Element, link: Link) -> None:
+        for attrs in link.get_mjcf_sites():
+            name = attrs["name"]
+            if name in self._emitted_sites:
+                raise ValueError(f"Duplicate MJCF site name: {name}")
+            ET.SubElement(body, "site", **attrs)
+            self._emitted_sites.add(name)
+
     def _add_sensor_site(self, body: ET.Element, sensor: Sensor) -> None:
         """Create the ``<site>`` a site-attached sensor will reference.
 
@@ -716,6 +746,12 @@ class MJCFExporter(BaseExporter):
         if not _needs_site(sensor.type):
             return
         site_name = site_name_for_sensor(sensor)
+        if sensor.extensions.get("mjcf_site"):
+            # Explicit imported frames are emitted once, including shared IMUs.
+            # A missing declared frame must not be replaced with an identity one.
+            if site_name not in self._emitted_sites:
+                raise ValueError(f"Sensor {sensor.name!r} references an undeclared site: {site_name}")
+            return
         site = ET.SubElement(body, "site", name=site_name)
         site.set("group", _SENSOR_SITE_GROUP)
         self._emitted_sites.add(site_name)
@@ -917,6 +953,7 @@ class MJCFExporter(BaseExporter):
                 schema=schema,
             )
 
+        self._add_declared_sites(body, link)
         if schema.sensors:
             for sensor in schema.sensors:
                 if sensor.parent_link != link.name:
@@ -1119,6 +1156,7 @@ class MJCFExporter(BaseExporter):
                 for key in [
                     "contype",
                     "conaffinity",
+                    "priority",
                     "margin",
                     "solref",
                     "solimp",
@@ -1127,7 +1165,9 @@ class MJCFExporter(BaseExporter):
                 ]:
                     val = collision.extensions.get(key)
                     if val is not None:
-                        geom.set(key, str(val))
+                        geom.set(
+                            key, " ".join(str(item) for item in val) if isinstance(val, (list, tuple)) else str(val)
+                        )
 
     def _add_actuator(
         self,
@@ -1173,9 +1213,16 @@ class MJCFExporter(BaseExporter):
             "general": "general",
         }
         act_tag = type_map.get(raw_type) or type_map.get(norm, "general")
-        act = ET.SubElement(
-            actuator_elem, act_tag, name=actuator.name, joint=actuator.joint
-        )
+        transmission = actuator.get_mjcf_site_transmission()
+        if transmission is not None:
+            for reference in ("site", "refsite"):
+                if reference in transmission and transmission[reference] not in self._emitted_sites:
+                    raise ValueError(
+                        f"Actuator {actuator.name!r} references an undeclared {reference}: {transmission[reference]}"
+                    )
+            act = ET.SubElement(actuator_elem, act_tag, name=actuator.name, **transmission)
+        else:
+            act = ET.SubElement(actuator_elem, act_tag, name=actuator.name, joint=actuator.joint)
 
         if hasattr(actuator, "control_range") and actuator.control_range:
             ctrl_min, ctrl_max = actuator.control_range
@@ -1330,6 +1377,8 @@ class MJCFExporter(BaseExporter):
                 )
                 if joint_name:
                     attrs["joint"] = joint_name
+            elif tag.startswith("frame") and sensor.extensions.get("mjcf_site"):
+                attrs.update(objtype="site", objname=site_name_for_sensor(sensor))
             elif _needs_site(sensor.type):
                 attrs["site"] = site_name_for_sensor(sensor)
 

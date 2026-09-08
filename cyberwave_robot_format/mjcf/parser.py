@@ -46,7 +46,6 @@ from cyberwave_robot_format.schema import (
     Vector3,
     Visual,
 )
-
 from cyberwave_robot_format.utils import sanitize_name
 
 logger = logging.getLogger(__name__)
@@ -62,6 +61,8 @@ class MJCFParser(BaseParser):
         self._default_geom_material: str | None = None
         self._default_size: dict[str, str] = {}
         self._default_actuator_attrs: dict[str, dict[str, str]] = {}
+        self._default_class = "main"
+        self._element_defaults: dict[str, dict[str, dict[str, str]]] = {}
 
     def can_parse(self, file_path: str | Path) -> bool:
         """Check if file is a valid MJCF file."""
@@ -72,8 +73,13 @@ class MJCFParser(BaseParser):
         except Exception:
             return False
 
-    def parse(self, input_path: str | Path) -> CommonSchema:
-        """Parse MJCF file with enhanced validation and comprehensive support."""
+    def parse(self, input_path: str | Path, *, resolve_inertia: bool = False) -> CommonSchema:
+        """Parse MJCF, optionally resolving inertia with the source physics engine.
+
+        Simulation/training importers should opt in when mass comes from geoms
+        rather than explicit inertials. This requires MuJoCo and rejects models
+        that cannot compile; it never substitutes guessed body masses.
+        """
         file_path = Path(input_path)
 
         try:
@@ -95,18 +101,18 @@ class MJCFParser(BaseParser):
             version=root.get("version", "2.3"),
         )
 
-        asset_elem = root.find("asset")
-        if asset_elem is not None:
-            context.materials = self._parse_materials(asset_elem, context)
-            context.meshes = self._parse_meshes(asset_elem, context)
-
         self._default_geom_friction = None
         self._default_geom_material = None
         self._default_size = {}
         self._default_actuator_attrs = {}
+        self._default_class = "main"
+        self._element_defaults = {"main": {}}
 
         default_elem = root.find("default")
         if default_elem is not None:
+            self._default_class = default_elem.get("class", "main")
+            self._element_defaults = {}
+            self._collect_element_defaults(default_elem, {})
             geom_default = default_elem.find("geom")
             if geom_default is not None:
                 friction_attr = geom_default.get("friction")
@@ -128,6 +134,14 @@ class MJCFParser(BaseParser):
                     size_attrs[key] = size_elem.get(key)
             self._default_size = size_attrs
 
+        asset_elem = root.find("asset")
+        if asset_elem is not None:
+            compiler = root.find("compiler")
+            mesh_dir = compiler.get("meshdir", compiler.get("assetdir", "")) if compiler is not None else ""
+            texture_dir = compiler.get("texturedir", compiler.get("assetdir", "")) if compiler is not None else ""
+            context.materials = self._parse_materials(asset_elem, context, texture_dir=texture_dir)
+            context.meshes = self._parse_meshes(asset_elem, context, mesh_dir=mesh_dir)
+
         worldbody = root.find("worldbody")
         if worldbody is None:
             context.add_error("MJCF file missing worldbody element")
@@ -137,6 +151,7 @@ class MJCFParser(BaseParser):
         joints = []
 
         world_link = Link(name="world")
+        self._parse_sites(worldbody, world_link, self._default_class)
         links.append(world_link)
 
         for body_elem in worldbody.findall("body"):
@@ -144,6 +159,8 @@ class MJCFParser(BaseParser):
                 body_links, body_joints = self._parse_body_hierarchy(body_elem, "world", context)
                 links.extend(body_links)
                 joints.extend(body_joints)
+            except ParseError:
+                raise
             except Exception as e:
                 context.add_error(f"Failed to parse body hierarchy: {e}")
 
@@ -155,17 +172,17 @@ class MJCFParser(BaseParser):
         sensors = []
         sensor_elem = root.find("sensor")
         if sensor_elem is not None:
-            sensors = self._parse_sensors(sensor_elem, context)
+            sensors = self._parse_sensors(sensor_elem, context, links)
 
         contacts = []
         contact_elem = root.find("contact")
         if contact_elem is not None:
             contacts = self._parse_contact_pairs(contact_elem, context)
 
-        physics = None
         option_elem = root.find("option")
-        if option_elem is not None:
-            physics = self._parse_mjcf_physics(option_elem, context)
+        # An omitted option uses MuJoCo defaults, not the common schema's
+        # cross-engine defaults. Preserve that distinction on a fresh import.
+        physics = self._parse_mjcf_physics(option_elem if option_elem is not None else ET.Element("option"), context)
 
         schema = CommonSchema(
             metadata=metadata,
@@ -176,6 +193,8 @@ class MJCFParser(BaseParser):
             physics=physics,
             contacts=contacts,
         )
+        if resolve_inertia:
+            self._resolve_compiled_inertia(schema, file_path)
 
         schema.extensions["parse_context"] = {
             "warnings": context.warnings,
@@ -195,15 +214,84 @@ class MJCFParser(BaseParser):
 
         return schema
 
+    @staticmethod
+    def _resolve_compiled_inertia(schema: CommonSchema, source: Path) -> None:
+        import numpy as np
+
+        try:
+            import mujoco
+        except ImportError as exc:
+            raise ParseError("Resolving MJCF inertia requires the optional MuJoCo runtime") from exc
+        model = mujoco.MjModel.from_xml_path(str(source))
+        names = {}
+        for index in range(1, model.nbody):
+            name = sanitize_name(model.body(index).name)
+            if name in names:
+                raise ParseError(f"Body names collide after schema normalization: {name}")
+            names[name] = index
+        for link in schema.links:
+            if link.name == "world":
+                continue
+            if link.name not in names:
+                raise ParseError(f"Compiled source does not contain schema body: {link.name}")
+            index = names[link.name]
+            rotation = np.empty(9)
+            mujoco.mju_quat2Mat(rotation, model.body_iquat[index])
+            rotation = rotation.reshape(3, 3)
+            tensor = rotation @ np.diag(model.body_inertia[index]) @ rotation.T
+            link.mass = float(model.body_mass[index])
+            link.center_of_mass = Vector3.from_list(model.body_ipos[index].tolist())
+            link.inertia = Inertia(
+                ixx=float(tensor[0, 0]),
+                iyy=float(tensor[1, 1]),
+                izz=float(tensor[2, 2]),
+                ixy=float(tensor[0, 1]),
+                ixz=float(tensor[0, 2]),
+                iyz=float(tensor[1, 2]),
+            )
+        schema.extensions["inertia_provenance"] = {"source": "compiled_mjcf", "mujoco_version": mujoco.__version__}
+
+    def _collect_element_defaults(self, element: ET.Element, inherited: dict[str, dict[str, str]]) -> None:
+        """Resolve supported element defaults without changing actuator shortcuts.
+
+        Classes inherit their parent's dummy-element attributes; sibling classes
+        remain independent. Keep raw class identifiers: they are references, not
+        schema entity names, and sanitizing them can create collisions.
+        """
+        name = element.get("class", self._default_class)
+        if name in self._element_defaults:
+            raise ParseError(f"Duplicate MJCF defaults class: {name}")
+        resolved = {tag: dict(attrs) for tag, attrs in inherited.items()}
+        for child in element:
+            if child.tag in {"joint", "geom", "site", "motor", "mesh"}:
+                resolved.setdefault(child.tag, {}).update(child.attrib)
+        self._element_defaults[name] = resolved
+        for child in element.findall("default"):
+            if not child.get("class"):
+                raise ParseError("Nested MJCF defaults must declare a class")
+            self._collect_element_defaults(child, resolved)
+
+    def _with_element_defaults(self, element: ET.Element, active_class: str) -> ET.Element:
+        class_name = element.get("class", active_class)
+        if class_name not in self._element_defaults:
+            raise ParseError(f"Unknown MJCF defaults class: {class_name}")
+        attrs = dict(self._element_defaults[class_name].get(element.tag, {}))
+        attrs.update(element.attrib)
+        return ET.Element(element.tag, attrs)
+
     def _parse_body_hierarchy(
         self,
         body_elem: ET.Element,
         parent_link: str,
         context: ParseContext,
+        inherited_class: str | None = None,
     ) -> tuple[list[Link], list[Joint]]:
         """Parse MJCF body hierarchy recursively with enhanced validation."""
         links = []
         joints = []
+        active_class = body_elem.get("childclass", inherited_class or self._default_class)
+        if active_class not in self._element_defaults:
+            raise ParseError(f"Unknown MJCF defaults childclass: {active_class}")
 
         body_name = body_elem.get("name")
         if not body_name:
@@ -213,6 +301,7 @@ class MJCFParser(BaseParser):
         body_name = sanitize_name(body_name)
 
         link = Link(name=body_name)
+        self._parse_sites(body_elem, link, active_class)
         body_pose: Pose | None = None
 
         pos_str = body_elem.get("pos")
@@ -244,14 +333,21 @@ class MJCFParser(BaseParser):
             self._parse_mjcf_inertial(inertial_elem, link, context)
 
         for geom_elem in body_elem.findall("geom"):
-            self._parse_mjcf_geometry(geom_elem, link, context)
+            self._parse_mjcf_geometry(self._with_element_defaults(geom_elem, active_class), link, context)
 
         links.append(link)
 
-        joint_elems = body_elem.findall("joint")
+        joint_elems = [element for element in body_elem if element.tag in {"joint", "freejoint"}]
         if joint_elems:
             for joint_elem in joint_elems:
-                joint = self._parse_mjcf_joint(joint_elem, parent_link, body_name, context, body_pose)
+                if joint_elem.tag == "freejoint":
+                    # This shortcut deliberately ignores joint defaults (notably
+                    # damping, armature and limits); treating it as an ordinary
+                    # defaulted joint changes floating-base physics.
+                    resolved_joint = ET.Element("joint", {**joint_elem.attrib, "type": "free"})
+                else:
+                    resolved_joint = self._with_element_defaults(joint_elem, active_class)
+                joint = self._parse_mjcf_joint(resolved_joint, parent_link, body_name, context, body_pose)
                 if joint:
                     joints.append(joint)
         elif parent_link != "world":
@@ -265,11 +361,31 @@ class MJCFParser(BaseParser):
             joints.append(joint)
 
         for child_body in body_elem.findall("body"):
-            child_links, child_joints = self._parse_body_hierarchy(child_body, body_name, context)
+            child_links, child_joints = self._parse_body_hierarchy(child_body, body_name, context, active_class)
             links.extend(child_links)
             joints.extend(child_joints)
 
         return links, joints
+
+    def _parse_sites(self, body: ET.Element, link: Link, active_class: str) -> None:
+        sites = []
+        for element in body.findall("site"):
+            if not element.get("name"):
+                continue  # Unnamed visual markers cannot be transmission targets.
+            attrs = dict(self._with_element_defaults(element, active_class).attrib)
+            attrs.pop("class", None)
+            attrs["name"] = sanitize_name(attrs["name"])
+            # Angular compiler conventions must not silently change on export.
+            # MuJoCo can canonicalize these orientations to quaternion first.
+            if "euler" in attrs or "axisangle" in attrs or "material" in attrs:
+                raise ParseError(f"Site {attrs['name']!r}: use quaternion orientation and inline rgba for import")
+            sites.append(attrs)
+        if sites:
+            link.extensions["mjcf_sites"] = sites
+            try:
+                link.get_mjcf_sites()
+            except ValueError as exc:
+                raise ParseError(str(exc)) from exc
 
     def _parse_mjcf_inertial(
         self,
@@ -309,6 +425,27 @@ class MJCFParser(BaseParser):
                         ixz=0.0,
                         iyz=0.0,
                     )
+                    quat_str = inertial_elem.get("quat")
+                    if quat_str:
+                        from trimesh.transformations import quaternion_matrix
+
+                        quat = [float(value) for value in quat_str.split()]
+                        norm = math.hypot(*quat)
+                        if len(quat) != 4 or not math.isfinite(norm) or norm == 0:
+                            raise ValueError("Invalid inertial quaternion")
+                        # Diagonal values live in the inertial frame. The common
+                        # schema stores a tensor in the link frame, not that frame's
+                        # orientation, so rotate the tensor instead of discarding it.
+                        rotation = quaternion_matrix([value / norm for value in quat])[:3, :3]
+                        tensor = rotation @ link.inertia.to_matrix() @ rotation.T
+                        link.inertia = Inertia(
+                            ixx=float(tensor[0, 0]),
+                            iyy=float(tensor[1, 1]),
+                            izz=float(tensor[2, 2]),
+                            ixy=float(tensor[0, 1]),
+                            ixz=float(tensor[0, 2]),
+                            iyz=float(tensor[1, 2]),
+                        )
             except ValueError:
                 context.add_error(f"Invalid inertia values for link {link.name}")
 
@@ -359,6 +496,8 @@ class MJCFParser(BaseParser):
                 type=GeometryType.BOX,
                 size=Vector3(size_values[0] * 2, size_values[1] * 2, size_values[2] * 2),
             )
+        elif geom_type == "ellipsoid" and len(size_values) == 3:
+            geometry = Geometry(type=GeometryType.ELLIPSOID, size=Vector3.from_list(size_values))
         elif geom_type == "cylinder" and len(size_values) >= 2:
             geometry = Geometry(
                 type=GeometryType.CYLINDER,
@@ -400,6 +539,8 @@ class MJCFParser(BaseParser):
                         context.add_warning(f"Invalid geom scale for mesh in link {link.name}")
                 if geometry.scale is None:
                     geometry.scale = Vector3(1.0, 1.0, 1.0)
+            else:
+                context.add_warning(f"Unknown mesh reference {mesh_name!r} for link {link.name}")
 
         if geometry:
             material_name = geom_elem.get("material")
@@ -424,23 +565,17 @@ class MJCFParser(BaseParser):
                 try:
                     pos_values = [float(x) for x in pos_str.split()]
                     if len(pos_values) == 3:
-                        position = Vector3(pos_values[0], pos_values[1], pos_values[2])
-
-                        orientation = Quaternion(0.0, 0.0, 0.0, 1.0)
-                        if quat_str:
-                            quat_values = [float(x) for x in quat_str.split()]
-                            if len(quat_values) == 4:
-                                orientation = Quaternion(
-                                    quat_values[1],
-                                    quat_values[2],
-                                    quat_values[3],
-                                    quat_values[0],
-                                )
-
-                        pose = Pose(position=position, orientation=orientation)
+                        pose.position = Vector3(pos_values[0], pos_values[1], pos_values[2])
 
                 except ValueError:
                     context.add_warning(f"Invalid geometry position for link {link.name}")
+            if quat_str:
+                try:
+                    quat_values = [float(x) for x in quat_str.split()]
+                    if len(quat_values) == 4:
+                        pose.orientation = Quaternion(quat_values[1], quat_values[2], quat_values[3], quat_values[0])
+                except ValueError:
+                    context.add_warning(f"Invalid geometry quaternion for link {link.name}")
 
             group = geom_elem.get("group")
             if group is None:
@@ -493,7 +628,7 @@ class MJCFParser(BaseParser):
                     if mat_name in context.materials:
                         material = context.materials[mat_name]
 
-                for attr in ["contype", "conaffinity", "margin", "solref", "solimp"]:
+                for attr in ["contype", "conaffinity", "priority", "margin", "solref", "solimp", "condim"]:
                     val = geom_elem.get(attr)
                     if val:
                         collision.extensions[attr] = val
@@ -617,9 +752,24 @@ class MJCFParser(BaseParser):
         self,
         asset_elem: ET.Element,
         context: ParseContext,
+        *,
+        texture_dir: str = "",
     ) -> dict[str, Material]:
         """Parse materials from asset section with validation."""
         materials = {}
+        textures = {}
+        for element in asset_elem.findall("texture"):
+            attributes = dict(element.attrib)
+            name = attributes.get("name") or Path(attributes.get("file", "")).stem
+            if not name:
+                continue
+            attributes["name"] = name
+            for key in ("file", "fileleft", "fileright", "fileup", "filedown", "filefront", "fileback"):
+                if attributes.get(key) and not Path(attributes[key]).is_absolute():
+                    attributes[key] = str((context.base_dir / texture_dir / attributes[key]).resolve())
+            if name in textures:
+                raise ParseError(f"Duplicate MJCF texture: {name}")
+            textures[name] = attributes
 
         for mat_elem in asset_elem.findall("material"):
             name = mat_elem.get("name")
@@ -659,6 +809,13 @@ class MJCFParser(BaseParser):
             texture = mat_elem.get("texture")
             if texture:
                 material.texture = texture
+                if texture in textures:
+                    # Keep the declaration with its consumer, like sites and
+                    # actuator extensions. It survives schema JSON and entity
+                    # composition; a dangling material reference cannot render.
+                    material.extensions["mjcf_texture"] = textures[texture]
+                else:
+                    context.add_warning(f"Texture not declared for material {name}: {texture}")
 
             emission = self._parse_float_attr(mat_elem, "emission")
             if emission is not None:
@@ -672,19 +829,26 @@ class MJCFParser(BaseParser):
         self,
         asset_elem: ET.Element,
         context: ParseContext,
+        *,
+        mesh_dir: str = "",
     ) -> dict[str, dict]:
         """Parse mesh assets with path resolution."""
         meshes = {}
 
         for mesh_elem in asset_elem.findall("mesh"):
+            mesh_elem = self._with_element_defaults(mesh_elem, self._default_class)
             name = mesh_elem.get("name")
             filename = mesh_elem.get("file")
             scale_attr = mesh_elem.get("scale")
+            # MuJoCo uses the file's basename without extension when a mesh
+            # asset omits its name (common in unmodified catalog source models).
+            if not name and filename:
+                name = Path(filename).stem
 
             if name and filename:
                 mesh_info = {}
                 if not Path(filename).is_absolute():
-                    full_path = context.base_dir / filename
+                    full_path = context.base_dir / mesh_dir / filename
                     if full_path.exists():
                         mesh_info["filename"] = str(full_path)
                     else:
@@ -726,29 +890,81 @@ class MJCFParser(BaseParser):
             if actuator_type is None:
                 continue
             attrs = self._actuator_attrs_with_defaults(actuator_entry)
+            if actuator_entry.tag == "motor" and actuator_entry.get("site"):
+                attrs = dict(self._with_element_defaults(actuator_entry, self._default_class).attrib)
             name = attrs.get("name")
             joint = attrs.get("joint")
-            if not name or not joint:
-                context.add_warning(
-                    f"{actuator_entry.tag.capitalize()} actuator missing name or joint reference"
-                )
+            site = attrs.get("site")
+            if site and actuator_entry.tag != "motor":
+                raise ParseError("Only stateless motor site transmissions are supported for MJCF import")
+            if not name or not (joint or site):
+                context.add_warning(f"{actuator_entry.tag.capitalize()} actuator missing name or joint reference")
                 continue
 
             actuator = Actuator(
                 name=sanitize_name(name),
-                joint=sanitize_name(joint),
+                joint=sanitize_name(joint) if joint else "",
                 type=actuator_type,
             )
 
-            gear = self._parse_first_float(attrs.get("gear"))
-            if gear is not None:
-                actuator.gear_ratio = gear
+            if site:
+                allowed = {
+                    "name",
+                    "class",
+                    "site",
+                    "refsite",
+                    "gear",
+                    "ctrlrange",
+                    "forcerange",
+                    "ctrllimited",
+                    "forcelimited",
+                    "group",
+                }
+                if attrs.keys() - allowed:
+                    raise ParseError(f"Unsupported site motor attributes: {sorted(attrs.keys() - allowed)}")
+                transmission = {
+                    key: value
+                    for key, value in attrs.items()
+                    if key in {"site", "refsite", "gear", "ctrllimited", "forcelimited", "group"}
+                }
+                for reference in ("site", "refsite"):
+                    if reference in transmission:
+                        transmission[reference] = sanitize_name(transmission[reference])
+                actuator.extensions["mjcf_site_transmission"] = transmission
+                try:
+                    actuator.get_mjcf_site_transmission()
+                except ValueError as exc:
+                    raise ParseError(str(exc)) from exc
+            else:
+                gear = self._parse_first_float(attrs.get("gear"))
+                if gear is not None:
+                    actuator.gear_ratio = gear
 
             ctrl_range = self._parse_float_pair(attrs.get("ctrlrange"))
+            if (
+                site
+                and "ctrlrange" in attrs
+                and (
+                    ctrl_range is None
+                    or not all(math.isfinite(value) for value in ctrl_range)
+                    or ctrl_range[0] >= ctrl_range[1]
+                )
+            ):
+                raise ParseError(f"Site motor {name!r} has invalid ctrlrange")
             if ctrl_range is not None:
                 actuator.control_range = ctrl_range
 
             force_range = self._parse_float_pair(attrs.get("forcerange"))
+            if (
+                site
+                and "forcerange" in attrs
+                and (
+                    force_range is None
+                    or not all(math.isfinite(value) for value in force_range)
+                    or force_range[0] >= force_range[1]
+                )
+            ):
+                raise ParseError(f"Site motor {name!r} has invalid forcerange")
             if force_range is not None:
                 actuator.force_range = force_range
                 actuator.max_torque = max(abs(force_range[0]), abs(force_range[1]))
@@ -811,9 +1027,11 @@ class MJCFParser(BaseParser):
         self,
         sensor_elem: ET.Element,
         context: ParseContext,
+        links: list[Link],
     ) -> list[Sensor]:
         """Parse sensor definitions with comprehensive type support."""
         sensors = []
+        site_parents = {site["name"]: link.name for link in links for site in link.get_mjcf_sites()}
 
         basic_sensor_types = [
             "accelerometer",
@@ -838,8 +1056,10 @@ class MJCFParser(BaseParser):
                 sensor = Sensor(
                     name=sanitize_name(name),
                     type=sensor_type,
-                    parent_link=site or "world",
+                    parent_link=site_parents.get(sanitize_name(site), site) if site else "world",
                 )
+                if site and sanitize_name(site) in site_parents:
+                    sensor.extensions["mjcf_site"] = sanitize_name(site)
 
                 if sensor_type == "camera":
                     resolution = sens_elem.get("resolution")
@@ -867,6 +1087,8 @@ class MJCFParser(BaseParser):
             for sens_elem in sensor_elem.findall(tag):
                 name = sens_elem.get("name")
                 target = sens_elem.get(attr)
+                if attr == "site" and sens_elem.get("objtype") == "site":
+                    target = sens_elem.get("objname")
                 if not name:
                     context.add_warning(f"Sensor {tag} missing name")
                     continue
@@ -874,7 +1096,9 @@ class MJCFParser(BaseParser):
                     context.add_warning(f"Sensor {tag} missing {attr}")
                     continue
 
-                parent_link = sanitize_name(target) if attr == "site" else "world"
+                parent_link = (
+                    site_parents.get(sanitize_name(target), sanitize_name(target)) if attr == "site" else "world"
+                )
                 sensor = Sensor(
                     name=sanitize_name(name),
                     type=tag,
@@ -884,9 +1108,18 @@ class MJCFParser(BaseParser):
                     sensor.parameters["joint"] = sanitize_name(target)
                 else:
                     sensor.parameters["site"] = sanitize_name(target)
+                    if sanitize_name(target) in site_parents:
+                        sensor.extensions["mjcf_site"] = sanitize_name(target)
 
                 sensors.append(sensor)
 
+        # Compiled sensor vectors follow source order, not our supported-tag list.
+        source_order = {
+            sanitize_name(element.get("name")): index
+            for index, element in enumerate(sensor_elem)
+            if element.get("name")
+        }
+        sensors.sort(key=lambda sensor: source_order[sensor.name])
         return sensors
 
     def _parse_float_attr(self, elem: ET.Element, attr: str) -> float | None:
@@ -929,7 +1162,14 @@ class MJCFParser(BaseParser):
         context: ParseContext,
     ) -> Physics | None:
         """Parse MJCF physics from <option> element."""
-        physics = Physics()
+        physics = Physics(timestep=0.002, solver=PhysicsSolver(type="euler", iterations=100, tolerance=1e-8))
+        # Keep nonportable scalar options without adding fields to every engine's
+        # schema. Portable fields below remain authoritative when edited later.
+        portable = {"gravity", "timestep", "integrator", "iterations", "tolerance"}
+        physics.extensions["mjcf_option"] = {
+            "noslip_iterations": "0",
+            **{key: value for key, value in option_elem.attrib.items() if key not in portable},
+        }
 
         gravity_str = option_elem.get("gravity")
         if gravity_str:
@@ -949,15 +1189,13 @@ class MJCFParser(BaseParser):
 
         integrator = option_elem.get("integrator")
         if integrator:
-            solver = PhysicsSolver()
             integrator_map = {
                 "euler": "euler",
                 "rk4": "rk4",
                 "implicit": "implicit",
                 "implicitfast": "implicitfast",
             }
-            solver.type = integrator_map.get(integrator.lower(), "quick")
-            physics.solver = solver
+            physics.solver.type = integrator_map.get(integrator.lower(), "quick")
 
         iterations_str = option_elem.get("iterations")
         if iterations_str:

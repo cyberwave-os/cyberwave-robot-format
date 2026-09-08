@@ -112,8 +112,37 @@ schema = parser.parse("path/to/robot.xml")
 
 # Access actuators
 for actuator in schema.actuators:
-    print(f"Actuator: {actuator.name}, joint: {actuator.joint}")
+    print(f"Actuator: {actuator.name}, joint: {actuator.joint}, site: {actuator.get_mjcf_site_transmission()}")
 ```
+
+Named MJCF sites and stateless site motors survive the common-schema JSON
+round trip and scene composition. `Link.extensions.mjcf_sites` retains the
+resolved frame attributes; `Actuator.extensions.mjcf_site_transmission` retains
+`site`, optional `refsite`, the full signed gear vector and limit flags.
+These actuators have an empty `joint`, not a fictitious joint, and no scalar
+`gear_ratio`. Site-bound IMU/frame sensors keep the same frame and source order.
+Scene composition namespaces all these references together.
+
+This is model preservation, **not** a declaration of hardware actuator access.
+A flight/locomotion skill may command only a higher-level controller while its
+simulation model contains motors internally. Runtime adapters must separately
+validate the policy's actual output interface. URDF cannot represent these native
+transmissions; retain the common-schema artifact instead of round-tripping through
+URDF. Current site import supports quaternion/vector orientations and inline
+colors; canonicalize Euler/axis-angle/material-based sites first. Unsupported
+site servos, malformed extensions and missing transmission frames fail explicitly.
+
+MJCF imports retain nested joint/geometry defaults and body `childclass`
+overrides, including inherited limits, collision settings and visual shapes.
+Floating roots declared with `<freejoint/>` stay floating without inheriting
+joint damping. Mesh names may be inferred from filenames in the compiler's mesh
+directory. Inertial-frame and geometry quaternions are retained.
+Fresh MJCF imports also retain scalar simulation options, including contact
+cone and impedance ratio, and use MuJoCo defaults for omitted options.
+This does not rewrite previously imported assets or their saved settings.
+Before training on a converted model, compare its compiled dynamics and solver
+settings with the intended model; successful parsing alone does not guarantee
+simulation equivalence.
 
 ### Export to MJCF
 

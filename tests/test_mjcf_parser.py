@@ -24,6 +24,25 @@ def simple_mjcf_path():
     return Path(__file__).parent / "fixtures" / "simple_robot.xml"
 
 
+@pytest.mark.parametrize("priority", [0, 5])
+def test_contact_priority_roundtrips(priority, tmp_path):
+    import xml.etree.ElementTree as ET
+
+    source = tmp_path / "priority.xml"
+    source.write_text(
+        '<mujoco><worldbody><body name="object"><geom name="contact" '
+        f'type="sphere" size="0.03" priority="{priority}"/></body></worldbody></mujoco>'
+    )
+    schema = MJCFParser().parse(source)
+    collision = next(link for link in schema.links if link.name == "object").collisions[0]
+    assert str(collision.extensions["priority"]) == str(priority)
+    destination = tmp_path / "export.xml"
+    MJCFExporter().export(schema, destination)
+    geom = ET.parse(destination).find(f".//geom[@name='{collision.name}']")
+    assert geom is not None
+    assert geom.get("priority") == str(priority)
+
+
 def test_mjcf_parser_basic(simple_mjcf_path):
     """Test that MJCF parser can parse a simple robot."""
     parser = MJCFParser()

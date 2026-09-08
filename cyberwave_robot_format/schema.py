@@ -134,9 +134,17 @@ class Quaternion:
         """Convert to roll-pitch-yaw angles (Fixed XYZ convention).
 
         Inverse of :meth:`from_rpy`; returns ``(roll, pitch, yaw)`` in radians.
-        Pitch is clamped to avoid NaN at the gimbal-lock singularity.
+        Normalize without mutating the source: MJCF permits scaled nonzero
+        quaternions. Pitch is clamped at the gimbal-lock singularity.
         """
         x, y, z, w = self.x, self.y, self.z, self.w
+        values = (x, y, z, w)
+        scale = max(abs(value) for value in values)
+        if not all(math.isfinite(value) for value in values) or scale == 0:
+            raise ValueError("Rotation quaternion must be finite and nonzero")
+        values = tuple(value / scale for value in values)
+        norm = math.hypot(*values)
+        x, y, z, w = (value / norm for value in values)
 
         # Roll (rotation about X).
         sinr_cosp = 2.0 * (w * x + y * z)
@@ -286,6 +294,19 @@ class Link:
     # Format-specific extensions
     extensions: dict[str, Any] = field(default_factory=dict)
 
+    def get_mjcf_sites(self) -> list[dict[str, str]]:
+        """Named native frames, retained without interpreting them as geometry."""
+        sites = self.extensions.get("mjcf_sites", [])
+        allowed = {"name", "type", "size", "rgba", "group", "pos", "quat", "zaxis", "xyaxes", "fromto", "user"}
+        if not isinstance(sites, list) or any(
+            not isinstance(site, dict)
+            or not site.get("name")
+            or any(key not in allowed or not isinstance(value, str) for key, value in site.items())
+            for site in sites
+        ):
+            raise ValueError(f"Link {self.name!r} has invalid MJCF site attributes")
+        return sites
+
 
 @dataclass
 class JointLimits:
@@ -367,7 +388,7 @@ class Actuator:
     """Actuator/motor definition."""
 
     name: str
-    joint: str
+    joint: str  # Empty for an explicitly declared MJCF site transmission.
     type: ActuatorType
 
     # Motor parameters
@@ -390,6 +411,35 @@ class Actuator:
     efficiency: float | None = None
 
     extensions: dict[str, Any] = field(default_factory=dict)
+
+    def get_mjcf_site_transmission(self) -> dict[str, str] | None:
+        """Return a validated native motor transmission, never a fictitious joint.
+
+        Site motors apply a six-axis wrench in a declared frame. Keep their gear
+        vector in the existing format-extension envelope rather than scalarizing
+        it into ``gear_ratio``. Other formats may preserve this envelope without
+        claiming they can execute it.
+        """
+        transmission = self.extensions.get("mjcf_site_transmission")
+        if transmission is None:
+            return None
+        allowed = {"site", "refsite", "gear", "ctrllimited", "forcelimited", "group"}
+        if (
+            self.joint
+            or self.type not in {ActuatorType.DC_MOTOR, ActuatorType.TORQUE}
+            or self.gear_ratio is not None
+            or not isinstance(transmission, dict)
+            or not transmission.get("site")
+            or any(key not in allowed or not isinstance(value, str) for key, value in transmission.items())
+        ):
+            raise ValueError(f"Actuator {self.name!r} has an invalid MJCF site motor transmission")
+        try:
+            gear = [float(value) for value in transmission.get("gear", "1 0 0 0 0 0").split()]
+        except ValueError as exc:
+            raise ValueError(f"Actuator {self.name!r} has an invalid MJCF gear vector") from exc
+        if not 1 <= len(gear) <= 6 or not all(math.isfinite(value) for value in gear):
+            raise ValueError(f"Actuator {self.name!r} has an invalid MJCF gear vector")
+        return transmission
 
 
 @dataclass
@@ -692,9 +742,29 @@ class CommonSchema:
                     f"Joint {joint.name!r} references unknown child link: {joint.child_link}."
                 )
 
-        # Check actuator references
+        site_names = []
+        for link in self.links:
+            try:
+                site_names.extend(site["name"] for site in link.get_mjcf_sites())
+            except ValueError as exc:
+                issues.append(str(exc))
+        if len(site_names) != len(set(site_names)):
+            issues.append("Duplicate MJCF site names found.")
+
+        # Check actuator references, including explicitly preserved native motors.
         for actuator in self.actuators:
-            if not self.get_joint(actuator.joint):
+            try:
+                transmission = actuator.get_mjcf_site_transmission()
+            except ValueError as exc:
+                issues.append(str(exc))
+                continue
+            if transmission is not None:
+                for reference in ("site", "refsite"):
+                    if reference in transmission and transmission[reference] not in site_names:
+                        issues.append(
+                            f"Actuator {actuator.name!r} references unknown {reference}: {transmission[reference]}."
+                        )
+            elif not self.get_joint(actuator.joint):
                 issues.append(
                     f"Actuator {actuator.name!r} references unknown joint: {actuator.joint}."
                 )
@@ -809,15 +879,31 @@ class CommonSchema:
             """Apply prefix to a name."""
             return f"{prefix}{name}"
 
+        # A material may be shared by several visuals in the copied schema.
+        # Prefix it once so distinct assets cannot steal each other's textures.
+        prefixed_materials: set[int] = set()
         # Rewrite all links (including nested collision/visual names)
         for link in other_copy.links:
             link.name = prefixed(link.name)
+            for site in link.get_mjcf_sites():
+                site["name"] = prefixed(site["name"])
             for collision in link.collisions:
                 if collision.name:
                     collision.name = prefixed(collision.name)
             for visual in link.visuals:
                 if visual.name:
                     visual.name = prefixed(visual.name)
+                material = visual.material
+                if material is not None and id(material) not in prefixed_materials:
+                    prefixed_materials.add(id(material))
+                    if material.name:
+                        material.name = prefixed(material.name)
+                    if material.texture and material.extensions.get("mjcf_texture"):
+                        material.texture = prefixed(material.texture)
+                        material.extensions["mjcf_texture"] = {
+                            **material.extensions["mjcf_texture"],
+                            "name": material.texture,
+                        }
 
         # Rewrite all joints and their references
         for joint in other_copy.joints:
@@ -831,13 +917,21 @@ class CommonSchema:
         # Rewrite all actuators and their references
         for actuator in other_copy.actuators:
             actuator.name = prefixed(actuator.name)
-            actuator.joint = prefixed(actuator.joint)
+            if actuator.joint:
+                actuator.joint = prefixed(actuator.joint)
+            transmission = actuator.get_mjcf_site_transmission()
+            if transmission is not None:
+                for reference in ("site", "refsite"):
+                    if reference in transmission:
+                        transmission[reference] = prefixed(transmission[reference])
 
         # Rewrite all sensors and their references
         for sensor in other_copy.sensors:
             sensor.name = prefixed(sensor.name)
             if sensor.parent_link != "world":
                 sensor.parent_link = prefixed(sensor.parent_link)
+            if sensor.extensions.get("mjcf_site"):
+                sensor.extensions["mjcf_site"] = prefixed(sensor.extensions["mjcf_site"])
 
         # Rewrite all contacts and their references
         for contact in other_copy.contacts:

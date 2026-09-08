@@ -259,7 +259,9 @@ class URDFExporter(BaseExporter):
             ET.SubElement(mat_elem, "color", rgba=rgba_str)
 
         if material.texture:
-            ET.SubElement(mat_elem, "texture", filename=material.texture)
+            # MJCF texture is an asset identifier; URDF needs its image path.
+            texture = material.extensions.get("mjcf_texture", {})
+            ET.SubElement(mat_elem, "texture", filename=texture.get("file", material.texture))
 
     def _write_pretty_xml(self, root: ET.Element, output_path: str | Path) -> None:
         """Write XML with pretty formatting."""

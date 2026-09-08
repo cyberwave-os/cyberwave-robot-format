@@ -165,17 +165,25 @@ def export_mujoco_zip_cloud(
         missing_meshes: list[str] = []
         missing_mesh_names: set[str] = set()
 
-        # Collect and copy mesh files
+        # Meshes and declared textures share the same cloud asset resolver and
+        # collision-safe archive namespace; never read a client-authored path.
         asset_elem = root.find("asset")
         if asset_elem is not None:
-            for mesh_elem in asset_elem.findall("mesh"):
-                mesh_file = mesh_elem.get("file")
+            references = [(item, "file") for item in asset_elem.findall("mesh")]
+            references.extend(
+                (item, field)
+                for item in asset_elem.findall("texture")
+                for field in ("file", "fileleft", "fileright", "fileup", "filedown", "filefront", "fileback")
+                if item.get(field)
+            )
+            for mesh_elem, file_attribute in references:
+                mesh_file = mesh_elem.get(file_attribute)
                 if not mesh_file:
                     continue
 
                 # Skip if already processed (deduplication)
                 if mesh_file in mesh_rewrite_map:
-                    mesh_elem.set("file", mesh_rewrite_map[mesh_file])
+                    mesh_elem.set(file_attribute, mesh_rewrite_map[mesh_file])
                     logger.debug(
                         f"Reusing existing mesh: {mesh_file} -> {mesh_rewrite_map[mesh_file]}"
                     )
@@ -201,7 +209,7 @@ def export_mujoco_zip_cloud(
                     # Generate unique asset name to avoid collisions
                     final_path = Path(final_filename)
                     basename = final_path.stem
-                    extension = final_path.suffix or ".obj"
+                    extension = final_path.suffix or (".png" if mesh_elem.tag == "texture" else ".obj")
 
                     # Handle duplicates
                     count = mesh_counter.get(basename, 0)
@@ -220,11 +228,13 @@ def export_mujoco_zip_cloud(
 
                     # Update rewrite map and XML
                     mesh_rewrite_map[mesh_file] = final_asset_name
-                    mesh_elem.set("file", final_asset_name)
+                    mesh_elem.set(file_attribute, final_asset_name)
                     logger.debug(
                         f"Updated XML mesh reference: {mesh_file} -> {final_asset_name}"
                     )
                 else:
+                    if mesh_elem.tag == "texture":
+                        raise FileNotFoundError(f"Missing texture asset: {mesh_file}")
                     # Mesh not found
                     missing_meshes.append(mesh_file)
                     mesh_name = mesh_elem.get("name")

@@ -38,6 +38,40 @@ from cyberwave_robot_format.schema import (
 from cyberwave_robot_format.urdf import URDFExporter
 
 
+@pytest.mark.parametrize("factor", [1.0, 2.0, -3.0, 1e-200, 1e200])
+def test_urdf_rotation_is_invariant_to_quaternion_magnitude(tmp_path, factor):
+    import numpy as np
+
+    orientation = Quaternion(0, factor, factor, 0)
+    schema = CommonSchema(
+        metadata=Metadata(name="scaled_rotation"),
+        links=[
+            Link(
+                name="body",
+                visuals=[
+                    Visual(
+                        pose=Pose(orientation=orientation),
+                        geometry=Geometry(type=GeometryType.BOX, size=Vector3(1, 2, 3)),
+                    )
+                ],
+            )
+        ],
+    )
+    destination = tmp_path / "robot.urdf"
+    URDFExporter().export(schema, destination)
+    rpy = [float(value) for value in ET.parse(destination).find(".//visual/origin").get("rpy").split()]
+    result = Quaternion.from_rpy(*rpy)
+    expected = np.array([0, 1 / math.sqrt(2), 1 / math.sqrt(2), 0])
+    assert abs(np.dot(result.to_list(), expected)) == pytest.approx(1)
+    assert orientation.to_list() == [0, factor, factor, 0], "Export must not mutate the source"
+
+
+@pytest.mark.parametrize("values", [[0, 0, 0, 0], [float("nan"), 0, 0, 1], [0, float("inf"), 0, 1]])
+def test_invalid_rotation_is_not_exported_as_a_plausible_pose(values):
+    with pytest.raises(ValueError, match="finite and nonzero"):
+        Quaternion(*values).to_rpy()
+
+
 class TestURDFExporterWorldLink:
     """Tests for world link injection in URDFExporter."""
 
