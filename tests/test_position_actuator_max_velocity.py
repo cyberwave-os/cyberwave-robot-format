@@ -34,7 +34,7 @@ from cyberwave_robot_format.schema import (
 )
 
 
-def _rail_schema(max_velocity):
+def _rail_schema(max_velocity, ramp_opt_in=False):
     """The rail bogie's contract: a prismatic joint on a position actuator."""
     return CommonSchema(
         metadata=Metadata(name="rail_bogie"),
@@ -73,6 +73,9 @@ def _rail_schema(max_velocity):
                 kp=100000.0,
                 kd=6000.0,
                 max_velocity=max_velocity,
+                extensions=(
+                    {"ramp_position_target": True} if ramp_opt_in else {}
+                ),
             )
         ],
     )
@@ -89,6 +92,16 @@ def _export(schema):
 def test_position_actuator_max_velocity_does_not_change_the_mjcf():
     """Declaring the governor is byte-identical to not declaring it."""
     assert _export(_rail_schema(2.0)) == _export(_rail_schema(None))
+
+
+def test_governor_opt_in_flag_does_not_change_the_mjcf():
+    """Same guarantee for the opt-in flag itself.
+
+    ``extensions.ramp_position_target`` is what actually turns the simulator's
+    governor on -- ``max_velocity`` only supplies its cap -- so the flag needs
+    the same proof: it is metadata for the simulator, invisible to physics.
+    """
+    assert _export(_rail_schema(2.0, ramp_opt_in=True)) == _export(_rail_schema(None))
 
 
 def test_position_actuator_ctrlrange_still_comes_from_joint_travel():
