@@ -385,3 +385,17 @@ class TestURDFExporterJointTypes:
 
         finally:
             Path(output_path).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("pitch", [math.pi / 2, -math.pi / 2, math.pi / 2 - 1e-7, -math.pi / 2 + 1e-7])
+@pytest.mark.parametrize("roll,yaw", [(0.0, 0.0), (0.7, -1.2), (-math.pi / 2, math.pi), (math.pi, math.pi / 2)])
+@pytest.mark.parametrize("scale", [1.0, -1.0, 7.0])
+def test_quaternion_gimbal_lock_preserves_rotation(pitch, roll, yaw, scale):
+    source = Quaternion.from_rpy(roll, pitch, yaw)
+    scaled = Quaternion(x=source.x * scale, y=source.y * scale, z=source.z * scale, w=source.w * scale)
+    restored = Quaternion.from_rpy(*scaled.to_rpy())
+    first = (source.x, source.y, source.z, source.w)
+    second = (restored.x, restored.y, restored.z, restored.w)
+    # Euler angles are not unique at the singularity; compare the rotation.
+    error = min(max(abs(a - sign * b) for a, b in zip(first, second)) for sign in (1, -1))
+    assert error < 1e-8

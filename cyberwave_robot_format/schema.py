@@ -135,7 +135,7 @@ class Quaternion:
 
         Inverse of :meth:`from_rpy`; returns ``(roll, pitch, yaw)`` in radians.
         Normalize without mutating the source: MJCF permits scaled nonzero
-        quaternions. Pitch is clamped at the gimbal-lock singularity.
+        quaternions. Gimbal-lock orientations retain their coupled roll/yaw rotation.
         """
         x, y, z, w = self.x, self.y, self.z, self.w
         values = (x, y, z, w)
@@ -146,20 +146,22 @@ class Quaternion:
         norm = math.hypot(*values)
         x, y, z, w = (value / norm for value in values)
 
-        # Roll (rotation about X).
-        sinr_cosp = 2.0 * (w * x + y * z)
-        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
-
-        # Pitch (rotation about Y), clamped to [-1, 1] against fp drift.
-        sinp = 2.0 * (w * y - z * x)
-        sinp = max(-1.0, min(1.0, sinp))
-        pitch = math.asin(sinp)
-
-        # Yaw (rotation about Z).
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
+        # Fixed XYZ is Rz(yaw) Ry(pitch) Rx(roll). At +/-90 degree
+        # pitch, roll and yaw are coupled: independent atan2(0, 0) calls
+        # can return a pair that describes a completely different rotation.
+        r00 = 1.0 - 2.0 * (y * y + z * z)
+        r10 = 2.0 * (w * z + x * y)
+        cos_pitch = math.hypot(r00, r10)
+        sin_pitch = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+        pitch = math.atan2(sin_pitch, cos_pitch)
+        if cos_pitch < 1e-12:
+            roll = 0.0
+            # Choose roll=0 and retain yaw-roll (+pitch) or yaw+roll
+            # (-pitch), both encoded by atan2(-R01, R11).
+            yaw = math.atan2(2.0 * (w * z - x * y), 1.0 - 2.0 * (x * x + z * z))
+        else:
+            roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+            yaw = math.atan2(r10, r00)
 
         return roll, pitch, yaw
 
