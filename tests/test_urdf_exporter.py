@@ -139,7 +139,7 @@ def test_urdf_bundle_reports_a_missing_declared_texture():
 def test_urdf_rotation_is_invariant_to_quaternion_magnitude(tmp_path, factor):
     import numpy as np
 
-    orientation = Quaternion(0, factor, factor, 0)
+    orientation = Quaternion(x=0, y=factor, z=factor, w=0)
     schema = CommonSchema(
         metadata=Metadata(name="scaled_rotation"),
         links=[
@@ -166,7 +166,7 @@ def test_urdf_rotation_is_invariant_to_quaternion_magnitude(tmp_path, factor):
 @pytest.mark.parametrize("values", [[0, 0, 0, 0], [float("nan"), 0, 0, 1], [0, float("inf"), 0, 1]])
 def test_invalid_rotation_is_not_exported_as_a_plausible_pose(values):
     with pytest.raises(ValueError, match="finite and nonzero"):
-        Quaternion(*values).to_rpy()
+        Quaternion.from_xyzw(values).to_rpy()
 
 
 class TestURDFExporterWorldLink:

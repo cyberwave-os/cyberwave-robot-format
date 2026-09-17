@@ -318,7 +318,7 @@ class MJCFParser(BaseParser):
             try:
                 quat_values = [float(x) for x in quat_str.split()]
                 if len(quat_values) == 4:
-                    orientation = Quaternion(quat_values[1], quat_values[2], quat_values[3], quat_values[0])
+                    orientation = Quaternion.from_wxyz(quat_values)
                     if body_pose is None:
                         body_pose = Pose(orientation=orientation)
                     else:
@@ -573,7 +573,7 @@ class MJCFParser(BaseParser):
                 try:
                     quat_values = [float(x) for x in quat_str.split()]
                     if len(quat_values) == 4:
-                        pose.orientation = Quaternion(quat_values[1], quat_values[2], quat_values[3], quat_values[0])
+                        pose.orientation = Quaternion.from_wxyz(quat_values)
                 except ValueError:
                     context.add_warning(f"Invalid geometry quaternion for link {link.name}")
 
@@ -680,7 +680,7 @@ class MJCFParser(BaseParser):
             try:
                 quat_vals = [float(x) for x in quat_str.split()]
                 if len(quat_vals) == 4:
-                    joint.pose.orientation = Quaternion(quat_vals[1], quat_vals[2], quat_vals[3], quat_vals[0])
+                    joint.pose.orientation = Quaternion.from_wxyz(quat_vals)
             except ValueError:
                 context.add_warning(f"Invalid joint quat for {joint_name}")
 
@@ -701,10 +701,10 @@ class MJCFParser(BaseParser):
                     and joint.pose.orientation.z == 0.0
                 ):
                     joint.pose.orientation = Quaternion(
-                        body_pose.orientation.x,
-                        body_pose.orientation.y,
-                        body_pose.orientation.z,
-                        body_pose.orientation.w,
+                        x=body_pose.orientation.x,
+                        y=body_pose.orientation.y,
+                        z=body_pose.orientation.z,
+                        w=body_pose.orientation.w,
                     )
 
         axis_str = joint_elem.get("axis")

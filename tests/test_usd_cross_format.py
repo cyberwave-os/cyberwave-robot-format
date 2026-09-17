@@ -857,7 +857,7 @@ class TestSchemaJsonIsCanonicalStraightFromTheParsers:
     def test_quaternion_coerces_int_components(self):
         from cyberwave_robot_format.schema import Quaternion
 
-        quat = Quaternion(0, 0, 0, 1)
+        quat = Quaternion(x=0, y=0, z=0, w=1)
         assert all(isinstance(value, float) for value in quat.to_list())
 
     def test_numpy_scalars_are_coerced_so_json_can_serialize_them(self):

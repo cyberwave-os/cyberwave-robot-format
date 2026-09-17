@@ -52,7 +52,7 @@ class Quaternion:
     def from_rpy(cls, roll: float, pitch: float, yaw: float) -> Quaternion:
         """Create quaternion from roll-pitch-yaw angles (Fixed XYZ convention)."""
         rotation = _geometry_core().quat.from_rpy(roll, pitch, yaw)
-        return cls(rotation.x, rotation.y, rotation.z, rotation.w)
+        return cls(x=rotation.x, y=rotation.y, z=rotation.z, w=rotation.w)
 
 
 @dataclass

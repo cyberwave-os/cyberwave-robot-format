@@ -9,6 +9,7 @@ format-specific information through extensions.
 from __future__ import annotations
 import math
 import re
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -115,10 +116,28 @@ class Quaternion:
         return [self.x, self.y, self.z, self.w]
 
     @classmethod
+    def from_wxyz(cls, values: Iterable[float]) -> "Quaternion":
+        """Read a ``w, x, y, z`` sequence -- MJCF's and MuJoCo's order.
+
+        Mirrors ``cyberwave_geometry.Quaternion.from_wxyz``. Named rather than
+        reordered by index at each call site: this class is ``x, y, z, w``
+        positionally, so ``Quaternion(v[1], v[2], v[3], v[0])`` is correct but
+        silently becomes wrong if either order ever moves.
+        """
+        w, x, y, z = values
+        return cls(x=float(x), y=float(y), z=float(z), w=float(w))
+
+    @classmethod
+    def from_xyzw(cls, values: Iterable[float]) -> "Quaternion":
+        """Read an ``x, y, z, w`` sequence -- protobuf, ROS and Three.js order."""
+        x, y, z, w = values
+        return cls(x=float(x), y=float(y), z=float(z), w=float(w))
+
+    @classmethod
     def from_rpy(cls, roll: float, pitch: float, yaw: float) -> "Quaternion":
         """Create quaternion from roll-pitch-yaw angles (Fixed XYZ convention)."""
         rotation = _geometry_core().quat.from_rpy(roll, pitch, yaw)
-        return cls(rotation.x, rotation.y, rotation.z, rotation.w)
+        return cls(x=rotation.x, y=rotation.y, z=rotation.z, w=rotation.w)
 
     def to_rpy(self) -> tuple[float, float, float]:
         """Convert to roll-pitch-yaw angles (Fixed XYZ convention).

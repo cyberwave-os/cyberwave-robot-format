@@ -129,7 +129,7 @@ def test_merge_with_spawn():
     
     spawn_pose = Pose(
         position=Vector3(1.0, 2.0, 3.0),
-        orientation=Quaternion(0.0, 0.0, 0.707, 0.707),
+        orientation=Quaternion(x=0.0, y=0.0, z=0.707, w=0.707),
     )
     
     base.merge_in(arm, "arm1", spawn_pose=spawn_pose)

@@ -22,16 +22,21 @@ __all__ = ["core"]
 _CACHE: Any = None
 
 _MISSING = (
-    "cyberwave-geometry is not installed.\n"
+    "cyberwave-geometry is not installed, so cyberwave-robot-format cannot do rotation "
+    "maths.\n"
     "\n"
-    "cyberwave-robot-format does not implement quaternion or transform maths; "
-    "it calls the shared geometry core, which ships a native library.\n"
+    "cyberwave-robot-format does not implement quaternion or transform maths; it "
+    "calls the shared geometry core, which ships a native library.\n"
     "\n"
-    "Install it with:\n"
-    "    pip install cyberwave-geometry\n"
+    "That package is NOT yet published to PyPI, so a plain `pip install "
+    "cyberwave-geometry` will not find it. This is a known gap; if you hit "
+    "this from a released build, please report it.\n"
     "\n"
-    "or, from a monorepo checkout:\n"
+    "From a monorepo checkout:\n"
     "    pip install common/geometry/bindings/python\n"
+    "\n"
+    "Cyberwave engineers can also install it from the internal Python "
+    "registry.\n"
 )
 
 
