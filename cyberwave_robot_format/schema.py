@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
+from ._geometry import core as _geometry_core
 
 
 class JointType(Enum):
@@ -115,20 +116,8 @@ class Quaternion:
     @classmethod
     def from_rpy(cls, roll: float, pitch: float, yaw: float) -> "Quaternion":
         """Create quaternion from roll-pitch-yaw angles (Fixed XYZ convention)."""
-
-        cy = math.cos(yaw * 0.5)
-        sy = math.sin(yaw * 0.5)
-        cp = math.cos(pitch * 0.5)
-        sp = math.sin(pitch * 0.5)
-        cr = math.cos(roll * 0.5)
-        sr = math.sin(roll * 0.5)
-
-        w = cr * cp * cy + sr * sp * sy
-        x = sr * cp * cy - cr * sp * sy
-        y = cr * sp * cy + sr * cp * sy
-        z = cr * cp * sy - sr * sp * cy
-
-        return cls(x, y, z, w)
+        rotation = _geometry_core().quat.from_rpy(roll, pitch, yaw)
+        return cls(rotation.x, rotation.y, rotation.z, rotation.w)
 
     def to_rpy(self) -> tuple[float, float, float]:
         """Convert to roll-pitch-yaw angles (Fixed XYZ convention).
@@ -137,33 +126,19 @@ class Quaternion:
         Normalize without mutating the source: MJCF permits scaled nonzero
         quaternions. Gimbal-lock orientations retain their coupled roll/yaw rotation.
         """
-        x, y, z, w = self.x, self.y, self.z, self.w
-        values = (x, y, z, w)
+        values = (self.x, self.y, self.z, self.w)
         scale = max(abs(value) for value in values)
         if not all(math.isfinite(value) for value in values) or scale == 0:
             raise ValueError("Rotation quaternion must be finite and nonzero")
-        values = tuple(value / scale for value in values)
-        norm = math.hypot(*values)
-        x, y, z, w = (value / norm for value in values)
-
-        # Fixed XYZ is Rz(yaw) Ry(pitch) Rx(roll). At +/-90 degree
-        # pitch, roll and yaw are coupled: independent atan2(0, 0) calls
-        # can return a pair that describes a completely different rotation.
-        r00 = 1.0 - 2.0 * (y * y + z * z)
-        r10 = 2.0 * (w * z + x * y)
-        cos_pitch = math.hypot(r00, r10)
-        sin_pitch = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
-        pitch = math.atan2(sin_pitch, cos_pitch)
-        if cos_pitch < 1e-12:
-            roll = 0.0
-            # Choose roll=0 and retain yaw-roll (+pitch) or yaw+roll
-            # (-pitch), both encoded by atan2(-R01, R11).
-            yaw = math.atan2(2.0 * (w * z - x * y), 1.0 - 2.0 * (x * x + z * z))
-        else:
-            roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
-            yaw = math.atan2(r10, r00)
-
-        return roll, pitch, yaw
+        # Scale down before handing the value to the core: its normalization
+        # rejects a norm below 1e-9 and overflows on one above sqrt(DBL_MAX),
+        # while MJCF permits any nonzero magnitude. Dividing by the largest
+        # component leaves a norm in [1, 2] without changing the rotation.
+        geometry = _geometry_core()
+        rpy = geometry.quat.to_rpy(
+            geometry.Quaternion.from_xyzw(tuple(value / scale for value in values))
+        )
+        return rpy.roll, rpy.pitch, rpy.yaw
 
 
 @dataclass

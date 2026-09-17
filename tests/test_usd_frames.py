@@ -327,6 +327,33 @@ class TestQuaternionHelpers:
     def test_zero_quaternion_reads_as_identity(self):
         assert np.allclose(quat_to_matrix(Quaternion(w=0.0)), np.eye(3))
 
+    @pytest.mark.parametrize("scale", [2.0, 0.001, (3.0, 1.0, 0.5)])
+    def test_scale_baked_into_the_matrix_is_divided_out(self, scale):
+        # An authored `xformOp:transform` carries scale in its upper-left 3x3,
+        # and `matrix_to_pose` reads that block directly. The rotation has to
+        # survive it: the shared core's from_matrix rejects a scaled matrix as
+        # not orthonormal, so the scale is removed before it gets there.
+        quat = Quaternion(x=0.1826, y=0.3651, z=0.5477, w=0.7303)
+        scaled = quat_to_matrix(quat) @ np.diag(np.broadcast_to(scale, 3))
+        assert np.allclose(
+            quat_to_matrix(matrix_to_quat(scaled)), quat_to_matrix(quat), atol=1e-9
+        )
+
+    @pytest.mark.parametrize(
+        "matrix",
+        [
+            np.diag([-1.0, 1.0, 1.0]),  # mirrored: negative scale, det < 0
+            np.diag([1.0, 1.0, 0.0]),  # collapsed: a zero column
+        ],
+    )
+    def test_a_matrix_that_is_not_a_rotation_reads_as_identity(self, matrix, caplog):
+        # Neither is expressible as a quaternion, and one such prim must not
+        # fail a whole USD import -- but it does get logged.
+        with caplog.at_level(logging.WARNING):
+            recovered = matrix_to_quat(matrix)
+        assert recovered == Quaternion()
+        assert "not a rotation matrix" in caplog.text.lower()
+
     def test_quat_multiply_matches_matrix_composition(self):
         rng = np.random.default_rng(11)
         for _ in range(100):

@@ -23,6 +23,20 @@ keywords = [
     "format-conversion",
 ]
 dependencies = [
+    # NOTE: `cyberwave-geometry` is a real runtime dependency of this package's
+    # rotation maths and is deliberately NOT declared yet. It is published to no
+    # index, so declaring it makes installation fail outright:
+    #   ERROR: Could not find a version that satisfies the requirement
+    #          cyberwave-geometry<0.2.0,>=0.1.1 (from versions: none)
+    # which is what broke the "Build Robot Format prerelease" job.
+    #
+    # Until it is published, `_geometry.py` imports it lazily, so only the code
+    # paths that actually do rotation maths need it at all, and CI installs it
+    # from the checkout (.github/actions/setup-geometry-core) for jobs that do.
+    #
+    # To declare it properly: publish the platform wheels, then add
+    #   "cyberwave-geometry>=0.2.0,<0.3.0",
+    # back here. See common/geometry/docs/MIGRATION.md.
     "numpy>=1.20.0",
     "lxml>=4.6.0",
     "defusedxml>=0.7.0",

@@ -23,7 +23,6 @@ the package. USD matrices are row-vector; that transpose is likewise confined to
 from __future__ import annotations
 
 import logging
-import math
 from collections import deque
 
 import numpy as np
@@ -36,6 +35,7 @@ from cyberwave_robot_format.schema import (
     Vector3,
 )
 from cyberwave_robot_format.usd.tokens import AXIS_TOKENS, REF_AXIS_TOKEN, WORLD_LINK
+from .._geometry import core as _geometry_core
 
 logger = logging.getLogger(__name__)
 
@@ -53,94 +53,98 @@ REF_AXIS_VECTORS: dict[str, np.ndarray] = {
 # --------------------------------------------------------------------------
 
 
+#: How far a matrix may drift from orthonormal before ``matrix_to_quat``
+#: refuses it. Looser than the core's 1e-6 default because these matrices come
+#: back from USD and from chained float32 transforms, where accumulated error
+#: is ordinary rather than a sign of a bug.
+_MATRIX_TOLERANCE = 1e-4
+
+
+def _to_core(q: Quaternion):
+    """This package's ``xyzw`` dataclass to the shared core's named type."""
+    return _geometry_core().Quaternion.from_xyzw((q.x, q.y, q.z, q.w))
+
+
 def quat_to_matrix(q: Quaternion) -> np.ndarray:
-    """Return the 3x3 rotation matrix for ``q`` (normalizing defensively)."""
-    x, y, z, w = q.x, q.y, q.z, q.w
-    n = math.sqrt(x * x + y * y + z * z + w * w)
-    if n < _EPS:
-        # A zero quaternion is meaningless; identity is the only safe reading and
-        # is what a caller comparing against Quaternion() would expect.
-        return np.eye(3)
-    x, y, z, w = x / n, y / n, z / n, w / n
-    return np.array(
-        [
-            [
-                1.0 - 2.0 * (y * y + z * z),
-                2.0 * (x * y - z * w),
-                2.0 * (x * z + y * w),
-            ],
-            [
-                2.0 * (x * y + z * w),
-                1.0 - 2.0 * (x * x + z * z),
-                2.0 * (y * z - x * w),
-            ],
-            [
-                2.0 * (x * z - y * w),
-                2.0 * (y * z + x * w),
-                1.0 - 2.0 * (x * x + y * y),
-            ],
-        ]
-    )
+    """Return the 3x3 rotation matrix for ``q`` (normalizing defensively).
+
+    A zero quaternion is meaningless; identity is the only safe reading and is
+    what a caller comparing against ``Quaternion()`` would expect, so the
+    lenient adapter rather than the strict core entry point.
+    """
+    geometry = _geometry_core()
+    rotation = geometry.compat.normalize_quaternion_or_identity(_to_core(q))
+    return np.array(geometry.quat.to_matrix(rotation)).reshape(3, 3)
 
 
 def matrix_to_quat(matrix: np.ndarray) -> Quaternion:
     """Return the unit quaternion for a 3x3 rotation matrix.
 
-    Uses Shepperd's method: pick the branch whose divisor is largest so the
-    square root never operates on a near-zero value. The sign is canonicalized
-    to ``w >= 0`` because ``q`` and ``-q`` are the same rotation but compare
-    unequal as dataclasses, and a deterministic choice is what makes
-    export -> parse -> export byte-stable.
+    A USD parsing boundary, so lenient in the two ways the matrices that
+    actually arrive here demand -- the strict core entry point is
+    ``geometry.quat.from_matrix``, and it is what does the conversion:
+
+    * **Scale is divided out first.** An authored ``xformOp:transform``
+      routinely bakes scale into its upper-left 3x3, and a chain of float32
+      transforms arrives a little off unit length either way. Each column is
+      divided by its norm, which removes positive scale without touching the
+      rotation. Without this the strict core entry point would reject every
+      scaled prim, so it is what keeps those parsing at all.
+
+      Note this **changes the rotation exported for a scaled prim**, and not
+      subtly. The trace formula used before the migration *tolerated* scale --
+      it returned a quaternion rather than raising -- but it did not ignore
+      it: for a uniformly scaled ``s*R`` the trace branch gives
+      ``x/w = s*(r21 - r12) / (s*T + 1)`` against the true
+      ``(r21 - r12) / (T + 1)``, and the trailing normalize preserves that
+      ratio, so the two agree only at ``s == 1``. Measured against a generic
+      rotation, the old result was off by 7.9 degrees at ``s = 2``, 16.0 at
+      ``s = 10`` and 23.4 at ``s = 0.25``. Dividing the scale out is therefore
+      a bug fix, not merely a way to avoid an error, and a scaled prim that
+      round-tripped before will now round-trip to a different -- correct --
+      rotation.
+    * **A matrix that is still not a rotation reads as identity**, with a
+      warning. Mirroring (negative scale) and shear cannot be expressed as a
+      quaternion at all; identity is what this returned for them before, and
+      failing a whole USD import over one such prim is worse than dropping a
+      rotation that was never representable. The warning is so it is not
+      silent, which is the part that *was* wrong before.
     """
-    m = np.asarray(matrix, dtype=np.float64)
-    trace = m[0, 0] + m[1, 1] + m[2, 2]
-
-    if trace > 0.0:
-        s = math.sqrt(trace + 1.0) * 2.0
-        w = 0.25 * s
-        x = (m[2, 1] - m[1, 2]) / s
-        y = (m[0, 2] - m[2, 0]) / s
-        z = (m[1, 0] - m[0, 1]) / s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
-        w = (m[2, 1] - m[1, 2]) / s
-        x = 0.25 * s
-        y = (m[0, 1] + m[1, 0]) / s
-        z = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
-        w = (m[0, 2] - m[2, 0]) / s
-        x = (m[0, 1] + m[1, 0]) / s
-        y = 0.25 * s
-        z = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
-        w = (m[1, 0] - m[0, 1]) / s
-        x = (m[0, 2] + m[2, 0]) / s
-        y = (m[1, 2] + m[2, 1]) / s
-        z = 0.25 * s
-
-    if w < 0.0:
-        x, y, z, w = -x, -y, -z, -w
-    return normalize_quat(Quaternion(x=x, y=y, z=z, w=w))
+    geometry = _geometry_core()
+    values = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    column_norms = np.linalg.norm(values, axis=0)
+    if bool(np.all(column_norms > _EPS)):
+        values = values / column_norms
+    try:
+        core = geometry.quat.from_matrix(
+            [float(component) for component in values.reshape(9)],
+            tolerance=_MATRIX_TOLERANCE,
+        )
+    except geometry.GeometryError as error:
+        logger.warning(
+            "Not a rotation matrix (%s); reading it as identity: %s",
+            error,
+            np.array2string(np.asarray(matrix, dtype=np.float64), precision=6),
+        )
+        return Quaternion()
+    # Canonicalize the sign here, not in the core: q and -q are the same
+    # rotation, but they compare unequal as dataclasses, and export -> parse ->
+    # export has to be byte-stable. The core deliberately does not pick a sign.
+    if core.w < 0.0:
+        core = geometry.Quaternion(x=-core.x, y=-core.y, z=-core.z, w=-core.w)
+    return Quaternion(x=core.x, y=core.y, z=core.z, w=core.w)
 
 
 def normalize_quat(q: Quaternion) -> Quaternion:
     """Return ``q`` scaled to unit length (identity if degenerate)."""
-    n = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
-    if n < _EPS:
-        return Quaternion()
-    return Quaternion(x=q.x / n, y=q.y / n, z=q.z / n, w=q.w / n)
+    core = _geometry_core().compat.normalize_quaternion_or_identity(_to_core(q))
+    return Quaternion(x=core.x, y=core.y, z=core.z, w=core.w)
 
 
 def quat_multiply(a: Quaternion, b: Quaternion) -> Quaternion:
     """Return the Hamilton product ``a ⊗ b`` (apply ``b`` first, then ``a``)."""
-    return Quaternion(
-        x=a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        y=a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        z=a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        w=a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-    )
+    core = _geometry_core().quat.multiply(_to_core(a), _to_core(b))
+    return Quaternion(x=core.x, y=core.y, z=core.z, w=core.w)
 
 
 def pose_to_matrix(pose: Pose) -> np.ndarray:
