@@ -11,6 +11,10 @@ This package provides:
 - **Format Exporters**: Export universal schema to URDF, MJCF, USD
 - **Validation**: Schema validation and consistency checks
 
+MJCF export omits all-zero visual boxes used on frame-only links, retaining the
+link, joints and collision shapes. Invalid collision boxes and partially zero
+or negative visual dimensions still fail MuJoCo compilation; they are not removed.
+
 ## Structure
 
 ```
@@ -103,6 +107,14 @@ conversion looks wrong.
 
 ### Parse MJCF (MuJoCo)
 
+Common-schema JSON reads also accept the older catalog actuator name `motor`.
+It becomes `dc_motor`, with `limits.effort` and `limits.velocity` mapped to
+`max_torque` and `max_velocity` when those canonical fields are absent.
+Explicit canonical fields, including zero or null, take precedence. Legacy
+limits must be finite, non-negative numbers. Descriptive gearbox ratios in
+`extensions` remain metadata; they do not change the output torque convention.
+This compatibility read does not rewrite saved assets or enable hardware control.
+
 ```python
 from cyberwave_robot_format.mjcf import MJCFParser
 
@@ -131,6 +143,18 @@ transmissions; retain the common-schema artifact instead of round-tripping throu
 URDF. Current site import supports quaternion/vector orientations and inline
 colors; canonicalize Euler/axis-angle/material-based sites first. Unsupported
 site servos, malformed extensions and missing transmission frames fail explicitly.
+
+Body adhesion actuators use `type: "adhesion"`, an empty `joint`, a nonnegative
+`control_range`, and `extensions.mjcf_adhesion: {"body": "suction_cup", "gain": "20"}`.
+The gain is in newtons per control unit; this example is not a hardware rating.
+Optional force limits use `force_range`; the native extension also accepts
+`group` and `forcelimited`. Import resolves nested adhesion defaults, storage
+retains the binding, and scene composition prefixes the body and actuator together.
+Missing bodies, malformed limits and unsupported MJCF attributes fail explicitly.
+Adhesion applies contact-normal force; it does not model a vacuum seal, imply
+successful grasping, or configure a controller command. Keep the common schema
+when moving between formats: URDF does not represent this native actuator.
+See [MuJoCo adhesion](https://mujoco.readthedocs.io/en/stable/XMLreference.html#actuator-adhesion).
 
 MJCF imports retain nested joint/geometry defaults and body `childclass`
 overrides, including inherited limits, collision settings and visual shapes.
@@ -262,6 +286,17 @@ not enable it for schemas from an untrusted source.
 
 Things worth knowing:
 
+- **Exact local poses.** Rotated visuals, collisions and sensors carry their
+  original position and quaternion in `cyberwave:pose:*`, alongside the native
+  matrix. This prevents small numeric changes on repeated export/import. As with
+  joint sidecars, these values take precedence when importing; external editors
+  changing the matrix should update or remove the sidecars as well. Older and
+  foreign stages without them retain native transform decomposition.
+- **Embedded JSON.** Metadata is limited to 256 nested arrays/objects, independently
+  of Python's recursion behavior. Import logs and ignores only the offending
+  attribute or `customData` value; export rejects excessive depth rather than
+  emitting data its reader would discard. This does not limit scene hierarchy or
+  mesh size, and brackets inside strings do not count as nesting.
 - **Angles.** USD stores angular joint limits and drive targets in degrees; the
   schema uses radians. The conversion is automatic, and the `cyberwave:` sidecars
   are always in schema units.
@@ -294,6 +329,18 @@ Things worth knowing:
   warning — so both appearances survive the round trip.
 
 Since v0.1.6.
+
+### Export positional loop closures to MuJoCo
+
+For a closed-chain robot, declare link-frame pairs in
+`schema.extensions["loop_closures"]`, for example
+`[{"frame_a": "rod_tip", "frame_b": "platform_tip"}]`.
+MuJoCo connects the two frame origins even if they differ in the zero pose.
+Only full `xyz` position constraints are currently supported by this exporter;
+other axis selections fail explicitly. Composition prefixes both frame names.
+Mark unpowered joints with `joint.extensions["passive"] = True` to exclude them
+from fallback motors. Author active actuators and physical properties separately;
+successful export does not establish stable dynamics or collision-free motion.
 
 ### Infer URDF mimic joints (gripper coupling)
 

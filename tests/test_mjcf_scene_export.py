@@ -2,9 +2,11 @@ import io
 import zipfile
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import pytest
 
 from cyberwave_robot_format.mjcf import export_mujoco_zip_cloud
+from cyberwave_robot_format.mjcf.utils import sanitize_inertia
 from cyberwave_robot_format.schema import (
     Actuator,
     ActuatorType,
@@ -22,6 +24,115 @@ from cyberwave_robot_format.schema import (
     Vector3,
     Visual,
 )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_empty_visual_box_keeps_frames_joints_and_collision(nested, caplog) -> None:
+    solid = Geometry(type=GeometryType.BOX, size=Vector3(0.1, 0.2, 0.3))
+    empty = Geometry(type=GeometryType.BOX, size=Vector3(0, 0, 0))
+    marker = Link(
+        name="marker",
+        mass=0.1,
+        inertia=Inertia(ixx=0.001, iyy=0.001, izz=0.001),
+        visuals=[Visual(geometry=empty), Visual(geometry=solid)],
+        collisions=[Collision(name="solid_collision", geometry=solid)],
+    )
+    schema = CommonSchema(metadata=Metadata(name="frame_marker"), links=[marker])
+    if nested:
+        schema.links.insert(0, Link(name="base"))
+        schema.joints.append(
+            Joint(
+                name="marker_joint",
+                type=JointType.REVOLUTE,
+                parent_link="base",
+                child_link="marker",
+                axis=Vector3(0, 0, 1),
+                limits=JointLimits(lower=-1, upper=1),
+            )
+        )
+    archive = export_mujoco_zip_cloud(schema, mesh_resolver=lambda _: None)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        xml = zf.read("mujoco_scene.xml").decode()
+    root = ET.fromstring(xml)
+    body = root.find(".//body[@name='marker']")
+    assert body is not None
+    assert len(body.findall("geom")) == 2
+    assert body.find("geom[@name='solid_collision']") is not None
+    assert "Omitting empty visual box on body marker" in caplog.text
+    assert empty.size == Vector3(0, 0, 0)
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(xml)
+    assert model.body("marker").id > 0
+    if nested:
+        assert model.joint("marker_joint").id >= 0
+    data = mujoco.MjData(model)
+    mujoco.mj_step(model, data, nstep=20)
+    assert np.isfinite(data.qpos).all()
+
+
+@pytest.mark.parametrize(
+    "collision,size", [(True, (0, 0, 0)), (False, (0, 1, 1)), (False, (-1, 0, 0))]
+)
+def test_export_does_not_hide_invalid_collision_or_nonempty_box(
+    collision, size
+) -> None:
+    geometry = Geometry(type=GeometryType.BOX, size=Vector3(*size))
+    link = Link(name="invalid")
+    if collision:
+        link.collisions.append(Collision(geometry=geometry))
+    else:
+        link.visuals.append(Visual(geometry=geometry))
+    archive = export_mujoco_zip_cloud(
+        CommonSchema(metadata=Metadata(name="invalid"), links=[link]),
+        mesh_resolver=lambda _: None,
+    )
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        xml = zf.read("mujoco_scene.xml").decode()
+    assert ET.fromstring(xml).find(".//worldbody//geom") is not None
+    mujoco = pytest.importorskip("mujoco")
+    with pytest.raises(ValueError, match="size .* must be positive"):
+        mujoco.MjModel.from_xml_string(xml)
+
+
+def test_export_repairs_anymal_camera_principal_inertia() -> None:
+    # Public ANYmal C camera tensor: positive definite with valid diagonals,
+    # but its principal moments fail MuJoCo's rigid-body triangle inequality.
+    inertia = Inertia(
+        ixx=0.000637051, iyy=0.000929402, izz=0.000484569, ixy=0.000484569, ixz=0.000424211, iyz=0.000005138
+    )
+    schema = CommonSchema(
+        metadata=Metadata(name="anymal_camera"), links=[Link(name="camera", mass=0.16043, inertia=inertia)]
+    )
+    archive = export_mujoco_zip_cloud(schema, mesh_resolver=lambda _: None)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        xml = zf.read("mujoco_scene.xml").decode()
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(xml)
+    moments = np.sort(model.body_inertia[model.body("camera").id])
+    assert moments[0] > 0
+    assert moments[0] + moments[1] >= moments[2]
+
+
+@pytest.mark.parametrize("moments", [(1.0, 1.0, 3.0), (1.0, 2.0, 2.5)])
+def test_inertia_repair_is_frame_independent(moments) -> None:
+    angle = 0.73
+    rotation = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
+    tensor = rotation @ np.diag(moments) @ rotation.T
+    link = Link(
+        name="rotated",
+        mass=1.0,
+        inertia=Inertia(
+            ixx=tensor[0, 0], iyy=tensor[1, 1], izz=tensor[2, 2], ixy=tensor[0, 1], ixz=tensor[0, 2], iyz=tensor[1, 2]
+        ),
+    )
+    result = sanitize_inertia(link)
+    repaired = np.array(
+        [[result[0], result[3], result[4]], [result[3], result[1], result[5]], [result[4], result[5], result[2]]]
+    )
+    expected = np.array(moments)
+    if sum(moments[:2]) < moments[2]:
+        expected[:2] += (moments[2] * 1.01 - sum(moments[:2])) / 2
+    np.testing.assert_allclose(repaired, rotation @ np.diag(expected) @ rotation.T, atol=1e-12)
 
 
 def _mesh_schema() -> CommonSchema:
@@ -56,11 +167,7 @@ def test_export_mujoco_zip_cloud_falls_back_when_mesh_is_missing() -> None:
 
     geoms = root.findall(".//worldbody//geom")
     assert all(geom.get("mesh") is None for geom in geoms)
-    collision_geoms = [
-        geom
-        for geom in geoms
-        if geom.get("class") == "collision" or geom.get("group") == "3"
-    ]
+    collision_geoms = [geom for geom in geoms if geom.get("class") == "collision" or geom.get("group") == "3"]
     assert len(collision_geoms) == 1
     assert collision_geoms[0].get("type") == "box"
     assert collision_geoms[0].get("size") == "0.025 0.025 0.025"
@@ -75,9 +182,7 @@ def test_export_mujoco_zip_cloud_can_require_meshes() -> None:
         )
 
 
-def test_export_mujoco_zip_cloud_adds_valid_inertial_for_moving_zero_mass_link() -> (
-    None
-):
+def test_export_mujoco_zip_cloud_adds_valid_inertial_for_moving_zero_mass_link() -> None:
     schema = CommonSchema(
         metadata=Metadata(name="zero_mass_joint_scene"),
         links=[
@@ -126,9 +231,7 @@ def _arm_schema(
         metadata=Metadata(name="continuous_joint_scene"),
         links=[
             Link(name="base", mass=1.0, inertia=Inertia(ixx=0.1, iyy=0.1, izz=0.1)),
-            Link(
-                name="spinner", mass=0.5, inertia=Inertia(ixx=0.01, iyy=0.01, izz=0.01)
-            ),
+            Link(name="spinner", mass=0.5, inertia=Inertia(ixx=0.01, iyy=0.01, izz=0.01)),
             Link(name="elbow", mass=0.5, inertia=Inertia(ixx=0.01, iyy=0.01, izz=0.01)),
         ],
         joints=[
@@ -164,9 +267,7 @@ def test_continuous_joint_exports_unlimited_even_with_limits() -> None:
     # messy source URDF) must still export as an honest limited="false" free
     # hinge with no positional range — the limits are ignored, not lied about.
     schema = _arm_schema(
-        continuous_limits=JointLimits(
-            lower=-62.83, upper=62.83, effort=39.0, velocity=1.0
-        ),
+        continuous_limits=JointLimits(lower=-62.83, upper=62.83, effort=39.0, velocity=1.0),
         continuous_home=None,
     )
     zip_bytes = export_mujoco_zip_cloud(schema, mesh_resolver=lambda _: None)
@@ -191,9 +292,7 @@ def test_continuous_joint_actuator_ctrlrange_is_home_plus_minus_pi() -> None:
     import math
 
     schema = _arm_schema(
-        continuous_limits=JointLimits(
-            lower=-62.83, upper=62.83, effort=39.0, velocity=1.0
-        ),
+        continuous_limits=JointLimits(lower=-62.83, upper=62.83, effort=39.0, velocity=1.0),
         continuous_home=None,  # → home 0.0 → ctrlrange [-π, π]
     )
     zip_bytes = export_mujoco_zip_cloud(schema, mesh_resolver=lambda _: None)

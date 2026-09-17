@@ -14,13 +14,15 @@
 
 """Unit tests for URDFExporter."""
 
+import io
 import math
 import tempfile
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import pytest
-
+from cyberwave_robot_format.mjcf import export_mujoco_zip_cloud
 from cyberwave_robot_format.schema import (
     Collision,
     CommonSchema,
@@ -29,13 +31,108 @@ from cyberwave_robot_format.schema import (
     Joint,
     JointType,
     Link,
+    Material,
     Metadata,
     Pose,
     Quaternion,
     Vector3,
     Visual,
 )
-from cyberwave_robot_format.urdf import URDFExporter
+from cyberwave_robot_format.urdf import URDFExporter, export_urdf_zip_cloud
+
+
+@pytest.mark.parametrize("format_name", ["urdf", "mjcf"])
+def test_scene_bundle_never_overwrites_a_pre_suffixed_filename(format_name):
+    """foot, foot, foot_1 must remain three distinct resources after flattening."""
+    files = {
+        "asset://robot_a/foot.obj": ("foot.obj", b"robot a"),
+        "asset://robot_b/foot.obj": ("foot.obj", b"robot b"),
+        "asset://robot_c/foot_1.obj": ("foot_1.obj", b"robot c"),
+    }
+    schema = CommonSchema(metadata=Metadata(name="multiple_robots"))
+    for i, source in enumerate([*files, next(iter(files))]):
+        schema.merge_in(
+            CommonSchema(
+                metadata=Metadata(name="robot"),
+                links=[
+                    Link(
+                        name="foot",
+                        visuals=[Visual(geometry=Geometry(type=GeometryType.MESH, filename=source))],
+                    )
+                ],
+            ),
+            instance_name=f"robot_{i}",
+            spawn_pose=Pose(),
+        )
+    calls = []
+
+    def resolve(source):
+        calls.append(source)
+        return files[source]
+
+    exporter = export_urdf_zip_cloud if format_name == "urdf" else export_mujoco_zip_cloud
+    with zipfile.ZipFile(io.BytesIO(exporter(schema, resolve))) as bundle:
+        if format_name == "urdf":
+            root = ET.fromstring(bundle.read("scene.urdf"))
+            paths = [root.find(f"link[@name='robot_{i}__foot']/visual/geometry/mesh").get("filename") for i in range(4)]
+        else:
+            root = ET.fromstring(bundle.read("mujoco_scene.xml"))
+            meshes = {m.get("name"): m.get("file") for m in root.findall("asset/mesh")}
+            paths = [
+                "assets/" + meshes[root.find(f".//body[@name='robot_{i}__foot']/geom").get("mesh")] for i in range(4)
+            ]
+        assert [bundle.read(path) for path in paths] == [b"robot a", b"robot b", b"robot c", b"robot a"]
+        assert len(set(paths)) == 3
+    assert calls == list(files)
+    assert schema.links[0].visuals[0].geometry.filename == next(iter(files))
+
+
+@pytest.mark.parametrize("from_mjcf", [False, True])
+def test_urdf_bundle_contains_the_declared_texture(from_mjcf):
+    source = "asset://robot/meshes/body.png"
+    material = Material(name="paint", texture="paint_image" if from_mjcf else source)
+    if from_mjcf:
+        material.extensions["mjcf_texture"] = {"name": "paint_image", "file": source}
+    schema = CommonSchema(
+        metadata=Metadata(name="textured"),
+        links=[
+            Link(
+                name="base",
+                visuals=[
+                    Visual(
+                        geometry=Geometry(type=GeometryType.BOX, size=Vector3(1, 1, 1)),
+                        material=material,
+                    )
+                ],
+            )
+        ],
+    )
+    archive = export_urdf_zip_cloud(schema, lambda filename: ("body.png", b"image") if filename == source else None)
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        root = ET.fromstring(bundle.read("scene.urdf"))
+        texture = root.find("link/visual/material/texture").get("filename")
+        assert texture.startswith("assets/")
+        assert bundle.read(texture) == b"image"
+    assert material.texture == ("paint_image" if from_mjcf else source)
+
+
+def test_urdf_bundle_reports_a_missing_declared_texture():
+    schema = CommonSchema(
+        metadata=Metadata(name="missing_texture"),
+        links=[
+            Link(
+                name="base",
+                visuals=[
+                    Visual(
+                        geometry=Geometry(type=GeometryType.BOX, size=Vector3(1, 1, 1)),
+                        material=Material(name="paint", texture="asset://robot/missing.png"),
+                    )
+                ],
+            )
+        ],
+    )
+    with pytest.raises(FileNotFoundError, match="texture.*missing.png"):
+        export_urdf_zip_cloud(schema, lambda _: None)
 
 
 @pytest.mark.parametrize("factor", [1.0, 2.0, -3.0, 1e-200, 1e200])

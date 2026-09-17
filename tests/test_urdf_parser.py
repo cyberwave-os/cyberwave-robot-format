@@ -488,12 +488,30 @@ def test_gazebo_ray_3d_multiplies_samples_across_both_axes(sensors_by_name):
     assert params["fov_horizontal"] == pytest.approx(360.0, abs=1e-3)
     assert params["fov_vertical"] == pytest.approx(30.0, abs=1e-2)
     assert params["points_per_second"] == 360 * 16 * 10
+    assert params["horizontal_samples"] == 360
+    assert params["vertical_samples"] == 16
+    assert params["yaw_offset"] == pytest.approx(0.0)
+    assert params["pitch_offset"] == pytest.approx(0.0)
 
 
 def test_gazebo_ray_emits_hfov_rad_alongside_the_degree_field(sensors_by_name):
     params = sensors_by_name["planar_scanner"].parameters
     assert params["hfov_rad"] == pytest.approx(2.35619449615 * 2)
     assert params["hfov_rad"] == pytest.approx(math.radians(params["fov_horizontal"]))
+
+
+def test_gazebo_ray_preserves_asymmetric_vertical_scan(sensor_urdf_path):
+    source = sensor_urdf_path.read_text().replace(
+        "<min_angle>-0.261799</min_angle>", "<min_angle>0</min_angle>"
+    )
+    sensor_urdf_path.write_text(source)
+    sensor = next(
+        s
+        for s in URDFParser().parse(sensor_urdf_path).sensors
+        if s.name == "dome_scanner"
+    )
+    assert sensor.parameters["pitch_offset"] == pytest.approx(0.261799 / 2)
+    assert sensor.parameters["vfov_rad"] == pytest.approx(0.261799)
 
 
 def test_gazebo_ray_3d_emits_both_hfov_rad_and_vfov_rad(sensors_by_name):

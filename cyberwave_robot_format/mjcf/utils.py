@@ -53,7 +53,7 @@ def sanitize_inertia(link: Link) -> tuple[float, float, float, float, float, flo
 
     matrix = np.array([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]])
 
-    eigvals = np.linalg.eigvals(matrix)
+    eigvals, axes = np.linalg.eigh(matrix)
 
     max_eig = np.max(np.abs(eigvals))
     min_eig = np.min(eigvals)
@@ -69,27 +69,16 @@ def sanitize_inertia(link: Link) -> tuple[float, float, float, float, float, flo
         logger.warning(
             "Fixed invalid inertia for link '%s': %s (forced to diagonal %.2e).", link.name, reason, safe_val
         )
+        return ixx, iyy, izz, ixy, ixz, iyz
 
-    diags = sorted([ixx, iyy, izz])
-    if diags[0] + diags[1] < diags[2]:
-        required_sum = diags[2] * 1.01
-        diff = required_sum - (diags[0] + diags[1])
-        boost = diff / 2.0
-
-        if ixx == diags[0]:
-            ixx += boost
-        elif iyy == diags[0]:
-            iyy += boost
-        else:
-            izz += boost
-
-        if ixx == diags[1]:
-            ixx += boost
-        elif iyy == diags[1]:
-            iyy += boost
-        else:
-            izz += boost
-
+    # The triangle inequality applies to principal moments, not the diagonal
+    # entries of a tensor expressed in an arbitrary link frame. Preserve those
+    # principal axes while increasing the two smaller moments when necessary.
+    if eigvals[0] + eigvals[1] < eigvals[2]:
+        eigvals[:2] += (eigvals[2] * 1.01 - eigvals[0] - eigvals[1]) / 2.0
+        repaired = (axes * eigvals) @ axes.T
+        ixx, iyy, izz = (float(repaired[i, i]) for i in range(3))
+        ixy, ixz, iyz = float(repaired[0, 1]), float(repaired[0, 2]), float(repaired[1, 2])
         logger.warning("Fixed inertia triangle inequality for link '%s'", link.name)
 
     return ixx, iyy, izz, ixy, ixz, iyz

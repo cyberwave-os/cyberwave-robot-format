@@ -5,6 +5,75 @@ import pytest
 from cyberwave_robot_format.schema import CommonSchema, Joint, JointType, Link, Metadata, Vector3
 
 
+def test_catalog_motor_actuators_preserve_limits_through_scene_export(tmp_path):
+    import copy
+    import xml.etree.ElementTree as ET
+
+    from cyberwave_robot_format.mjcf import MJCFExporter
+    from cyberwave_robot_format.schema import ActuatorType
+
+    source = CommonSchema(
+        metadata=Metadata(name="catalog_motor"),
+        links=[Link(name="base"), Link(name="finger")],
+        joints=[Joint(name="jointGripper", type=JointType.REVOLUTE, parent_link="base", child_link="finger")],
+    ).to_dict()
+    source["actuators"] = [
+        {
+            "name": "gripper_actuator",
+            "type": "motor",
+            "joint": "jointGripper",
+            "limits": {"effort": 30.0, "velocity": 3.1415},
+            "extensions": {"model": "Unitree Custom Actuator", "gear_ratio": 9},
+        }
+    ]
+    before = copy.deepcopy(source)
+    schema = CommonSchema.from_dict(source)
+    actuator = schema.actuators[0]
+    assert actuator.type == ActuatorType.DC_MOTOR
+    assert actuator.max_torque == 30.0
+    assert actuator.max_velocity == 3.1415
+    # The descriptive gearbox ratio is not a motor-shaft control declaration.
+    assert actuator.gear_ratio is None
+    assert actuator.extensions == before["actuators"][0]["extensions"]
+    assert source == before
+    canonical = schema.to_dict()
+    assert canonical["actuators"][0]["type"] == "dc_motor"
+    assert CommonSchema.from_dict(canonical).to_dict() == canonical
+    destination = tmp_path / "motor.xml"
+    MJCFExporter().export(schema, destination)
+    motor = ET.parse(destination).find("./actuator/motor")
+    assert motor is not None
+    assert motor.attrib["joint"] == "jointGripper"
+    assert [float(x) for x in motor.attrib["forcerange"].split()] == [-30.0, 30.0]
+    assert motor.get("gear") is None
+
+
+@pytest.mark.parametrize("limit", [0.0, 12.0, None])
+def test_legacy_motor_keeps_explicit_canonical_limits(limit):
+    source = CommonSchema(metadata=Metadata(name="limits")).to_dict()
+    source["actuators"] = [
+        {
+            "name": "motor",
+            "type": "motor",
+            "joint": "joint1",
+            "max_torque": limit,
+            "max_velocity": limit,
+            "limits": {"effort": 30, "velocity": 3.1415},
+        }
+    ]
+    actuator = CommonSchema.from_dict(source).actuators[0]
+    assert actuator.max_torque == limit
+    assert actuator.max_velocity == limit
+
+
+@pytest.mark.parametrize("limits", [{"effort": -1}, {"velocity": float("nan")}, {"effort": True}, "unknown"])
+def test_legacy_motor_rejects_invalid_limits(limits):
+    source = CommonSchema(metadata=Metadata(name="invalid")).to_dict()
+    source["actuators"] = [{"name": "motor", "type": "motor", "joint": "joint1", "limits": limits}]
+    with pytest.raises(Exception):
+        CommonSchema.from_dict(source)
+
+
 def test_schema_validation_valid():
     """Test that a valid schema passes validation."""
     metadata = Metadata(name="test_robot")

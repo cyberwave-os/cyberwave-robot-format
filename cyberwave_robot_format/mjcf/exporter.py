@@ -27,6 +27,7 @@ from cyberwave_robot_format.mesh import (
     convert_dae_to_obj,
     converted_mesh_texture,
 )
+from cyberwave_robot_format.mesh.resolution import reserve_resource_name
 from cyberwave_robot_format.mjcf.utils import sanitize_inertia
 from cyberwave_robot_format.schema import (
     Actuator,
@@ -388,6 +389,9 @@ class MJCFExporter(BaseExporter):
             # ``home ± span`` for a continuous joint (which carries no limits).
             joints_by_name = {j.name: j for j in schema.joints}
             for actuator in schema.actuators:
+                adhesion = actuator.get_mjcf_adhesion()
+                if adhesion is not None and not schema.get_link(adhesion["body"]):
+                    raise ValueError(f"Actuator {actuator.name!r} references an unknown body: {adhesion['body']}")
                 target_joint = joints_by_name.get(actuator.joint)
                 if target_joint is not None and target_joint.mimic is not None:
                     # A mimic slave is already position-constrained by its
@@ -511,7 +515,7 @@ class MJCFExporter(BaseExporter):
         # geoms that have no material of their own to override it with.
         mesh_materials: dict[str, str] = {}
         self._mesh_materials = mesh_materials
-        used_names: dict[str, int] = {}
+        used_names: set[str] = set()
 
         def register_mesh(filename: str, scale: Vector3 | None) -> None:
             if not filename:
@@ -541,12 +545,7 @@ class MJCFExporter(BaseExporter):
                     logger.warning("Failed to convert DAE mesh %s: %s", filename, e)
 
             base_name = Path(original_filename).stem or "mesh"
-            count = used_names.get(base_name, 0)
-            if count:
-                mesh_name = f"{base_name}_{count}"
-            else:
-                mesh_name = base_name
-            used_names[base_name] = count + 1
+            mesh_name = reserve_resource_name(base_name, used_names)
 
             mesh_lookup[lookup_key] = mesh_name
             if texture_file:
@@ -988,6 +987,17 @@ class MJCFExporter(BaseExporter):
         schema: CommonSchema | None = None,
     ) -> None:
         """Add geometry element to body."""
+        # URDFs can use an empty visual box on a frame-only link. It has no
+        # visible surface, but MuJoCo rejects its zero size. Omit only that
+        # visual; retain the body/joints and never drop a collision shape.
+        if (
+            collision is None
+            and geometry.type == GeometryType.BOX
+            and geometry.size is not None
+            and geometry.size.x == geometry.size.y == geometry.size.z == 0
+        ):
+            logger.warning("Omitting empty visual box on body %s", body.get("name"))
+            return
         geom = ET.SubElement(body, "geom")
         geom.set("group", group)
 
@@ -1182,6 +1192,14 @@ class MJCFExporter(BaseExporter):
                 ``ctrl`` is a rad/s setpoint, so a joint-angle band is the wrong
                 quantity entirely (see the velocity branch below).
         """
+        adhesion = actuator.get_mjcf_adhesion()
+        if adhesion is not None:
+            assert actuator.control_range is not None  # Validated with the body binding.
+            act = ET.SubElement(actuator_elem, "adhesion", name=actuator.name, **adhesion)
+            act.set("ctrlrange", " ".join(str(value) for value in actuator.control_range))
+            if actuator.force_range is not None:
+                act.set("forcerange", " ".join(str(value) for value in actuator.force_range))
+            return
         raw_type = getattr(actuator, "type", None)
         norm = None
         if isinstance(raw_type, str):
@@ -1523,10 +1541,41 @@ class MJCFExporter(BaseExporter):
                 )
                 continue
             mimic_joints.append(j)
-        if not mimic_joints:
+        closures = schema.get_loop_closures()
+        if not mimic_joints and not closures:
             return
 
         equality = ET.SubElement(mujoco, "equality")
+        bodies = {body.get("name"): body for body in mujoco.iter("body")}
+        sites = {site.get("name") for site in mujoco.iter("site")}
+        for index, closure in enumerate(closures):
+            if set(closure.get("axes", "xyz")) != set("xyz"):
+                raise ValueError("MuJoCo loop_closures currently require xyz axes")
+            endpoints = []
+            for endpoint in ("frame_a", "frame_b"):
+                frame = closure[endpoint]
+                body = bodies.get(frame)
+                if body is None:
+                    raise ValueError(
+                        f"Loop closure frame {frame!r} has no exported body"
+                    )
+                name = f"{frame}__loop_{index}_{endpoint}"
+                while name in sites:
+                    name += "_"
+                sites.add(name)
+                ET.SubElement(
+                    body,
+                    "site",
+                    name=name,
+                    pos="0 0 0",
+                    size="0.001",
+                    rgba="0 0 0 0",
+                    group=_SENSOR_SITE_GROUP,
+                )
+                endpoints.append(name)
+            # Sites preserve both local origins. body+anchor instead assumes the
+            # zero pose is already closed and would lock in an initial gap.
+            ET.SubElement(equality, "connect", site1=endpoints[0], site2=endpoints[1])
         for joint in mimic_joints:
             ET.SubElement(
                 equality,

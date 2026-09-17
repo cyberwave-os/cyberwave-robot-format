@@ -41,6 +41,7 @@ from cyberwave_robot_format.schema import (
     Material,
     Physics,
     Pose,
+    Quaternion,
     Scene,
     Sensor,
     Visual,
@@ -255,6 +256,15 @@ class _StageBuilder:
         self.pxr.UsdGeom.Xformable(prim).AddTransformOp().Set(
             c.np_to_gf_matrix(matrix)
         )
+
+    def _set_local_pose(self, prim: Any, pose: Pose) -> None:
+        """Retain authored components as well as the native USD transform."""
+        self._set_transform(prim, f.pose_to_matrix(pose))
+        # Pure translations already round-trip exactly. Keep those stages lean
+        # and byte-compatible; only rotations need their source components.
+        if pose.orientation != Quaternion():
+            c.write_vector3(prim, t.A_POSE_POSITION, pose.position)
+            c.write_quaternion(prim, t.A_POSE_ORIENTATION, pose.orientation)
 
     def _set_scale(self, prim: Any, scale: tuple[float, float, float]) -> None:
         """Author ``xformOp:scale`` after any transform op.
@@ -500,7 +510,7 @@ class _StageBuilder:
         prim_type_name = t.GEOMETRY_TYPE_TO_PRIM_TYPE.get(geometry_type, t.PRIM_XFORM)
         prim = self._define(getattr(pxr.UsdGeom, prim_type_name), path).GetPrim()
 
-        self._set_transform(prim, f.pose_to_matrix(pose))
+        self._set_local_pose(prim, pose)
         if geometry is None:
             # No type sidecar at all: its absence is what tells the parser that
             # Visual.geometry / Collision.geometry was None rather than UNKNOWN.
@@ -1080,7 +1090,7 @@ class _StageBuilder:
         path, _ = self._child_path(parent_path, sensor.name)
         prim = self._define(self.pxr.UsdGeom.Xform, path).GetPrim()
         self._author_name_sidecar(prim, sensor.name)
-        self._set_transform(prim, f.pose_to_matrix(sensor.pose))
+        self._set_local_pose(prim, sensor.pose)
 
         # `type` is free-form in the schema (IMU, camera, lidar, rangefinder, ...)
         # and is written verbatim: mapping it onto a USD vocabulary would need a

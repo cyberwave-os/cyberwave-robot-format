@@ -579,6 +579,14 @@ class _StageReader:
             else None
         )
 
+        # Like joint pose sidecars, authored local poses avoid a lossy
+        # quaternion -> matrix -> quaternion round trip. Older/foreign stages
+        # without a complete pair retain the native USD decomposition path.
+        position = c.read_vector3(prim, t.A_POSE_POSITION)
+        orientation = c.read_quaternion(prim, t.A_POSE_ORIENTATION)
+        if position is not None and orientation is not None:
+            return Pose(position=position, orientation=orientation), scale
+
         transform_attr = prim.GetAttribute("xformOp:transform")
         if transform_attr and transform_attr.HasAuthoredValue():
             return f.matrix_to_pose(c.gf_matrix_to_np(transform_attr.Get())), scale

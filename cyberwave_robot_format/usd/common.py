@@ -423,6 +423,50 @@ def _json_default(obj: Any) -> Any:
     return unstructured
 
 
+# Bound decoding independently of CPython's changing recursion limits. This
+# applies only to embedded USD metadata, not the scene hierarchy or mesh data.
+_JSON_MAX_DEPTH = 256
+
+
+def _check_json_nesting(raw: str) -> None:
+    """Reject excessive nesting before allocating the decoded object tree."""
+    depth = 0
+    quoted = False
+    escaped = False
+    for char in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > _JSON_MAX_DEPTH:
+                raise RecursionError("USD JSON metadata is nested too deeply")
+        elif char in "]}":
+            depth -= 1
+
+
+def _read_json_metadata(raw: Any, location: str, prim: Any) -> Any | None:
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, str):
+            _check_json_nesting(raw)
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("%s on %s is not valid JSON; ignoring it.", location, prim.GetPath())
+    except RecursionError:
+        logger.warning(
+            "%s on %s is nested too deeply to decode; ignoring it.", location, prim.GetPath()
+        )
+    return None
+
+
 def dumps_json(value: Any) -> str:
     """Serialize a JSON-ish payload deterministically, preserving key order.
 
@@ -436,7 +480,12 @@ def dumps_json(value: Any) -> str:
 
     The compact separators keep the embedded payloads readable in the ``.usda``.
     """
-    return json.dumps(value, separators=(",", ":"), default=_json_default)
+    try:
+        raw = json.dumps(value, separators=(",", ":"), default=_json_default)
+        _check_json_nesting(raw)
+    except RecursionError as exc:
+        raise ValueError(f"USD JSON metadata exceeds {_JSON_MAX_DEPTH} nesting levels") from exc
+    return raw
 
 
 def write_json_attr(prim: Any, name: str, value: Any) -> None:
@@ -455,26 +504,7 @@ def write_json_attr(prim: Any, name: str, value: Any) -> None:
 
 def read_json_attr(prim: Any, name: str) -> Any | None:
     """Read a JSON payload from a ``string`` attribute, or ``None``."""
-    raw = read_string(prim, name)
-    if raw is None:
-        return None
-    try:
-        return json.loads(raw)
-    except (ValueError, TypeError):
-        logger.warning(
-            "Attribute %s on %s is not valid JSON; ignoring it.", name, prim.GetPath()
-        )
-        return None
-    except RecursionError:
-        # A deeply nested payload ("[[[[...") exhausts the C stack inside json's
-        # scanner. RecursionError is not a ValueError, so without this a hostile
-        # stage would abort the whole parse instead of dropping one attribute.
-        logger.warning(
-            "Attribute %s on %s is nested too deeply to decode; ignoring it.",
-            name,
-            prim.GetPath(),
-        )
-        return None
+    return _read_json_metadata(read_string(prim, name), f"Attribute {name}", prim)
 
 
 def write_custom_data_json(prim: Any, key: str, value: Any) -> None:
@@ -491,24 +521,7 @@ def write_custom_data_json(prim: Any, key: str, value: Any) -> None:
 
 def read_custom_data_json(prim: Any, key: str) -> Any | None:
     """Read a JSON payload from ``customData``, or ``None`` if absent/invalid."""
-    raw = prim.GetCustomDataByKey(key)
-    if raw is None:
-        return None
-    try:
-        return json.loads(raw)
-    except (ValueError, TypeError):
-        logger.warning(
-            "customData[%s] on %s is not valid JSON; ignoring it.", key, prim.GetPath()
-        )
-        return None
-    except RecursionError:
-        # See read_json_attr: a hostile payload must cost one attribute, not the run.
-        logger.warning(
-            "customData[%s] on %s is nested too deeply to decode; ignoring it.",
-            key,
-            prim.GetPath(),
-        )
-        return None
+    return _read_json_metadata(prim.GetCustomDataByKey(key), f"customData[{key}]", prim)
 
 
 def read_extensions(prim: Any, key: str) -> dict[str, Any]:

@@ -434,6 +434,40 @@ class TestFullRoundTrip:
         second = USDExporter().export_to_string(USDParser().parse_string(first))
         assert first == second
 
+    @pytest.mark.parametrize("kind", ["visual", "collision", "sensor"])
+    def test_local_pose_is_exact_across_repeated_round_trips(self, kind):
+        # A rotation matrix cannot recover the original quaternion bits. Preserve
+        # authored poses as we already preserve joint poses and inertial values.
+        pose = Pose.from_xyzrpy([0.013579, -0.24, 0.05], [0.1, 0.2, 0.3])
+        schema = CommonSchema(metadata=Metadata(name="pose-round-trip"), links=[Link(name="base")])
+        geometry = Geometry(type=GeometryType.BOX, size=Vector3(0.11, 0.22, 0.33))
+        if kind == "visual":
+            schema.links[0].visuals = [Visual(pose=pose, geometry=geometry)]
+        elif kind == "collision":
+            schema.links[0].collisions = [Collision(pose=pose, geometry=geometry)]
+        else:
+            schema.sensors = [Sensor(name="camera", type="camera", parent_link="base", pose=pose)]
+        text = USDExporter().export_to_string(schema)
+        for _ in range(5):
+            restored = USDParser().parse_string(text)
+            if kind == "visual":
+                restored_pose = restored.links[0].visuals[0].pose
+            elif kind == "collision":
+                restored_pose = restored.links[0].collisions[0].pose
+            else:
+                restored_pose = restored.sensors[0].pose
+            assert restored_pose == pose
+            assert USDExporter().export_to_string(restored) == text
+
+    def test_export_rejects_metadata_its_reader_would_discard(self):
+        schema = full_schema()
+        value = 0
+        for _ in range(256):
+            value = [value]
+        schema.extensions = {"deep": value}
+        with pytest.raises(ValueError, match="256 nesting levels"):
+            USDExporter().export_to_string(schema)
+
     def test_export_is_deterministic(self):
         schema = full_schema()
         assert USDExporter().export_to_string(schema) == USDExporter().export_to_string(

@@ -14,12 +14,52 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import resolve_robotics_uri_py as rru
 
 
 logger = logging.getLogger(__name__)
+
+MeshResolver = Callable[[str], tuple[str, bytes] | None]
+
+
+def reserve_resource_name(filename: str, used: set[str]) -> str:
+    """Allocate a flat name without overwriting an existing suffixed name."""
+    path = Path(filename)
+    stem, suffix = path.stem or "asset", path.suffix
+    candidate = f"{stem}{suffix}"
+    index = 1
+    while candidate in used:
+        candidate = f"{stem}_{index}{suffix}"
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+class CloudAssetBundle:
+    """Resolve each source once and share safe archive naming across formats."""
+
+    def __init__(self, directory: Path, resolver: MeshResolver) -> None:
+        self.directory = directory
+        self.resolver = resolver
+        self._resolved: dict[str, str | None] = {}
+        self._used_names: set[str] = set()
+
+    def add(self, source: str, *, default_extension: str = ".obj") -> str | None:
+        if source not in self._resolved:
+            result = self.resolver(source)
+            if result is None:
+                self._resolved[source] = None
+            else:
+                filename, payload = result
+                if not Path(filename).suffix:
+                    filename += default_extension
+                name = reserve_resource_name(filename, self._used_names)
+                (self.directory / name).write_bytes(payload)
+                self._resolved[source] = name
+        return self._resolved[source]
 
 
 def _package_search_paths(base_dir: Path) -> list[Path]:
@@ -159,4 +199,4 @@ def resolve_mesh_uri(filename: str, base_dir: Path) -> str:
     return filename
 
 
-__all__ = ["resolve_mesh_uri"]
+__all__ = ["CloudAssetBundle", "MeshResolver", "reserve_resource_name", "resolve_mesh_uri"]

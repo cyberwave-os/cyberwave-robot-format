@@ -263,7 +263,7 @@ class MJCFParser(BaseParser):
             raise ParseError(f"Duplicate MJCF defaults class: {name}")
         resolved = {tag: dict(attrs) for tag, attrs in inherited.items()}
         for child in element:
-            if child.tag in {"joint", "geom", "site", "motor", "mesh"}:
+            if child.tag in {"joint", "geom", "site", "motor", "mesh", "adhesion"}:
                 resolved.setdefault(child.tag, {}).update(child.attrib)
         self._element_defaults[name] = resolved
         for child in element.findall("default"):
@@ -883,6 +883,7 @@ class MJCFParser(BaseParser):
             "velocity": ActuatorType.VELOCITY,
             "general": ActuatorType.DC_MOTOR,
             "muscle": ActuatorType.MUSCLE,
+            "adhesion": ActuatorType.ADHESION,
         }
 
         for actuator_entry in list(actuator_elem):
@@ -890,9 +891,34 @@ class MJCFParser(BaseParser):
             if actuator_type is None:
                 continue
             attrs = self._actuator_attrs_with_defaults(actuator_entry)
-            if actuator_entry.tag == "motor" and actuator_entry.get("site"):
+            if actuator_entry.tag == "adhesion" or (actuator_entry.tag == "motor" and actuator_entry.get("site")):
                 attrs = dict(self._with_element_defaults(actuator_entry, self._default_class).attrib)
             name = attrs.get("name")
+            if actuator_type == ActuatorType.ADHESION:
+                allowed = {"name", "class", "body", "gain", "ctrlrange", "forcerange", "group", "forcelimited"}
+                if not name or attrs.keys() - allowed:
+                    raise ParseError(f"Invalid adhesion actuator attributes: {sorted(attrs.keys() - allowed)}")
+                binding = {
+                    key: value for key, value in attrs.items() if key in {"body", "gain", "group", "forcelimited"}
+                }
+                if "body" in binding:
+                    binding["body"] = sanitize_name(binding["body"])
+                actuator = Actuator(
+                    name=sanitize_name(name),
+                    joint="",
+                    type=actuator_type,
+                    control_range=self._parse_float_pair(attrs.get("ctrlrange")),
+                    force_range=self._parse_float_pair(attrs.get("forcerange")),
+                    extensions={"mjcf_adhesion": binding},
+                )
+                if "forcerange" in attrs and actuator.force_range is None:
+                    raise ParseError(f"Adhesion actuator {name!r} has invalid forcerange")
+                try:
+                    actuator.get_mjcf_adhesion()
+                except ValueError as exc:
+                    raise ParseError(str(exc)) from exc
+                actuators.append(actuator)
+                continue
             joint = attrs.get("joint")
             site = attrs.get("site")
             if site and actuator_entry.tag != "motor":

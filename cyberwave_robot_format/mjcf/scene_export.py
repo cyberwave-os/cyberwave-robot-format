@@ -26,17 +26,13 @@ import os
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Callable
 from pathlib import Path
 
+from cyberwave_robot_format.mesh.resolution import CloudAssetBundle, MeshResolver
 from cyberwave_robot_format.mjcf.exporter import MJCFExporter
 from cyberwave_robot_format.schema import CommonSchema
 
 logger = logging.getLogger(__name__)
-
-# Type alias for mesh resolver that returns (final_filename, bytes)
-# This allows in-memory conversion: resolve "foo.dae" -> ("foo.obj", obj_bytes)
-MeshResolver = Callable[[str], tuple[str, bytes] | None]
 
 # Scenes are mesh binaries built per request, so the write is on a latency path
 # and the bytes are not: level 1 writes 2-5x faster than zlib's default 6 for
@@ -160,8 +156,7 @@ def export_mujoco_zip_cloud(
             root.insert(0, compiler)
 
         # Build mesh rewrite map to avoid collisions in composed scenes
-        mesh_rewrite_map: dict[str, str] = {}  # original_mesh_file -> unique_asset_name
-        mesh_counter: dict[str, int] = {}  # basename -> count for deduplication
+        bundle = CloudAssetBundle(assets_dir, mesh_resolver)
         missing_meshes: list[str] = []
         missing_mesh_names: set[str] = set()
 
@@ -181,57 +176,12 @@ def export_mujoco_zip_cloud(
                 if not mesh_file:
                     continue
 
-                # Skip if already processed (deduplication)
-                if mesh_file in mesh_rewrite_map:
-                    mesh_elem.set(file_attribute, mesh_rewrite_map[mesh_file])
-                    logger.debug(
-                        f"Reusing existing mesh: {mesh_file} -> {mesh_rewrite_map[mesh_file]}"
-                    )
-                    continue
-
-                final_filename = None
-                mesh_bytes = None
-
-                # Resolve mesh via mesh_resolver (cloud-native)
-                if mesh_resolver:
-                    logger.debug(f"Trying mesh_resolver for: {mesh_file}")
-                    result = mesh_resolver(mesh_file)
-
-                    if result is not None:
-                        # Expect tuple: (final_filename, bytes)
-                        final_filename, mesh_bytes = result
-                        logger.debug(
-                            f"  Resolved via mesh_resolver: {mesh_file} -> {final_filename} ({len(mesh_bytes)} bytes)"
-                        )
-
-                # Process the mesh if we got bytes
-                if mesh_bytes is not None and final_filename is not None:
-                    # Generate unique asset name to avoid collisions
-                    final_path = Path(final_filename)
-                    basename = final_path.stem
-                    extension = final_path.suffix or (".png" if mesh_elem.tag == "texture" else ".obj")
-
-                    # Handle duplicates
-                    count = mesh_counter.get(basename, 0)
-                    if count > 0:
-                        unique_name = f"{basename}_{count}{extension}"
-                    else:
-                        unique_name = f"{basename}{extension}"
-                    mesh_counter[basename] = count + 1
-
-                    # Write to assets directory
-                    dst_path = assets_dir / unique_name
-                    dst_path.write_bytes(mesh_bytes)
-                    logger.debug(f"Wrote mesh to assets: {dst_path}")
-
-                    final_asset_name = unique_name
-
-                    # Update rewrite map and XML
-                    mesh_rewrite_map[mesh_file] = final_asset_name
-                    mesh_elem.set(file_attribute, final_asset_name)
-                    logger.debug(
-                        f"Updated XML mesh reference: {mesh_file} -> {final_asset_name}"
-                    )
+                asset_name = bundle.add(
+                    mesh_file,
+                    default_extension=".png" if mesh_elem.tag == "texture" else ".obj",
+                )
+                if asset_name is not None:
+                    mesh_elem.set(file_attribute, asset_name)
                 else:
                     if mesh_elem.tag == "texture":
                         raise FileNotFoundError(f"Missing texture asset: {mesh_file}")

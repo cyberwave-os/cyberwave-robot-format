@@ -1348,6 +1348,47 @@ def Xform "Part"
         relaxed = USDParser().parse(path)
         assert strict.to_dict() == relaxed.to_dict()
 
+    @pytest.mark.parametrize("custom_data", [False, True])
+    @pytest.mark.parametrize("depth", [256, 257])
+    def test_metadata_depth_limit_is_explicit(self, custom_data, depth, caplog):
+        from cyberwave_robot_format.usd import common as c
+
+        stage = Usd.Stage.CreateInMemory()
+        prim = stage.DefinePrim("/Robot")
+        raw = "[" * depth + "0" + "]" * depth
+        if custom_data:
+            prim.SetCustomDataByKey("cyberwave:extensions", raw)
+            result = c.read_custom_data_json(prim, "cyberwave:extensions")
+        else:
+            prim.CreateAttribute("cyberwave:parameters", Sdf.ValueTypeNames.String).Set(raw)
+            result = c.read_json_attr(prim, "cyberwave:parameters")
+        if depth == 256:
+            for _ in range(depth):
+                result = result[0]
+            assert result == 0
+            assert "nested too deeply" not in caplog.text
+        else:
+            assert result is None
+            assert "nested too deeply" in caplog.text
+            assert "/Robot" in caplog.text
+
+    @pytest.mark.parametrize("custom_data", [False, True])
+    def test_metadata_depth_check_ignores_delimiters_in_strings(self, custom_data):
+        import json
+        from cyberwave_robot_format.usd import common as c
+
+        stage = Usd.Stage.CreateInMemory()
+        prim = stage.DefinePrim("/Robot")
+        value = {"quoted": '[{"quoted": "\\\""}]' * 600, "other": {"values": [1, 2]}}
+        raw = json.dumps(value)
+        if custom_data:
+            prim.SetCustomDataByKey("cyberwave:extensions", raw)
+            result = c.read_custom_data_json(prim, "cyberwave:extensions")
+        else:
+            prim.CreateAttribute("cyberwave:parameters", Sdf.ValueTypeNames.String).Set(raw)
+            result = c.read_json_attr(prim, "cyberwave:parameters")
+        assert result == value
+
     def test_deeply_nested_json_payload_does_not_abort_the_parse(self, caplog):
         # json's scanner raises RecursionError, which is not a ValueError — without
         # explicit handling one hostile attribute would kill the whole run.

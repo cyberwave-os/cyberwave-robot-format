@@ -86,6 +86,11 @@ CD_EXCLUDES = f"{CW}:excludes"
 A_NAME = f"{CW}:name"
 """Original schema name, authored only when sanitization changed it."""
 
+# Local visual/collision/sensor pose. Native matrices remain available to other
+# USD consumers; these fields preserve the source quaternion exactly on import.
+A_POSE_POSITION = f"{CW}:pose:position"
+A_POSE_ORIENTATION = f"{CW}:pose:orientation"
+
 # Link
 #
 # UsdPhysicsMassAPI is entirely float32 (``physics:mass`` is ``float``,

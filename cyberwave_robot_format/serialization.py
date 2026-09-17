@@ -10,12 +10,15 @@ This module provides a configured cattrs converter that handles:
 from __future__ import annotations
 
 from enum import Enum
+from math import isfinite
 from typing import Any
 
 from cattrs import Converter
+from cattrs.gen import make_dict_structure_fn
 
 # Import schema types - these are needed for hook registration
 from cyberwave_robot_format.schema import (
+    Actuator,
     ActuatorType,
     GeometryType,
     JointType,
@@ -52,9 +55,7 @@ def _structure_vector3(val: Any, _: type[Vector3]) -> Vector3:
     if isinstance(val, Vector3):
         return val
     if not isinstance(val, dict):
-        raise TypeError(
-            f"Vector3 must be a dict with x/y/z keys, got {type(val).__name__}"
-        )
+        raise TypeError(f"Vector3 must be a dict with x/y/z keys, got {type(val).__name__}")
     return Vector3(
         x=float(val.get("x", 0.0)),
         y=float(val.get("y", 0.0)),
@@ -74,9 +75,7 @@ def _structure_quaternion(val: Any, _: type[Quaternion]) -> Quaternion:
     if isinstance(val, Quaternion):
         return val
     if not isinstance(val, dict):
-        raise TypeError(
-            f"Quaternion must be a dict with x/y/z/w keys, got {type(val).__name__}"
-        )
+        raise TypeError(f"Quaternion must be a dict with x/y/z/w keys, got {type(val).__name__}")
     return Quaternion(
         x=float(val.get("x", 0.0)),
         y=float(val.get("y", 0.0)),
@@ -102,9 +101,7 @@ def _structure_pose(val: Any, _: type[Pose]) -> Pose:
     if isinstance(val, Pose):
         return val
     if not isinstance(val, dict):
-        raise TypeError(
-            f"Pose must be a dict with position/orientation keys, got {type(val).__name__}"
-        )
+        raise TypeError(f"Pose must be a dict with position/orientation keys, got {type(val).__name__}")
     return Pose(
         position=_structure_vector3(val.get("position"), Vector3),
         orientation=_structure_quaternion(val.get("orientation"), Quaternion),
@@ -129,6 +126,30 @@ def _build_converter() -> Converter:
     # Register Pose hook
     converter.register_unstructure_hook(Pose, _unstructure_pose)
     converter.register_structure_hook(Pose, _structure_pose)
+
+    structure_actuator = make_dict_structure_fn(Actuator, converter)
+
+    def structure_catalog_actuator(val: Any, cls: type[Actuator]) -> Actuator:
+        # Older catalog JSON uses the MJCF motor name and joint-space limits.
+        # Normalize on read; all writers continue to emit the canonical schema.
+        if isinstance(val, dict) and val.get("type") == "motor":
+            val = {**val, "type": ActuatorType.DC_MOTOR.value}
+            limits = val.get("limits", {})
+            if not isinstance(limits, dict):
+                raise ValueError("Legacy motor limits must be a mapping")
+            for legacy, canonical in (
+                ("effort", "max_torque"),
+                ("velocity", "max_velocity"),
+            ):
+                if canonical in val or legacy not in limits:
+                    continue
+                limit = limits[legacy]
+                if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not isfinite(limit) or limit < 0:
+                    raise ValueError(f"Legacy motor {legacy} must be finite and non-negative")
+                val[canonical] = float(limit)
+        return structure_actuator(val, cls)
+
+    converter.register_structure_hook(Actuator, structure_catalog_actuator)
 
     return converter
 

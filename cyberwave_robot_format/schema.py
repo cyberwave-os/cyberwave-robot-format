@@ -53,6 +53,7 @@ class ActuatorType(Enum):
     POSITION = "position"  # PD control
     TORQUE = "torque"  # Direct torque control
     MUSCLE = "muscle"  # Biomechanical muscle model
+    ADHESION = "adhesion"  # Contact-normal force on an explicitly declared body
 
 
 @dataclass
@@ -365,7 +366,7 @@ class Actuator:
     """Actuator/motor definition."""
 
     name: str
-    joint: str  # Empty for an explicitly declared MJCF site transmission.
+    joint: str  # Empty for an explicitly declared MJCF site/body transmission.
     type: ActuatorType
 
     # Motor parameters
@@ -388,6 +389,53 @@ class Actuator:
     efficiency: float | None = None
 
     extensions: dict[str, Any] = field(default_factory=dict)
+
+    def get_mjcf_adhesion(self) -> dict[str, str] | None:
+        """Validate a body contact actuator without inventing a movable tool joint.
+
+        Controls scale the declared gain (newtons). Adhesion needs contact; this
+        declaration does not imply a vacuum seal or a successful grasp.
+        """
+        binding = self.extensions.get("mjcf_adhesion")
+        if binding is None and self.type != ActuatorType.ADHESION:
+            return None
+        invalid = f"Actuator {self.name!r} has an invalid MJCF adhesion transmission"
+        if (
+            self.type != ActuatorType.ADHESION
+            or self.joint
+            or self.gear_ratio is not None
+            or self.extensions.get("mjcf_site_transmission") is not None
+            or not isinstance(binding, dict)
+            or not binding.get("body")
+            or any(
+                key not in {"body", "gain", "group", "forcelimited"} or not isinstance(value, str)
+                for key, value in binding.items()
+            )
+        ):
+            raise ValueError(invalid)
+        try:
+            gain = float(binding.get("gain", "1"))
+            limits = self.control_range
+            valid = (
+                math.isfinite(gain)
+                and gain > 0
+                and limits is not None
+                and len(limits) == 2
+                and all(math.isfinite(value) for value in limits)
+                and 0 <= limits[0] < limits[1]
+            )
+            if self.force_range is not None:
+                valid = (
+                    valid
+                    and len(self.force_range) == 2
+                    and all(math.isfinite(value) for value in self.force_range)
+                    and 0 <= self.force_range[0] < self.force_range[1]
+                )
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            raise ValueError(invalid)
+        return binding
 
     def get_mjcf_site_transmission(self) -> dict[str, str] | None:
         """Return a validated native motor transmission, never a fictitious joint.
@@ -622,6 +670,50 @@ class CommonSchema:
     # Global extensions for format-specific features
     extensions: dict[str, Any] = field(default_factory=dict)
 
+    def get_loop_closures(self) -> list[dict[str, str]]:
+        """Validate optional positional closures between named link origins.
+
+        Keep these in extensions so existing schemas serialize identically.
+        Axes are expressed in frame_a; individual exporters may support only xyz.
+        """
+        closures = self.extensions.get("loop_closures", [])
+        if not isinstance(closures, list):
+            raise ValueError("loop_closures must be a list")
+        link_names = {link.name for link in self.links}
+        seen = set()
+        for closure in closures:
+            if not isinstance(closure, dict) or set(closure) - {
+                "frame_a",
+                "frame_b",
+                "axes",
+            }:
+                raise ValueError(
+                    "loop_closures entries accept frame_a, frame_b and axes only"
+                )
+            a, b, axes = (
+                closure.get("frame_a"),
+                closure.get("frame_b"),
+                closure.get("axes", "xyz"),
+            )
+            if not isinstance(a, str) or not isinstance(b, str) or a == b:
+                raise ValueError("loop_closures require two distinct link frames")
+            if a not in link_names or b not in link_names:
+                raise ValueError(
+                    f"loop_closures reference unknown link frames: {a}, {b}"
+                )
+            if (
+                not isinstance(axes, str)
+                or not axes
+                or set(axes) - set("xyz")
+                or len(set(axes)) != len(axes)
+            ):
+                raise ValueError("loop_closures axes must be a nonempty subset of xyz")
+            key = (a, b, "".join(sorted(axes)))
+            if key in seen:
+                raise ValueError(f"Duplicate loop_closures entry: {a}, {b}")
+            seen.add(key)
+        return closures
+
     def get_link(self, name: str) -> Link | None:
         """Get link by name."""
         for link in self.links:
@@ -698,6 +790,11 @@ class CommonSchema:
         """
         issues = []
 
+        try:
+            self.get_loop_closures()
+        except ValueError as exc:
+            issues.append(str(exc))
+
         # Check for duplicate names
         link_names = [link.name for link in self.links]
         if len(link_names) != len(set(link_names)):
@@ -731,11 +828,15 @@ class CommonSchema:
         # Check actuator references, including explicitly preserved native motors.
         for actuator in self.actuators:
             try:
+                adhesion = actuator.get_mjcf_adhesion()
                 transmission = actuator.get_mjcf_site_transmission()
             except ValueError as exc:
                 issues.append(str(exc))
                 continue
-            if transmission is not None:
+            if adhesion is not None:
+                if not self.get_link(adhesion["body"]):
+                    issues.append(f"Actuator {actuator.name!r} references unknown body: {adhesion['body']}.")
+            elif transmission is not None:
                 for reference in ("site", "refsite"):
                     if reference in transmission and transmission[reference] not in site_names:
                         issues.append(
@@ -845,6 +946,7 @@ class CommonSchema:
 
         # Determine root link for spawn joint (must be unique)
         root_link = other.get_single_root_link()
+        closures = other.get_loop_closures()
 
         # Deep copy to avoid mutating the original
         other_copy = deepcopy(other)
@@ -896,6 +998,9 @@ class CommonSchema:
             actuator.name = prefixed(actuator.name)
             if actuator.joint:
                 actuator.joint = prefixed(actuator.joint)
+            adhesion = actuator.get_mjcf_adhesion()
+            if adhesion is not None:
+                adhesion["body"] = prefixed(adhesion["body"])
             transmission = actuator.get_mjcf_site_transmission()
             if transmission is not None:
                 for reference in ("site", "refsite"):
@@ -949,6 +1054,15 @@ class CommonSchema:
                 self.collision_config.pairs.append(prefixed_pair)
 
         # Append all entities to self
+        if closures:
+            self.extensions.setdefault("loop_closures", []).extend(
+                {
+                    **closure,
+                    "frame_a": prefixed(closure["frame_a"]),
+                    "frame_b": prefixed(closure["frame_b"]),
+                }
+                for closure in closures
+            )
         self.links.extend(other_copy.links)
         self.joints.extend(other_copy.joints)
         self.actuators.extend(other_copy.actuators)

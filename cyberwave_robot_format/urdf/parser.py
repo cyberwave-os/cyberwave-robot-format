@@ -381,6 +381,12 @@ class URDFParser(BaseParser):
             samples = _f(f"scan/{axis}/samples")
             if samples is not None and samples > 0:
                 samples_total *= samples
+                sensor.parameters[f"{axis}_samples"] = int(samples)
+            if min_angle is not None and max_angle is not None:
+                # Preserve asymmetric sweeps; a FOV alone loses their centre.
+                sensor.parameters[
+                    "yaw_offset" if axis == "horizontal" else "pitch_offset"
+                ] = (min_angle + max_angle) / 2.0
 
         min_range = _f("range/min")
         if min_range is not None:
