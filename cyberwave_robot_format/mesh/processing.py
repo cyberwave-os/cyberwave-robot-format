@@ -154,9 +154,7 @@ def convert_mesh_bytes_to_obj(
         >>> storage.write('model.obj', obj_bytes)
     """
     # Write to temp file (trimesh requires file path for loading)
-    with tempfile.NamedTemporaryFile(
-        suffix=os.path.splitext(original_filename)[1], delete=False
-    ) as tmp_in:
+    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(original_filename)[1], delete=False) as tmp_in:
         tmp_in.write(mesh_bytes)
         tmp_in_path = tmp_in.name
 
@@ -188,9 +186,7 @@ def convert_mesh_bytes_to_obj(
         os.unlink(tmp_in_path)
 
 
-def get_mesh_lookup_key(
-    filename: str, scale: Vector3 | None
-) -> tuple[str, tuple[float, float, float]]:
+def get_mesh_lookup_key(filename: str, scale: Vector3 | None) -> tuple[str, tuple[float, float, float]]:
     """Generate a lookup key for mesh asset caching.
 
     Args:
@@ -204,9 +200,54 @@ def get_mesh_lookup_key(
     return (filename, scale_tuple)
 
 
+def decompose_collision_mesh(
+    mesh: trimesh.Trimesh, *, threshold_m: float = 0.001, max_hulls: int = 32
+) -> list[trimesh.Trimesh]:
+    """Prepare convex collision pieces offline, in the input mesh's frame.
+
+    Supply vertices already scaled to metres. Keep visual meshes and authored
+    link inertia unchanged; replace only the selected collision mesh with these
+    pieces, retaining its pose/contact properties. MuJoCo otherwise fills
+    concavities such as gripper openings with one convex hull. This is explicit
+    asset preparation, never an implicit exporter/runtime geometry change.
+
+    CoACD's hull-count cap can relax its requested concavity threshold. Review
+    the resulting collision geometry before treating it as calibrated.
+    """
+    if not np.isfinite(threshold_m) or threshold_m <= 0:
+        raise ValueError("Collision decomposition requires a positive metric threshold")
+    if isinstance(max_hulls, bool) or not isinstance(max_hulls, int) or not 1 <= max_hulls <= 128:
+        raise ValueError("Collision decomposition requires 1..128 hulls")
+    if (
+        not isinstance(mesh, trimesh.Trimesh)
+        or len(mesh.vertices) < 4
+        or len(mesh.faces) < 4
+        or not np.isfinite(mesh.vertices).all()
+    ):
+        raise ValueError("Collision decomposition requires a finite triangle mesh")
+    try:
+        import coacd
+    except ImportError as exc:
+        raise RuntimeError("Install cyberwave-robot-format[collision] for convex decomposition") from exc
+    parts = coacd.run_coacd(
+        coacd.Mesh(np.asarray(mesh.vertices, dtype=np.float64), np.asarray(mesh.faces, dtype=np.int32)),
+        threshold=threshold_m,
+        real_metric=True,
+        max_convex_hull=max_hulls,
+        seed=0,
+    )
+    if not parts:
+        raise ValueError("Collision decomposition returned no geometry")
+    result = [trimesh.Trimesh(vertices=v, faces=f, process=False) for v, f in parts]
+    if any(not np.isfinite(part.vertices).all() or part.volume <= 0 for part in result):
+        raise ValueError("Collision decomposition returned invalid geometry")
+    return result
+
+
 __all__ = [
     "convert_dae_to_obj",
     "convert_mesh_bytes_to_obj",
     "converted_mesh_texture",
     "get_mesh_lookup_key",
+    "decompose_collision_mesh",
 ]

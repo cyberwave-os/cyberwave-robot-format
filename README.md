@@ -451,3 +451,29 @@ url = {https://github.com/thanhndv212/robot_format_converter},
 version = {1.0.0}
 }
 ```
+
+## Preparing concave collision meshes
+
+MuJoCo uses a convex hull for each mesh collider. A concave gripper, bracket or
+container can therefore have an invisible solid region despite a correct visual
+mesh. Prepare collision pieces explicitly before publishing an asset:
+
+```python
+# pip install 'cyberwave-robot-format[collision]'
+import trimesh
+from cyberwave_robot_format.mesh import decompose_collision_mesh
+
+mesh = trimesh.load("collision.obj", force="mesh")
+# Apply the authored mesh scale first: input coordinates must be metres.
+parts = decompose_collision_mesh(mesh, threshold_m=0.001, max_hulls=32)
+for index, part in enumerate(parts):
+    part.export(f"collision-{index}.obj")
+```
+
+Use one existing `Collision` entry per piece, retaining the source collider's
+pose, group and contact properties. The output is already scaled; do not apply
+the original scale twice. Preserve the visual mesh and authored link inertia.
+Store source hashes and preparation settings with the asset artifacts. Review
+clearances, hull count and contacts in simulation: the hull-count limit can relax
+the requested approximation tolerance. This utility does not run automatically
+on export or motion and does not authorize hardware control.

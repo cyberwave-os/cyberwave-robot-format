@@ -47,6 +47,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+collision = ["coacd>=1.0.14"]
 # OpenUSD Python bindings, required only by cyberwave_robot_format.usd. Kept
 # optional because usd-core publishes no linux-aarch64 wheel (conda-forge's
 # `openusd` is the way in there),
