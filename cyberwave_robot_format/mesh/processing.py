@@ -42,11 +42,12 @@ def convert_dae_to_obj(
         Path to the converted OBJ file.
 
     Raises:
+        FileNotFoundError: If ``dae_path`` is not a file on this host and no
+            earlier conversion of it is cached.
         Exception: If mesh conversion fails.
     """
     if output_dir is None:
         output_dir = Path("/tmp/mujoco_converted_meshes")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate unique name based on path AND scale
     scale_tuple = (scale.x, scale.y, scale.z) if scale else (1.0, 1.0, 1.0)
@@ -62,7 +63,12 @@ def convert_dae_to_obj(
 
     if new_filename.exists():
         return str(new_filename)
-    mesh_dir.mkdir(parents=True, exist_ok=True)
+
+    if not Path(dae_path).is_file():
+        # Deliberately after the cache probe: a mesh whose source has since
+        # moved out of reach still resolves to its converted OBJ. Raised rather
+        # than logged so the caller can word the message for its own context.
+        raise FileNotFoundError(f"DAE mesh is not a file on this host: {dae_path}")
 
     logger.info(
         "Converting DAE to OBJ: %s -> %s (scale=%s).",
@@ -71,7 +77,11 @@ def convert_dae_to_obj(
         scale_tuple,
     )
 
+    # Load before creating anything on disk: a path trimesh cannot open (a
+    # missing file, an ``asset://`` URI) must not leave an empty per-mesh
+    # directory behind on every failed attempt.
     mesh = trimesh.load(dae_path)
+    mesh_dir.mkdir(parents=True, exist_ok=True)
 
     # Handle Scene objects (flatten to single mesh)
     if isinstance(mesh, trimesh.Scene):

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from xml.dom import minidom
@@ -47,6 +48,12 @@ from cyberwave_robot_format.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A mesh reference with any URI scheme (``asset://<uuid>/...`` from cloud
+# exports, ``package://``, ``https://``, ``file://``) is not a path trimesh can
+# open; whoever handed the exporter a URI owns resolving it.
+_URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
 
 # Default dynamics applied to a URDF ``<mimic>`` slave joint that carries no
 # authored dynamics. The ``<equality>`` coupling constrains the slave's
@@ -532,17 +539,47 @@ class MJCFExporter(BaseExporter):
 
             texture_file: str | None = None
             if filename.lower().endswith(".dae"):
-                try:
-                    actual_filename = convert_dae_to_obj(
-                        filename, scale if scale else None
+                if _URI_SCHEME.match(filename):
+                    # trimesh opens filesystem paths, never URIs (see ``_URI_SCHEME``);
+                    # the caller's mesh resolver converts it when the scene is
+                    # packaged. Trying here only failed with "string is not a
+                    # file" on every such mesh.
+                    logger.debug(
+                        "Deferring DAE conversion of non-local mesh %s to the mesh resolver.",
+                        filename,
                     )
-                    # The converter writes the mesh's base-colour map beside the
-                    # OBJ, and MuJoCo does not read the `.mtl` that references
-                    # it — so without declaring it here the mesh renders in the
-                    # default grey while its texture sits unused on disk.
-                    texture_file = converted_mesh_texture(actual_filename)
-                except Exception as e:
-                    logger.warning("Failed to convert DAE mesh %s: %s", filename, e)
+                else:
+                    # The converter's on-disk check stays inside the catch-all: a
+                    # path the OS refuses to stat (permission, name too long) must
+                    # cost one warning, not the whole scene export.
+                    try:
+                        try:
+                            actual_filename = convert_dae_to_obj(
+                                filename, scale if scale else None
+                            )
+                        except FileNotFoundError:
+                            # Not on this host, and no earlier conversion to fall
+                            # back on -- which is not the same as broken. A cloud
+                            # export resolves the reference against storage after
+                            # the MJCF is written, and the callers that skip
+                            # resource scoping still reach here with a relative
+                            # filename. A direct export has nothing downstream to
+                            # resolve it, and then this is the only place that can
+                            # name the mesh -- so warn, but claim only what is known.
+                            logger.warning(
+                                "DAE mesh %s is not a file on this host; exporting the "
+                                "reference unconverted for a resolver to rewrite.",
+                                filename,
+                            )
+                        else:
+                            # The converter writes the mesh's base-colour map beside
+                            # the OBJ, and MuJoCo does not read the `.mtl` that
+                            # references it — so without declaring it here the mesh
+                            # renders in the default grey while its texture sits
+                            # unused on disk.
+                            texture_file = converted_mesh_texture(actual_filename)
+                    except Exception as e:
+                        logger.warning("Failed to convert DAE mesh %s: %s", filename, e)
 
             base_name = Path(original_filename).stem or "mesh"
             mesh_name = reserve_resource_name(base_name, used_names)
