@@ -23,7 +23,7 @@ cyberwave_robot_format/
 ├── core.py             # Base classes for parsers/exporters
 ├── urdf/               # URDF parser and exporter
 ├── mjcf/               # MJCF (MuJoCo) parser and exporter
-├── usd/                # USD (OpenUSD) parser and exporter
+├── usd/                # USD (OpenUSD) parser and exporter, scene -> GLB converter
 ├── mesh/               # Mesh processing utilities
 ├── math_utils.py       # Math utilities (Vector3, Quaternion, etc.)
 └── utils.py            # General utilities
@@ -329,6 +329,62 @@ Things worth knowing:
   warning — so both appearances survive the round trip.
 
 Since v0.1.6.
+
+### Convert a USD scene to a GLB
+
+`USDParser` reads USD as a *robot* and never looks at mesh vertices. For a static
+**scene** — a room, a set of props, an Omniverse export — `USDSceneToGLB` bakes the
+stage into one self-contained binary glTF: transforms baked into the vertices,
+materials translated to glTF PBR, textures embedded.
+
+Needs both `usd-core` and Pillow, which the `usd` extra installs.
+
+```python
+from cyberwave_robot_format.usd import USDSceneToGLB
+
+result = USDSceneToGLB(max_texture_size=2048).convert("room.usda")
+open("room.glb", "wb").write(result.glb)
+
+print(result.report.as_dict())  # what was translated, substituted or skipped
+```
+
+- **Z-up by default.** Cyberwave is Z-up and does not re-orient a GLB you upload
+  yourself (it only does so for its own generated meshes), so a standard Y-up glTF
+  would stand on its end. Pass `z_up=False` for glTF-standard Y-up. Units come from
+  the stage's `metersPerUnit`; the output is always metres.
+- **Materials.** `UsdPreviewSurface`, glTF-style MDL (`gltf/pbr.mdl`), OmniPBR-style
+  inputs, and file-based `.mdl` (its constants and texture paths are read as text —
+  MDL is never executed). A material that cannot be resolved, typically an MDL
+  library that is not on disk, becomes neutral grey and is listed in
+  `report.substituted_materials`; `material_overrides={"Carpet": {"base_color":
+  [0.3, 0.33, 0.2], "roughness": 0.95}}` replaces it. Untextured black
+  `chrome`/`steel`/`copper`/`brass`/`plastic_black` materials — which FBX exports
+  leave to the renderer's defaults — get metal PBR values by name
+  (`apply_name_presets=False` turns that off).
+- **Hidden prims are included.** Authors often hide geometry to get it out of a
+  debug camera's way. Pass `include_invisible=False` to honour `visibility`.
+  Guide and proxy geometry is never included.
+- **Node names** follow the prim path (`World.left.gauge.needle`), so a part such as
+  a needle stays addressable in the GLB.
+- **`.usdz` packages** work as given: textures stored inside the package are read
+  back through USD's resolver.
+- **Triangle budget.** `max_triangles` (default 5,000,000) refuses a larger scene with
+  a `ValueError` naming the limit, before any per-corner array is built. Peak memory
+  is roughly 0.75 GB per million triangles, and a 48 MB `.usdc` can hold eight million
+  of them, so a service converting uploads should keep this modest.
+- **Not carried over:** lights, cameras and animation.
+
+Unlike `USDParser`, `allow_external_layers` defaults to **`False`**: the typical
+caller is an upload endpoint. Composition and every texture and `.mdl` the stage
+names must resolve inside the input's directory, or inside `root_dir` if you pass
+one (`convert("extracted/models/scene.usd", root_dir="extracted")`; use it for a
+scene unpacked from a ZIP, where the scene file often sits in a subfolder beside a
+sibling `textures/` folder), otherwise a stage naming
+`/etc/some-image.png` would have that file embedded in the GLB it gets back. Texture
+references that are missing or refused are listed in `report.missing_textures`. A
+texture that is not where it is referenced but has a same-named file elsewhere in
+the input directory is used anyway, with a `report.warnings` entry (noting when
+there were several candidates) so a wrong match is visible.
 
 ### Export positional loop closures to MuJoCo
 

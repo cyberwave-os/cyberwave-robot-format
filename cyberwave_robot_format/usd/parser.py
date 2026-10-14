@@ -200,6 +200,26 @@ class USDParser(BaseParser):
             raise ValueError(f"Could not open USD stage from {path}")
         return stage
 
+    def open_confined(
+        self, path: str | Path, root_dir: str | Path | None = None
+    ) -> Any:
+        """Open the stage at ``path``, enforcing ``allow_external_layers``.
+
+        The public entry for callers that want the composed stage itself rather
+        than a :class:`CommonSchema` (e.g. the scene -> GLB converter): it applies
+        the same confinement ``parse`` does. ``root_dir`` is the directory
+        composition may stay within; it defaults to the file's own directory, and
+        must contain the file. Pass it for an extracted archive whose scene file
+        sits below the archive root, so ``../textures`` beside it is still allowed.
+        """
+        path = Path(path)
+        root = (Path(root_dir) if root_dir is not None else path.parent).resolve()
+        if not _is_within(path.resolve(), root):
+            raise ValueError(f"{path} is not inside the permitted directory {root}.")
+        stage = self._open(path)
+        self._assert_layers_within(stage, {root})
+        return stage
+
     @staticmethod
     def _sniff_suffix(path: Path) -> str | None:
         """Return the USD suffix implied by the file's magic bytes, if any."""
