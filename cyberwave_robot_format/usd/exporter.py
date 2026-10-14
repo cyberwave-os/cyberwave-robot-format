@@ -48,6 +48,8 @@ from cyberwave_robot_format.schema import (
 )
 from cyberwave_robot_format.usd import common as c
 from cyberwave_robot_format.usd import frames as f
+from cyberwave_robot_format.usd import physx as px
+from cyberwave_robot_format.usd import semantics as sem
 from cyberwave_robot_format.usd import tokens as t
 
 logger = logging.getLogger(__name__)
@@ -136,11 +138,24 @@ class USDExporter(BaseExporter):
         stage = self._build_stage(schema)
         return stage.GetRootLayer().ExportToString()
 
+    def build_stage(self, schema: CommonSchema) -> tuple[Any, AssetPaths]:
+        """Build the in-memory stage and report where each entity was authored.
+
+        For callers composing assets into a larger stage (see
+        :func:`cyberwave_robot_format.usd.scene.export_scene_usd`),
+        which need the prim paths without re-deriving the exporter's naming.
+        """
+        builder = self._builder(schema)
+        return builder.stage, builder.asset_paths()
+
     # ------------------------------------------------------------------
     # Stage construction
     # ------------------------------------------------------------------
 
     def _build_stage(self, schema: CommonSchema) -> Any:
+        return self._builder(schema).stage
+
+    def _builder(self, schema: CommonSchema) -> _StageBuilder:
         pxr = c.require_pxr()
         stage = pxr.Usd.Stage.CreateInMemory("cyberwave.usda")
 
@@ -179,7 +194,25 @@ class USDExporter(BaseExporter):
             mesh_search_paths=self.mesh_search_paths,
         )
         builder.build()
-        return stage
+        return builder
+
+
+class AssetPaths:
+    """Prim paths an export authored, relative to the asset's root prim.
+
+    Plain strings (``"Links/base"``), so they can be re-rooted under any prim a
+    composing stage references the asset into.
+    """
+
+    def __init__(self) -> None:
+        self.root_name: str = ""
+        self.links: dict[str, str] = {}
+        self.joints: dict[str, str] = {}
+        self.sensors: dict[str, str] = {}
+        self.rotors: dict[str, str] = {}
+        self.materials: dict[str, str] = {}
+        # ``(subject, message)`` per ``extensions["physx"]`` entry that was skipped.
+        self.physx_problems: list[tuple[str, str]] = []
 
 
 class _StageBuilder:
@@ -210,6 +243,28 @@ class _StageBuilder:
         self._named_materials: dict[str, Material] = {}
         self._shadowed_warned: set[str] = set()
         self._group_members: dict[str, list[Any]] = {}
+        self.sensor_paths: dict[str, Any] = {}
+        self.rotor_paths: dict[str, Any] = {}
+        self.dof_indices = sem.dof_indices(schema)
+        self.physx_problems: list[tuple[str, str]] = []
+        # Whether a zero link mass means "massless" rather than "unknown";
+        # see _write_mass.
+        self._schema_authors_mass = any(link.mass > 0.0 for link in schema.links)
+
+    def asset_paths(self) -> AssetPaths:
+        paths = AssetPaths()
+        paths.root_name = self.root_path.name
+        for target, source in (
+            (paths.links, self.link_paths),
+            (paths.joints, self.joint_paths),
+            (paths.sensors, self.sensor_paths),
+            (paths.rotors, self.rotor_paths),
+            (paths.materials, self.material_paths),
+        ):
+            for name, path in source.items():
+                target[name] = self._relative(path, self.root_path)
+        paths.physx_problems = list(self.physx_problems)
+        return paths
 
     # -- helpers -------------------------------------------------------
 
@@ -292,6 +347,12 @@ class _StageBuilder:
 
         # The whole schema is one reduced-coordinate articulation.
         pxr.UsdPhysics.ArticulationRootAPI.Apply(root_prim)
+        self._write_physx(
+            root_prim,
+            px.ARTICULATION_APIS,
+            px.physx_extension(schema.extensions),
+            schema.metadata.name,
+        )
 
         if root_name != schema.metadata.name:
             c.write_string(root_prim, t.A_NAME, schema.metadata.name)
@@ -308,6 +369,7 @@ class _StageBuilder:
         order["joints"] = self._write_joints()
         order["actuators"], driven_joints = self._write_actuators()
         self._write_passive_drives(driven_joints)
+        self._write_rotors()
         order["contacts"] = self._write_contacts()
         c.write_custom_data_json(root_prim, t.CD_ORDER, _pruned(order))
 
@@ -336,11 +398,15 @@ class _StageBuilder:
             link_order.append(self._relative(path, self.root_path))
 
             self._author_name_sidecar(prim, link.name)
+            c.write_custom_data_value(prim, t.CD_LINK_NAME, link.name)
             self.pxr.UsdPhysics.RigidBodyAPI.Apply(prim)
             self._write_mass(prim, link)
             self._set_transform(prim, world_transforms.get(link.name, _IDENTITY))
             c.write_custom_data_json(prim, t.CD_EXTENSIONS, link.extensions)
             c.write_usd_passthrough(prim, t.USD_PASSTHROUGH_LINK, link.extensions)
+            self._write_physx(
+                prim, px.LINK_APIS, px.physx_extension(link.extensions), link.name
+            )
 
             member_order = {
                 "visuals": self._write_visuals(path, link),
@@ -386,7 +452,15 @@ class _StageBuilder:
 
         Skipping it for a default-inertial link matters: ``physics:mass = 0`` is
         UsdPhysics' request to *derive* mass from density and geometry, the
-        opposite of what a schema mass of ``0.0`` means.
+        opposite of what a schema mass of ``0.0`` means. Only a schema that
+        authors no inertial anywhere leaves a link with collision geometry to
+        that derivation -- there is nothing better to go on. Once another link
+        carries mass, a zero-mass link is a deliberate massless one (Spot's
+        ``body``, whose 32 kg sit on the fixed ``base_link``; a frame such as
+        a camera optical frame or a tool tip): deriving it from its collider
+        added 31 kg to Spot in PhysX, which MuJoCo -- whose exporter gives
+        every zero-mass body a stand-in -- never sees. Those links get the small
+        stand-in from :meth:`_write_massless_fallback` instead.
         """
         inertia = link.inertia
         has_inertia = any(
@@ -406,6 +480,8 @@ class _StageBuilder:
             or link.center_of_mass.z != 0.0
         )
         if link.mass == 0.0 and not has_inertia and not has_com:
+            if not link.collisions or self._schema_authors_mass:
+                self._write_massless_fallback(prim, link)
             return
 
         mass_api = self.pxr.UsdPhysics.MassAPI.Apply(prim)
@@ -439,6 +515,30 @@ class _StageBuilder:
                 ],
             )
 
+    def _write_massless_fallback(self, prim: Any, link: Link) -> None:
+        """Give a link with nothing to weigh a tiny, explicit inertial.
+
+        Every link is a rigid body here, and UsdPhysics cannot express a
+        massless one: with no mass and no collider PhysX invents an inertial
+        and misplaces the frame. The native ``MassAPI`` carries the stand-in;
+        the sidecars keep the schema's zeros, so import and re-export are
+        unchanged, and :data:`t.A_LINK_MASS_FALLBACK` marks the substitution.
+        """
+        mass_api = self.pxr.UsdPhysics.MassAPI.Apply(prim)
+        mass_api.CreateMassAttr(float(t.MASSLESS_LINK_FALLBACK_MASS_KG))
+        inertia = float(t.MASSLESS_LINK_FALLBACK_INERTIA_KG_M2)
+        mass_api.CreateDiagonalInertiaAttr(self.pxr.Gf.Vec3f(inertia, inertia, inertia))
+        mass_api.CreateCenterOfMassAttr(self.pxr.Gf.Vec3f(0.0, 0.0, 0.0))
+        c.write_double(prim, t.A_LINK_MASS, link.mass)
+        c.write_float_list(prim, t.A_LINK_INERTIA, [0.0] * 6)
+        c.write_bool(prim, t.A_LINK_MASS_FALLBACK, True)
+        logger.debug(
+            "Link %r has no mass, inertia or collision geometry; authored a "
+            "%g kg stand-in inertial.",
+            link.name,
+            t.MASSLESS_LINK_FALLBACK_MASS_KG,
+        )
+
     # -- visuals / collisions ------------------------------------------
 
     def _write_visuals(self, link_path: Any, link: Link) -> list[str]:
@@ -449,7 +549,10 @@ class _StageBuilder:
         for index, visual in enumerate(link.visuals):
             schema_name = visual.name or f"{t.UNNAMED_VISUAL_PREFIX}{index}"
             path, _ = self._child_path(scope, schema_name)
-            prim = self._write_geometry_prim(path, visual.geometry, visual.pose)
+            textured = bool(visual.material and visual.material.texture)
+            prim = self._write_geometry_prim(
+                path, visual.geometry, visual.pose, textured=textured
+            )
             order.append(self._relative(path, link_path))
             self._author_optional_name(prim, visual.name)
             c.write_custom_data_json(prim, t.CD_EXTENSIONS, visual.extensions)
@@ -472,6 +575,12 @@ class _StageBuilder:
                 prim, t.USD_PASSTHROUGH_COLLISION, collision.extensions
             )
             self._write_collision_physics(prim, collision)
+            self._write_physx(
+                prim,
+                px.COLLISION_APIS,
+                px.physx_extension(collision.extensions),
+                f"{link.name}/{schema_name}",
+            )
             self._group_members.setdefault(collision.group, []).append(path)
         return order
 
@@ -503,7 +612,7 @@ class _StageBuilder:
             self._bind_material(prim, physics_material, purpose=t.TOK_MATERIAL_PURPOSE_PHYSICS)
 
     def _write_geometry_prim(
-        self, path: Any, geometry: Geometry | None, pose: Pose
+        self, path: Any, geometry: Geometry | None, pose: Pose, *, textured: bool = False
     ) -> Any:
         pxr = self.pxr
         geometry_type = geometry.type if geometry else GeometryType.UNKNOWN
@@ -516,7 +625,9 @@ class _StageBuilder:
             # Visual.geometry / Collision.geometry was None rather than UNKNOWN.
             return prim
 
-        scale = self._write_native_geometry(prim, geometry, geometry_type)
+        scale = self._write_native_geometry(
+            prim, geometry, geometry_type, textured=textured
+        )
         if scale is not None:
             self._set_scale(prim, scale)
 
@@ -535,7 +646,12 @@ class _StageBuilder:
         return prim
 
     def _write_native_geometry(
-        self, prim: Any, geometry: Geometry, geometry_type: GeometryType
+        self,
+        prim: Any,
+        geometry: Geometry,
+        geometry_type: GeometryType,
+        *,
+        textured: bool = False,
     ) -> tuple[float, float, float] | None:
         """Author the native ``UsdGeom`` attributes; return an ``xformOp:scale``."""
         pxr = self.pxr
@@ -581,7 +697,7 @@ class _StageBuilder:
 
         if geometry_type == GeometryType.MESH:
             if self.bake_meshes and geometry.filename:
-                self._bake_mesh_points(prim, geometry.filename)
+                self._bake_mesh_points(prim, geometry.filename, uvs=textured)
             if geometry.scale:
                 return (geometry.scale.x, geometry.scale.y, geometry.scale.z)
             return None
@@ -614,12 +730,16 @@ class _StageBuilder:
                 return resolved
         return None
 
-    def _bake_mesh_points(self, prim: Any, filename: str) -> None:
+    def _bake_mesh_points(self, prim: Any, filename: str, *, uvs: bool = False) -> None:
         """Author mesh points into the prim, best-effort.
 
         Unresolvable or unloadable meshes degrade to a reference-only placeholder
         rather than failing the export: the asset reference itself is already
         preserved in ``cyberwave:geometry:meshFilename``.
+
+        With *uvs* (a textured visual) the mesh's per-vertex texture coordinates
+        are authored as the ``st`` primvar the material's ``UsdPrimvarReader``
+        reads; a mesh without them keeps the material's base color.
         """
         resolved = self._resolve_mesh(filename)
         if resolved is None:
@@ -636,6 +756,8 @@ class _StageBuilder:
             loaded: Any = trimesh.load(resolved, force="mesh")
             vertices = np.asarray(loaded.vertices, dtype=np.float64)
             faces = np.asarray(loaded.faces, dtype=np.int64)
+            uv = getattr(loaded.visual, "uv", None) if uvs else None
+            uv = np.asarray(uv, dtype=np.float32) if uv is not None else None
         except Exception as exc:
             logger.warning(
                 "Could not bake mesh %r into USD (%s); the prim keeps only the "
@@ -653,6 +775,16 @@ class _StageBuilder:
             pxr.Vt.IntArray([int(i) for i in faces.flatten()])
         )
         mesh.CreateSubdivisionSchemeAttr(pxr.UsdGeom.Tokens.none)
+        if uv is not None and uv.shape == (len(vertices), 2):
+            pxr.UsdGeom.PrimvarsAPI(prim).CreatePrimvar(
+                "st", pxr.Sdf.ValueTypeNames.TexCoord2fArray, pxr.UsdGeom.Tokens.vertex
+            ).Set(pxr.Vt.Vec2fArray.FromNumpy(uv))
+        elif uvs:
+            logger.warning(
+                "Textured mesh %r has no per-vertex UVs; it renders with the "
+                "material's base color.",
+                filename,
+            )
 
     # -- materials -----------------------------------------------------
 
@@ -831,6 +963,10 @@ class _StageBuilder:
             order.append(self._relative(path, self.root_path))
 
             self._author_name_sidecar(prim, joint.name)
+            c.write_custom_data_value(prim, t.CD_JOINT_NAME, joint.name)
+            c.write_custom_data_value(
+                prim, t.CD_DOF_INDEX, self.dof_indices.get(joint.name)
+            )
             self._write_joint_bodies(usd_joint, joint)
             self._write_joint_frames(usd_joint, joint)
             self._write_joint_limits(usd_joint, joint)
@@ -838,7 +974,47 @@ class _StageBuilder:
             self._write_joint_sidecars(prim, joint)
             c.write_custom_data_json(prim, t.CD_EXTENSIONS, joint.extensions)
             c.write_usd_passthrough(prim, t.USD_PASSTHROUGH_JOINT, joint.extensions)
+            # Derived first, so a valid extensions["physx"] value overrides it and
+            # an invalid one is skipped without losing the derived value.
+            self._write_physx(
+                prim, px.JOINT_APIS, px.derived_joint_physx(joint), joint.name
+            )
+            self._write_physx(
+                prim, px.JOINT_APIS, px.physx_extension(joint.extensions), joint.name
+            )
+        self._write_native_mimics()
         return order
+
+    def _write_native_mimics(self) -> None:
+        """Author each mimic Isaac can simulate as a ``NewtonMimicAPI``.
+
+        A second pass, because the leader can come after its follower. A mimic
+        NVIDIA cannot express keeps only its sidecars and is passive in Isaac.
+        """
+        joints = {joint.name: joint for joint in self.schema.joints}
+        for joint in self.schema.joints:
+            if joint.mimic is None:
+                continue
+            leader = joints.get(joint.mimic.joint)
+            problem = px.native_mimic_problem(joint, leader)
+            if problem is not None:
+                logger.warning(
+                    "Mimic joint %r is not authored natively: %s.", joint.name, problem
+                )
+                continue
+            px.write_newton_mimic(
+                self.stage.GetPrimAtPath(self.joint_paths[joint.name]),
+                self.joint_paths[joint.mimic.joint],
+                joint.mimic,
+                angular=joint.type in t.ANGULAR_JOINT_TYPES,
+            )
+
+    def _write_physx(
+        self, prim: Any, apis: frozenset[str], values: dict[str, Any], subject: str
+    ) -> None:
+        for problem in px.write_physx(prim, apis, values):
+            logger.warning("Skipping PhysX attribute on %r: %s.", subject, problem)
+            self.physx_problems.append((subject, problem))
 
     def _write_joint_bodies(self, usd_joint: Any, joint: Joint) -> None:
         """Wire ``physics:body0``/``body1``.
@@ -959,8 +1135,9 @@ class _StageBuilder:
             c.write_double(prim, t.A_JOINT_DYN_BACKLASH, dynamics.backlash)
 
         if joint.mimic is not None:
-            # No core UsdPhysics equivalent (PhysX has PhysxMimicJointAPI, which
-            # is not part of usd-core), so this is sidecar-only.
+            # No core UsdPhysics equivalent. The sidecars are authoritative; a
+            # NewtonMimicAPI is added on top where Isaac can simulate the coupling
+            # (see _write_native_mimics).
             c.write_string(prim, t.A_JOINT_MIMIC_JOINT, joint.mimic.joint)
             c.write_double(prim, t.A_JOINT_MIMIC_MULTIPLIER, joint.mimic.multiplier)
             c.write_double(prim, t.A_JOINT_MIMIC_OFFSET, joint.mimic.offset)
@@ -1038,26 +1215,46 @@ class _StageBuilder:
         )
 
     def _write_drive(self, joint: Joint, actuator: Actuator) -> bool:
+        """Author the joint's ``UsdPhysicsDriveAPI`` for its primary actuator.
+
+        The gains follow the actuator's control mode, mirroring what the MJCF
+        exporter emits and cyberwave-sim drives: a position servo is a
+        stiffness/damping drive towards ``home_position``; a velocity servo is a
+        pure damping drive (``kd`` is MJCF ``kv``) towards zero velocity; a motor
+        is an effort-only drive with no gains, only ``maxForce``. Angular gains
+        are converted to UsdPhysics' per-degree units.
+        """
         drive = self._drive_target(joint)
         if drive is None:
             return False
         is_angular = joint.type in t.ANGULAR_JOINT_TYPES
+        mode = sem.CONTROL_MODE_FOR_ACTUATOR.get(actuator.type)
         drive.CreateTypeAttr(
             t.DRIVE_TYPE_FOR_ACTUATOR.get(actuator.type, t.TOK_DRIVE_FORCE)
         )
-        if actuator.kp is not None:
-            drive.CreateStiffnessAttr(float(actuator.kp))
-        if actuator.kd is not None:
-            drive.CreateDampingAttr(float(actuator.kd))
+        if mode == "position":
+            if actuator.kp is not None:
+                drive.CreateStiffnessAttr(
+                    sem.angular_gain_to_usd(actuator.kp, is_angular)
+                )
+            if actuator.kd is not None:
+                drive.CreateDampingAttr(sem.angular_gain_to_usd(actuator.kd, is_angular))
+            if joint.home_position is not None:
+                drive.CreateTargetPositionAttr(
+                    _to_usd_angle(joint.home_position, is_angular)
+                )
+        elif mode == "velocity":
+            if actuator.kd is not None:
+                drive.CreateDampingAttr(sem.angular_gain_to_usd(actuator.kd, is_angular))
+            drive.CreateTargetVelocityAttr(0.0)
         max_force = actuator.max_torque
         if max_force is None and actuator.force_range is not None:
             max_force = max(abs(actuator.force_range[0]), abs(actuator.force_range[1]))
         if max_force is not None:
             drive.CreateMaxForceAttr(float(max_force))
-        if joint.home_position is not None:
-            drive.CreateTargetPositionAttr(
-                _to_usd_angle(joint.home_position, is_angular)
-            )
+        prim = drive.GetPrim()
+        c.write_custom_data_value(prim, t.CD_CONTROL_MODE, mode)
+        c.write_custom_data_value(prim, t.CD_ACTUATOR_NAME, actuator.name)
         return True
 
     def _write_passive_drive(self, joint: Joint) -> None:
@@ -1072,9 +1269,13 @@ class _StageBuilder:
         is_angular = joint.type in t.ANGULAR_JOINT_TYPES
         drive.CreateTypeAttr(t.TOK_DRIVE_FORCE)
         if dynamics.spring_stiffness != 0.0:
-            drive.CreateStiffnessAttr(float(dynamics.spring_stiffness))
+            drive.CreateStiffnessAttr(
+                sem.angular_gain_to_usd(dynamics.spring_stiffness, is_angular)
+            )
         if dynamics.damping != 0.0:
-            drive.CreateDampingAttr(float(dynamics.damping))
+            drive.CreateDampingAttr(
+                sem.angular_gain_to_usd(dynamics.damping, is_angular)
+            )
         target = (
             joint.home_position
             if joint.home_position is not None
@@ -1087,10 +1288,36 @@ class _StageBuilder:
     def _write_sensor(
         self, parent_path: Any, sensor: Sensor, nested_under_link: bool
     ) -> Any:
+        """Author a sensor as a typed prim plus its raw schema record.
+
+        Cameras (rgb/depth/first-person) become ``UsdGeomCamera`` with the full
+        pinhole model; every other sensor is an ``Xform`` mount frame. Either way
+        the prim carries the portable ``cyberwave:sensorKind`` /
+        ``cyberwave:sensorParams`` customData a runtime instantiates its own
+        sensor from (no simulator-specific sensor schema is authored), and the
+        verbatim ``cyberwave:sensor:*`` attributes that make the round trip exact.
+
+        Camera frames need no conversion: ``CommonSchema`` camera poses use the
+        MuJoCo convention (look along -Z, +Y up), which is also USD's.
+        """
+        kind = sem.sensor_kind(sensor.type)
+        is_camera = kind in sem.CAMERA_KINDS
         path, _ = self._child_path(parent_path, sensor.name)
-        prim = self._define(self.pxr.UsdGeom.Xform, path).GetPrim()
+        schema_type = self.pxr.UsdGeom.Camera if is_camera else self.pxr.UsdGeom.Xform
+        prim = self._define(schema_type, path).GetPrim()
+        self.sensor_paths.setdefault(sensor.name, path)
         self._author_name_sidecar(prim, sensor.name)
         self._set_local_pose(prim, sensor.pose)
+        c.write_custom_data_value(prim, t.CD_SENSOR_NAME, sensor.name)
+        c.write_custom_data_value(prim, t.CD_SENSOR_KIND, kind)
+        c.write_custom_data_value(
+            prim, t.CD_SENSOR_PARAMS, sem.normalized_sensor_params(sensor, kind)
+        )
+        if is_camera:
+            write_camera_intrinsics(
+                self.pxr.UsdGeom.Camera(prim),
+                sem.camera_intrinsics(sensor.parameters),
+            )
 
         # `type` is free-form in the schema (IMU, camera, lidar, rangefinder, ...)
         # and is written verbatim: mapping it onto a USD vocabulary would need a
@@ -1106,6 +1333,34 @@ class _StageBuilder:
             c.write_string(prim, t.A_SENSOR_PARENT_LINK, sensor.parent_link)
         c.write_custom_data_json(prim, t.CD_EXTENSIONS, sensor.extensions)
         return path
+
+    # -- rotors --------------------------------------------------------
+
+    def _write_rotors(self) -> None:
+        """Author a frame per thrust-producing site motor under its link.
+
+        ``Links/<link>/Rotors/<actuator>`` sits at the MJCF site's pose and
+        carries ``cyberwave:rotor`` (thrust axis, gain, reaction torque ratio,
+        control range). USD has no thruster schema, so a runtime applies the
+        force itself; the ``Actuators`` record keeps the round trip exact.
+        """
+        sites = sem.sites_by_name(self.schema)
+        for actuator in self.schema.actuators:
+            rotor = sem.rotor_spec(actuator, sites)
+            if rotor is None or rotor.link not in self.link_paths:
+                continue
+            scope = self._scope(self.link_paths[rotor.link], t.SCOPE_ROTORS)
+            path, _ = self._child_path(scope, actuator.name)
+            prim = self._define(self.pxr.UsdGeom.Xform, path).GetPrim()
+            self.rotor_paths[actuator.name] = path
+            self._set_transform(
+                prim,
+                f.pose_to_matrix(
+                    Pose(position=rotor.position, orientation=rotor.orientation)
+                ),
+            )
+            c.write_custom_data_value(prim, t.CD_ACTUATOR_NAME, actuator.name)
+            c.write_custom_data_value(prim, t.CD_ROTOR, rotor.to_custom_data())
 
     # -- contacts ------------------------------------------------------
 
@@ -1290,6 +1545,9 @@ class _StageBuilder:
 
         _write_contact_surface(prim, t.PHYSICS_CONTACT_PREFIX, physics.contact)
         c.write_custom_data_json(prim, t.CD_EXTENSIONS, physics.extensions)
+        self._write_physx(
+            prim, px.SCENE_APIS, px.physx_extension(physics.extensions), "physics"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1323,6 +1581,26 @@ def _pruned(order: dict[str, list[str]]) -> dict[str, list[str]]:
     ``"contacts":[]`` noise on the majority of models.
     """
     return {key: value for key, value in order.items() if value}
+
+
+def write_camera_intrinsics(camera: Any, intrinsics: sem.CameraIntrinsics) -> None:
+    """Author a pinhole model on a ``UsdGeomCamera`` (see ``CameraIntrinsics``)."""
+    pxr = c.require_pxr()
+    camera.CreateProjectionAttr(pxr.UsdGeom.Tokens.perspective)
+    camera.CreateFocalLengthAttr(intrinsics.usd_focal_length)
+    camera.CreateHorizontalApertureAttr(intrinsics.usd_horizontal_aperture)
+    camera.CreateVerticalApertureAttr(intrinsics.usd_vertical_aperture)
+    if intrinsics.usd_horizontal_aperture_offset != 0.0:
+        camera.CreateHorizontalApertureOffsetAttr(
+            intrinsics.usd_horizontal_aperture_offset
+        )
+    if intrinsics.usd_vertical_aperture_offset != 0.0:
+        camera.CreateVerticalApertureOffsetAttr(
+            intrinsics.usd_vertical_aperture_offset
+        )
+    camera.CreateClippingRangeAttr(
+        pxr.Gf.Vec2f(intrinsics.near_clip, intrinsics.far_clip)
+    )
 
 
 def _to_usd_angle(value: float, is_angular: bool) -> float:

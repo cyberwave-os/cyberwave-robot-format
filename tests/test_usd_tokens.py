@@ -215,8 +215,11 @@ class TestBothSidesUseEveryConstant:
         import cyberwave_robot_format.usd as usd_package
 
         directory = Path(usd_package.__file__).parent
+        # The scene exporter authors the scene-level keys on the composed stage,
+        # so it counts as part of the writing side.
+        writers = ("exporter.py", "scene.py")
         return (
-            (directory / "exporter.py").read_text(),
+            "\n".join((directory / name).read_text() for name in writers),
             (directory / "parser.py").read_text(),
         )
 

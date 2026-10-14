@@ -64,6 +64,8 @@ from cyberwave_robot_format.schema import (
 )
 from cyberwave_robot_format.usd import common as c
 from cyberwave_robot_format.usd import frames as f
+from cyberwave_robot_format.usd import physx as px
+from cyberwave_robot_format.usd import semantics as sem
 from cyberwave_robot_format.usd import tokens as t
 
 logger = logging.getLogger(__name__)
@@ -286,7 +288,10 @@ class _StageReader:
     def read(self) -> CommonSchema:
         self.root_prim = self._find_root_prim()
         schema = CommonSchema(metadata=self._read_metadata())
-        schema.extensions = c.read_extensions(self.root_prim, t.CD_EXTENSIONS)
+        schema.extensions = px.merge_physx(
+            c.read_extensions(self.root_prim, t.CD_EXTENSIONS),
+            px.read_physx(self.root_prim, px.ARTICULATION_APIS),
+        )
 
         schema.links = self._read_links()
         schema.joints = self._read_joints()
@@ -404,9 +409,12 @@ class _StageReader:
                     inertia=self._read_inertia(prim),
                     visuals=visuals,
                     collisions=collisions,
-                    extensions=c.merge_usd_passthrough(
-                        c.read_extensions(prim, t.CD_EXTENSIONS),
-                        c.read_usd_passthrough(prim, t.USD_PASSTHROUGH_LINK),
+                    extensions=px.merge_physx(
+                        c.merge_usd_passthrough(
+                            c.read_extensions(prim, t.CD_EXTENSIONS),
+                            c.read_usd_passthrough(prim, t.USD_PASSTHROUGH_LINK),
+                        ),
+                        px.read_physx(prim, px.LINK_APIS),
                     ),
                 )
             )
@@ -416,6 +424,9 @@ class _StageReader:
         sidecar = c.read_double(prim, t.A_LINK_MASS)
         if sidecar is not None:
             return sidecar
+        if c.read_bool(prim, t.A_LINK_MASS_FALLBACK):
+            # The native mass is the exporter's stand-in, not the link's.
+            return 0.0
         native = c.read_native(self.pxr.UsdPhysics.MassAPI(prim).GetMassAttr())
         return float(native) if native is not None else 0.0
 
@@ -443,6 +454,8 @@ class _StageReader:
                 ixz=sidecar[4],
                 iyz=sidecar[5],
             )
+        if c.read_bool(prim, t.A_LINK_MASS_FALLBACK):
+            return Inertia()
         mass_api = self.pxr.UsdPhysics.MassAPI(prim)
         diagonal = c.read_native(mass_api.GetDiagonalInertiaAttr())
         if diagonal is None:
@@ -554,9 +567,12 @@ class _StageReader:
             restitution=restitution,
             stiffness=c.read_double(prim, t.A_COLLISION_STIFFNESS),
             damping=c.read_double(prim, t.A_COLLISION_DAMPING),
-            extensions=c.merge_usd_passthrough(
-                c.read_extensions(prim, t.CD_EXTENSIONS),
-                c.read_usd_passthrough(prim, t.USD_PASSTHROUGH_COLLISION),
+            extensions=px.merge_physx(
+                c.merge_usd_passthrough(
+                    c.read_extensions(prim, t.CD_EXTENSIONS),
+                    c.read_usd_passthrough(prim, t.USD_PASSTHROUGH_COLLISION),
+                ),
+                px.read_physx(prim, px.COLLISION_APIS),
             ),
         )
 
@@ -911,6 +927,20 @@ class _StageReader:
             c.read_extensions(prim, t.CD_EXTENSIONS),
             c.read_usd_passthrough(prim, t.USD_PASSTHROUGH_JOINT),
         )
+        # On our own output the velocity limit and armature are float32 copies of
+        # sidecars _read_joint_limits/_read_joint_dynamics already read.
+        extensions = px.merge_physx(
+            extensions,
+            px.read_physx(
+                prim,
+                px.JOINT_APIS,
+                skip=(
+                    px.DERIVED_JOINT_KEYS
+                    if self._is_cyberwave_authored(prim)
+                    else frozenset()
+                ),
+            ),
+        )
         drive = self._drive_attributes(prim, joint_type)
         if drive is not None:
             target_velocity = c.read_native(drive.GetTargetVelocityAttr())
@@ -1044,7 +1074,8 @@ class _StageReader:
 
         In USD a drive whose stiffness pulls towards a target and whose damping
         resists motion *is* a spring-damper, so this is the inverse of what the
-        exporter writes for an un-actuated joint with dynamics.
+        exporter writes for an un-actuated joint with dynamics. Angular gains are
+        per degree in UsdPhysics and per radian in the schema.
         """
         joint_type = self._read_joint_type(prim)
         drive = self._drive_attributes(prim, joint_type)
@@ -1054,9 +1085,18 @@ class _StageReader:
         damping = c.read_native(drive.GetDampingAttr())
         if stiffness is None and damping is None:
             return None
+        is_angular = joint_type in t.ANGULAR_JOINT_TYPES
         return JointDynamics(
-            damping=float(damping) if damping is not None else 0.0,
-            spring_stiffness=float(stiffness) if stiffness is not None else 0.0,
+            damping=(
+                sem.angular_gain_from_usd(damping, is_angular)
+                if damping is not None
+                else 0.0
+            ),
+            spring_stiffness=(
+                sem.angular_gain_from_usd(stiffness, is_angular)
+                if stiffness is not None
+                else 0.0
+            ),
         )
 
     def _read_home_position(self, prim: Any, joint_type: JointType) -> float | None:
@@ -1085,7 +1125,7 @@ class _StageReader:
     def _read_mimic(self, prim: Any) -> MimicJoint | None:
         driver = c.read_string(prim, t.A_JOINT_MIMIC_JOINT)
         if driver is None:
-            return None
+            return self._read_native_mimic(prim)
         return MimicJoint(
             joint=driver,
             multiplier=_or_default(
@@ -1094,6 +1134,26 @@ class _StageReader:
             offset=_or_default(
                 c.read_double(prim, t.A_JOINT_MIMIC_OFFSET), MimicJoint.offset
             ),
+        )
+
+    def _read_native_mimic(self, prim: Any) -> MimicJoint | None:
+        """A foreign stage's ``NewtonMimicAPI``/``PhysxMimicJointAPI`` coupling."""
+        native = px.read_native_mimic(prim)
+        if native is None:
+            return None
+        leader_path, multiplier, offset = native
+        leader = prim.GetStage().GetPrimAtPath(leader_path)
+        if not leader or not leader.IsA(self.pxr.UsdPhysics.Joint):
+            self.context.add_warning(
+                f"Mimic on {prim.GetPath()} targets {leader_path}, which is not a "
+                "joint; the coupling is dropped."
+            )
+            return None
+        angular = self._read_joint_type(prim) in t.ANGULAR_JOINT_TYPES
+        return MimicJoint(
+            joint=c.schema_name_from_prim(leader),
+            multiplier=multiplier,
+            offset=math.radians(offset) if angular else offset,
         )
 
     # -- actuators / sensors / contacts ---------------------------------
@@ -1168,13 +1228,22 @@ class _StageReader:
             if stiffness is None and damping is None and max_force is None:
                 continue
             joint_name = c.schema_name_from_prim(prim)
+            is_angular = joint_type in t.ANGULAR_JOINT_TYPES
             actuators.append(
                 Actuator(
                     name=f"{joint_name}_drive",
                     joint=joint_name,
                     type=ActuatorType.POSITION,
-                    kp=float(stiffness) if stiffness is not None else None,
-                    kd=float(damping) if damping is not None else None,
+                    kp=(
+                        sem.angular_gain_from_usd(stiffness, is_angular)
+                        if stiffness is not None
+                        else None
+                    ),
+                    kd=(
+                        sem.angular_gain_from_usd(damping, is_angular)
+                        if damping is not None
+                        else None
+                    ),
                     max_torque=(
                         float(max_force)
                         if max_force is not None and math.isfinite(float(max_force))
@@ -1360,7 +1429,10 @@ class _StageReader:
             ),
             solver=solver,
             contact=_read_contact_surface(prim, t.PHYSICS_CONTACT_PREFIX),
-            extensions=c.read_extensions(prim, t.CD_EXTENSIONS),
+            extensions=px.merge_physx(
+                c.read_extensions(prim, t.CD_EXTENSIONS),
+                px.read_physx(prim, px.SCENE_APIS),
+            ),
         )
 
     def _find_physics_scene(self) -> Any | None:

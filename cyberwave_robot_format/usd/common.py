@@ -48,7 +48,7 @@ def require_pxr() -> SimpleNamespace:
     global _PXR
     if _PXR is None:
         try:
-            from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils, Vt
+            from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade, UsdUtils, Vt
         except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
             raise ImportError(
                 "USD support requires the 'pxr' module. Install it with "
@@ -61,6 +61,7 @@ def require_pxr() -> SimpleNamespace:
             Tf=Tf,
             Usd=Usd,
             UsdGeom=UsdGeom,
+            UsdLux=UsdLux,
             UsdPhysics=UsdPhysics,
             UsdShade=UsdShade,
             UsdUtils=UsdUtils,
@@ -517,6 +518,48 @@ def write_custom_data_json(prim: Any, key: str, value: Any) -> None:
     if value is None or (isinstance(value, dict) and not value):
         return
     prim.SetCustomDataByKey(key, dumps_json(value))
+
+
+def _to_custom_data_value(value: Any) -> Any | None:
+    """Convert a scalar/list/dict payload into the value types USD stores natively."""
+    vt = require_pxr().Vt
+    if value is None:
+        return None
+    if isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        converted = {
+            str(key): item
+            for key, item in ((k, _to_custom_data_value(v)) for k, v in value.items())
+            if item is not None
+        }
+        return converted or None
+    if isinstance(value, list | tuple):
+        if all(isinstance(item, str) for item in value):
+            return vt.StringArray([str(item) for item in value])
+        if all(
+            isinstance(item, int | float) and not isinstance(item, bool)
+            for item in value
+        ):
+            return vt.DoubleArray([float(item) for item in value])
+    raise TypeError(f"Unsupported customData value: {value!r}")
+
+
+def write_custom_data_value(prim: Any, key: str, value: Any) -> None:
+    """Store a plain USD value (not JSON) in ``customData`` under ``key``.
+
+    Used for the portable identity keys (``cyberwave:linkName``,
+    ``cyberwave:sensorParams`` ...) that a non-Cyberwave consumer reads directly.
+    Strings, ints, bools and finite floats are stored as-is, number/string lists
+    as ``double[]``/``string[]``, dicts as nested USD dictionaries (which
+    ``.usda`` writes in sorted key order). ``None`` and empty dicts are skipped.
+    """
+    converted = _to_custom_data_value(value)
+    if converted is None:
+        return
+    prim.SetCustomDataByKey(key, converted)
 
 
 def read_custom_data_json(prim: Any, key: str) -> Any | None:

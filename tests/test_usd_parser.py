@@ -579,14 +579,15 @@ def Xform "Robot" (prepend apiSchemas = ["PhysicsArticulationRootAPI"])
         assert actuator.name == "j_drive"
         assert actuator.joint == "j"
         assert actuator.type == ActuatorType.POSITION
-        assert math.isclose(actuator.kp, 250.0, abs_tol=1e-4)
-        assert math.isclose(actuator.kd, 12.5, abs_tol=1e-4)
+        # UsdPhysics angular gains are per degree; the schema's are per radian.
+        assert math.isclose(actuator.kp, math.degrees(250.0), rel_tol=1e-6)
+        assert math.isclose(actuator.kd, math.degrees(12.5), rel_tol=1e-6)
         assert math.isclose(actuator.max_torque, 80.0, abs_tol=1e-4)
 
     def test_a_drive_yields_joint_dynamics(self):
         dynamics = parse(self.FIXTURE).joints[0].dynamics
-        assert math.isclose(dynamics.spring_stiffness, 250.0, abs_tol=1e-4)
-        assert math.isclose(dynamics.damping, 12.5, abs_tol=1e-4)
+        assert math.isclose(dynamics.spring_stiffness, math.degrees(250.0), rel_tol=1e-6)
+        assert math.isclose(dynamics.damping, math.degrees(12.5), rel_tol=1e-6)
 
     def test_drive_target_becomes_home_position_in_radians(self):
         home = parse(self.FIXTURE).joints[0].home_position

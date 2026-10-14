@@ -222,18 +222,152 @@ class TestLinkLayout:
 
 
 class TestMass:
-    def test_mass_api_is_omitted_for_a_default_inertial(self):
+    def test_mass_api_is_omitted_for_a_default_inertial_with_geometry(self):
         # physics:mass = 0 asks UsdPhysics to derive mass from density and geometry,
         # the opposite of what a schema mass of 0.0 means — so MassAPI must not be
-        # applied at all for a link with no inertial data.
+        # applied at all for a link with no inertial data but a collider to
+        # derive it from.
         stage = open_exported(
-            CommonSchema(metadata=Metadata(name="r"), links=[Link(name="a")])
+            CommonSchema(
+                metadata=Metadata(name="r"),
+                links=[Link(name="a", collisions=[Collision(geometry=sphere(0.1))])],
+            )
         )
         link = stage.GetPrimAtPath(
             stage.GetDefaultPrim().GetPath().AppendPath("Links/a")
         )
         assert link.HasAPI(UsdPhysics.RigidBodyAPI)
         assert not link.HasAPI(UsdPhysics.MassAPI)
+        assert not link.GetAttribute(t.A_LINK_MASS_FALLBACK).IsValid()
+
+    def test_zero_mass_collider_link_is_massless_once_the_schema_has_inertials(self):
+        # Spot: the floating-base `body` link carries the collision mesh but no
+        # inertial; its 32 kg sit on `base_link`, fixed to it. Deriving `body`'s
+        # mass from its collider gave PhysX an 81 kg Spot (MuJoCo: 50 kg) that
+        # the policy could not hold up. With inertials authored elsewhere, zero
+        # means massless, as the MJCF exporter already treats it.
+        schema = CommonSchema(
+            metadata=Metadata(name="dog"),
+            links=[
+                Link(name="body", collisions=[Collision(geometry=sphere(0.3))]),
+                Link(
+                    name="base_link",
+                    mass=32.86,
+                    inertia=Inertia(ixx=0.1, iyy=0.9, izz=0.9),
+                ),
+            ],
+            joints=[
+                Joint(
+                    name="base_joint",
+                    type=JointType.FIXED,
+                    parent_link="body",
+                    child_link="base_link",
+                )
+            ],
+        )
+        stage = open_exported(schema)
+        body = stage.GetPrimAtPath(
+            stage.GetDefaultPrim().GetPath().AppendPath("Links/body")
+        )
+        assert body.HasAPI(UsdPhysics.MassAPI)
+        assert UsdPhysics.MassAPI(body).GetMassAttr().Get() == pytest.approx(
+            t.MASSLESS_LINK_FALLBACK_MASS_KG
+        )
+        assert body.GetAttribute(t.A_LINK_MASS_FALLBACK).Get() is True
+
+        parsed = USDParser().parse_string(export(schema))
+        by_name = {link.name: link for link in parsed.links}
+        assert by_name["body"].mass == 0.0
+        assert by_name["body"].inertia == Inertia()
+        assert by_name["base_link"].mass == pytest.approx(32.86)
+        assert export(parsed) == export(schema)
+
+    def test_massless_link_without_geometry_gets_a_tiny_explicit_inertial(self):
+        # A bare frame (camera optical frame, tool tip) is still a rigid body,
+        # and with nothing to derive a mass from PhysX invents one ("negative
+        # mass, small sphere approximated inertia") that moved the Kinova wrist
+        # camera off the arm. The exporter authors a gram-scale stand-in.
+        stage = open_exported(
+            CommonSchema(
+                metadata=Metadata(name="r"),
+                links=[Link(name="a", visuals=[Visual(geometry=sphere(0.01))])],
+            )
+        )
+        link = stage.GetPrimAtPath(
+            stage.GetDefaultPrim().GetPath().AppendPath("Links/a")
+        )
+        assert link.HasAPI(UsdPhysics.RigidBodyAPI)
+        assert link.HasAPI(UsdPhysics.MassAPI)
+        mass_api = UsdPhysics.MassAPI(link)
+        assert mass_api.GetMassAttr().Get() == pytest.approx(
+            t.MASSLESS_LINK_FALLBACK_MASS_KG
+        )
+        assert tuple(mass_api.GetDiagonalInertiaAttr().Get()) == pytest.approx(
+            (t.MASSLESS_LINK_FALLBACK_INERTIA_KG_M2,) * 3
+        )
+        assert tuple(mass_api.GetCenterOfMassAttr().Get()) == (0.0, 0.0, 0.0)
+        assert link.GetAttribute(t.A_LINK_MASS_FALLBACK).Get() is True
+        # The sidecars keep the schema's own values.
+        assert link.GetAttribute(t.A_LINK_MASS).Get() == 0.0
+        assert list(link.GetAttribute(t.A_LINK_INERTIA).Get()) == [0.0] * 6
+
+    def test_massless_frame_chain_round_trips_to_zero_mass(self):
+        # The Kinova wrist: bracelet -> end_effector_link -> camera frames, all
+        # fixed, none with mass, inertia or geometry.
+        frames = ["end_effector_link", "camera_link", "camera_depth_frame"]
+        schema = CommonSchema(
+            metadata=Metadata(name="wrist"),
+            links=[
+                Link(
+                    name="bracelet_link",
+                    mass=0.5,
+                    inertia=Inertia(ixx=1e-3, iyy=1e-3, izz=1e-3),
+                ),
+                *(Link(name=name) for name in frames),
+            ],
+            joints=[
+                Joint(
+                    name=f"{child}_joint",
+                    type=JointType.FIXED,
+                    parent_link=parent,
+                    child_link=child,
+                )
+                for parent, child in zip(
+                    ["bracelet_link", "end_effector_link", "end_effector_link"],
+                    frames,
+                    strict=True,
+                )
+            ],
+        )
+        stage = open_exported(schema)
+        root = stage.GetDefaultPrim().GetPath()
+        for name in frames:
+            prim = stage.GetPrimAtPath(root.AppendPath(f"Links/{name}"))
+            assert UsdPhysics.MassAPI(prim).GetMassAttr().Get() > 0.0, name
+        bracelet = stage.GetPrimAtPath(root.AppendPath("Links/bracelet_link"))
+        assert not bracelet.GetAttribute(t.A_LINK_MASS_FALLBACK).IsValid()
+        assert UsdPhysics.MassAPI(bracelet).GetMassAttr().Get() == pytest.approx(0.5)
+
+        parsed = USDParser().parse_string(export(schema))
+        by_name = {link.name: link for link in parsed.links}
+        for name in frames:
+            assert by_name[name].mass == 0.0
+            assert by_name[name].inertia == Inertia()
+        assert export(parsed) == export(schema)
+
+    def test_fallback_marker_alone_still_reads_as_massless(self):
+        # A consumer that strips the double sidecars must not turn the stand-in
+        # into the link's real mass on import.
+        text = export(CommonSchema(metadata=Metadata(name="r"), links=[Link(name="a")]))
+        layer = Sdf.Layer.CreateAnonymous(".usda")
+        assert layer.ImportFromString(text)
+        stage = Usd.Stage.Open(layer)
+        link = stage.GetPrimAtPath(stage.GetDefaultPrim().GetPath().AppendPath("Links/a"))
+        link.RemoveProperty(t.A_LINK_MASS)
+        link.RemoveProperty(t.A_LINK_INERTIA)
+        (parsed_link,) = USDParser().parse_string(layer.ExportToString()).links
+        assert parsed_link.mass == 0.0
+        assert parsed_link.inertia == Inertia()
 
     def test_mass_and_inertia_are_authored_natively_and_as_sidecars(self):
         schema = CommonSchema(
@@ -915,8 +1049,11 @@ class TestActuatorsAndDrives:
         root = stage.GetDefaultPrim().GetPath()
         joint = stage.GetPrimAtPath(root.AppendPath("Joints/j"))
         drive = UsdPhysics.DriveAPI(joint, "angular")
-        assert math.isclose(drive.GetStiffnessAttr().Get(), 100.0, abs_tol=1e-4)
-        assert math.isclose(drive.GetDampingAttr().Get(), 5.0, abs_tol=1e-4)
+        # UsdPhysics angular gains are per degree; the schema's are per radian.
+        assert math.isclose(
+            drive.GetStiffnessAttr().Get(), math.radians(100.0), rel_tol=1e-6
+        )
+        assert math.isclose(drive.GetDampingAttr().Get(), math.radians(5.0), rel_tol=1e-6)
         assert math.isclose(drive.GetMaxForceAttr().Get(), 20.0, abs_tol=1e-4)
         assert math.isclose(drive.GetTargetPositionAttr().Get(), 45.0, abs_tol=1e-3)
         assert drive.GetTypeAttr().Get() == "force"
@@ -948,8 +1085,8 @@ class TestActuatorsAndDrives:
             stage.GetDefaultPrim().GetPath().AppendPath("Joints/j")
         )
         drive = UsdPhysics.DriveAPI(joint, "angular")
-        assert math.isclose(drive.GetStiffnessAttr().Get(), 7.5, abs_tol=1e-4)
-        assert math.isclose(drive.GetDampingAttr().Get(), 0.5, abs_tol=1e-4)
+        assert math.isclose(drive.GetStiffnessAttr().Get(), math.radians(7.5), rel_tol=1e-6)
+        assert math.isclose(drive.GetDampingAttr().Get(), math.radians(0.5), rel_tol=1e-6)
 
     def test_an_actuator_wins_over_the_passive_spring(self):
         schema = two_link_schema(dynamics=JointDynamics(spring_stiffness=7.5))
@@ -962,9 +1099,56 @@ class TestActuatorsAndDrives:
         )
         assert math.isclose(
             UsdPhysics.DriveAPI(joint, "angular").GetStiffnessAttr().Get(),
-            100.0,
-            abs_tol=1e-4,
+            math.radians(100.0),
+            rel_tol=1e-6,
         )
+
+    def test_prismatic_gains_are_already_si(self):
+        schema = two_link_schema(type=JointType.PRISMATIC)
+        schema.actuators = [
+            Actuator(name="m1", joint="j", type=ActuatorType.POSITION, kp=10.0, kd=2.0)
+        ]
+        stage = open_exported(schema)
+        joint = stage.GetPrimAtPath(
+            stage.GetDefaultPrim().GetPath().AppendPath("Joints/j")
+        )
+        drive = UsdPhysics.DriveAPI(joint, "linear")
+        assert math.isclose(drive.GetStiffnessAttr().Get(), 10.0, abs_tol=1e-6)
+        assert math.isclose(drive.GetDampingAttr().Get(), 2.0, abs_tol=1e-6)
+
+    def test_velocity_actuator_is_a_pure_damping_drive(self):
+        schema = two_link_schema(home_position=0.5)
+        schema.actuators = [
+            Actuator(name="m1", joint="j", type=ActuatorType.VELOCITY, kp=3.0, kd=4.0)
+        ]
+        stage = open_exported(schema)
+        joint = stage.GetPrimAtPath(
+            stage.GetDefaultPrim().GetPath().AppendPath("Joints/j")
+        )
+        drive = UsdPhysics.DriveAPI(joint, "angular")
+        assert not drive.GetStiffnessAttr().HasAuthoredValue()
+        assert not drive.GetTargetPositionAttr().HasAuthoredValue()
+        assert math.isclose(drive.GetDampingAttr().Get(), math.radians(4.0), rel_tol=1e-6)
+        assert drive.GetTargetVelocityAttr().Get() == 0.0
+        assert joint.GetCustomDataByKey(t.CD_CONTROL_MODE) == "velocity"
+
+    def test_motor_is_an_effort_only_drive(self):
+        schema = two_link_schema()
+        schema.actuators = [
+            Actuator(
+                name="m1", joint="j", type=ActuatorType.TORQUE, kp=3.0, max_torque=9.0
+            )
+        ]
+        stage = open_exported(schema)
+        joint = stage.GetPrimAtPath(
+            stage.GetDefaultPrim().GetPath().AppendPath("Joints/j")
+        )
+        drive = UsdPhysics.DriveAPI(joint, "angular")
+        assert not drive.GetStiffnessAttr().HasAuthoredValue()
+        assert not drive.GetDampingAttr().HasAuthoredValue()
+        assert math.isclose(drive.GetMaxForceAttr().Get(), 9.0, abs_tol=1e-6)
+        assert joint.GetCustomDataByKey(t.CD_CONTROL_MODE) == "effort"
+        assert joint.GetCustomDataByKey(t.CD_ACTUATOR_NAME) == "m1"
 
     def test_zero_dynamics_does_not_author_a_drive(self):
         schema = two_link_schema(dynamics=JointDynamics())

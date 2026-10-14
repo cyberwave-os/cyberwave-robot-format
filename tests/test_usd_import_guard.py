@@ -49,18 +49,39 @@ def without_pxr(monkeypatch):
     monkeypatch.setattr(common, "_PXR", None)
 
 
+@pytest.fixture
+def reload_module():
+    """``importlib.reload`` a module for one test, then restore its namespace.
+
+    A reload rebinds every class the module defines. Test modules that imported
+    those classes before this one ran would then fail ``isinstance`` checks inside
+    the reloaded module, so the outcome would depend on test order.
+    """
+    saved: list[tuple[object, dict]] = []
+
+    def reload(name: str):
+        module = importlib.import_module(name)
+        saved.append((module, dict(vars(module))))
+        return importlib.reload(module)
+
+    yield reload
+    for module, namespace in reversed(saved):
+        vars(module).clear()
+        vars(module).update(namespace)
+
+
 def simple_schema() -> CommonSchema:
     return CommonSchema(metadata=Metadata(name="robot"), links=[Link(name="a")])
 
 
 class TestImportsSucceedWithoutPxr:
-    def test_the_package_imports_and_exposes_the_converters(self, without_pxr):
-        module = importlib.reload(importlib.import_module("cyberwave_robot_format"))
+    def test_the_package_imports_and_exposes_the_converters(self, without_pxr, reload_module):
+        module = reload_module("cyberwave_robot_format")
         assert hasattr(module, "USDExporter")
         assert hasattr(module, "USDParser")
 
-    def test_the_usd_subpackage_imports(self, without_pxr):
-        module = importlib.reload(importlib.import_module("cyberwave_robot_format.usd"))
+    def test_the_usd_subpackage_imports(self, without_pxr, reload_module):
+        module = reload_module("cyberwave_robot_format.usd")
         assert module.USDExporter is not None
         assert module.USDParser is not None
 
@@ -72,11 +93,13 @@ class TestImportsSucceedWithoutPxr:
             "cyberwave_robot_format.usd.common",
             "cyberwave_robot_format.usd.exporter",
             "cyberwave_robot_format.usd.parser",
+            "cyberwave_robot_format.usd.semantics",
+            "cyberwave_robot_format.usd.scene",
             "cyberwave_robot_format.usd.scene_to_glb",
         ],
     )
-    def test_each_usd_module_imports(self, without_pxr, module_name):
-        assert importlib.reload(importlib.import_module(module_name)) is not None
+    def test_each_usd_module_imports(self, without_pxr, reload_module, module_name):
+        assert reload_module(module_name) is not None
 
     def test_constructing_the_converters_succeeds(self, without_pxr):
         from cyberwave_robot_format.usd import USDExporter, USDParser
@@ -108,6 +131,14 @@ class TestImportsSucceedWithoutPxr:
 
 
 class TestCallsFailWithAnActionableMessage:
+    def test_scene_export_raises_import_error_naming_usd_core(
+        self, without_pxr, tmp_path
+    ):
+        from cyberwave_robot_format.usd import export_scene_usd
+
+        with pytest.raises(ImportError, match="usd-core"):
+            export_scene_usd(simple_schema(), tmp_path)
+
     def test_export_raises_import_error_naming_usd_core(self, without_pxr):
         from cyberwave_robot_format.usd import USDExporter
 
@@ -155,14 +186,14 @@ class TestCallsFailWithAnActionableMessage:
 
 
 class TestPxrFreeModules:
-    """``frames`` and ``tokens`` must not touch ``pxr`` even lazily.
+    """``frames``, ``tokens`` and ``semantics`` must not touch ``pxr`` even lazily.
 
     Load-bearing: ``test_usd_frames.py`` and ``test_usd_tokens.py``'s pure-table
     assertions run on the strength of this, which is what keeps the joint-frame and
     inertia math covered on a machine with no ``usd-core``.
     """
 
-    @pytest.mark.parametrize("module_name", ["frames", "tokens"])
+    @pytest.mark.parametrize("module_name", ["frames", "tokens", "semantics"])
     def test_module_never_imports_pxr(self, module_name):
         module = importlib.import_module(f"cyberwave_robot_format.usd.{module_name}")
         source = Path(module.__file__).read_text()
@@ -175,12 +206,14 @@ class TestPxrFreeModules:
         ]
         assert offenders == []
 
-    def test_frames_math_works_with_pxr_unavailable(self, without_pxr):
-        module = importlib.reload(
-            importlib.import_module("cyberwave_robot_format.usd.frames")
-        )
+    def test_frames_math_works_with_pxr_unavailable(self, without_pxr, reload_module):
+        module = reload_module("cyberwave_robot_format.usd.frames")
         quat = module.axis_to_ref_quat(Vector3(y=1.0))
         assert module.ref_quat_to_axis(quat).y == pytest.approx(1.0)
+
+    def test_semantics_works_with_pxr_unavailable(self, without_pxr, reload_module):
+        module = reload_module("cyberwave_robot_format.usd.semantics")
+        assert module.camera_intrinsics({"width": 4, "height": 2}).cx == 2.0
 
 
 class TestUsdCoreIsActuallyInstalled:

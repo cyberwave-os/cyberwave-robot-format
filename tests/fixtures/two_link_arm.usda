@@ -23,6 +23,7 @@ def Xform "two_link_arm" (
             prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI", "PhysicsFilteredPairsAPI"]
             customData = {
                 dictionary cyberwave = {
+                    string linkName = "base_link"
                     string order = '{"visuals":["Visuals/base_visual"],"collisions":["Collisions/base_collision"]}'
                 }
             }
@@ -79,6 +80,7 @@ def Xform "two_link_arm" (
             prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
             customData = {
                 dictionary cyberwave = {
+                    string linkName = "upper_arm"
                     string order = '{"visuals":["Visuals/upper_visual"]}'
                 }
             }
@@ -110,6 +112,7 @@ def Xform "two_link_arm" (
             prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
             customData = {
                 dictionary cyberwave = {
+                    string linkName = "gripper"
                     string order = '{"visuals":["Visuals/gripper_visual"]}'
                 }
             }
@@ -135,7 +138,17 @@ def Xform "two_link_arm" (
 
             def Scope "Sensors"
             {
-                def Xform "wrist_imu"
+                def Xform "wrist_imu" (
+                    customData = {
+                        dictionary cyberwave = {
+                            string sensorKind = "imu"
+                            string sensorName = "wrist_imu"
+                            dictionary sensorParams = {
+                                double update_rate_hz = 200
+                            }
+                        }
+                    }
+                )
                 {
                     custom string cyberwave:sensor:type = "IMU"
                     custom double cyberwave:sensor:updateRate = 200
@@ -147,7 +160,15 @@ def Xform "two_link_arm" (
     def Scope "Joints"
     {
         def PhysicsRevoluteJoint "shoulder" (
-            prepend apiSchemas = ["PhysicsDriveAPI:angular"]
+            prepend apiSchemas = ["PhysxJointAPI", "PhysicsDriveAPI:angular"]
+            customData = {
+                dictionary cyberwave = {
+                    string actuatorName = "shoulder_motor"
+                    string controlMode = "position"
+                    int dofIndex = 0
+                    string jointName = "shoulder"
+                }
+            }
         )
         {
             custom double3 cyberwave:joint:axis = (0, 1, 0)
@@ -166,9 +187,9 @@ def Xform "two_link_arm" (
             custom double4 cyberwave:joint:poseOrientation = (0, 0, 0, 1)
             custom double3 cyberwave:joint:posePosition = (0, 0, 0.1)
             custom token cyberwave:joint:type = "revolute"
-            float drive:angular:physics:damping = 6
+            float drive:angular:physics:damping = 0.10471976
             float drive:angular:physics:maxForce = 40
-            float drive:angular:physics:stiffness = 120
+            float drive:angular:physics:stiffness = 2.0943952
             float drive:angular:physics:targetPosition = 14.323945
             uniform token drive:angular:physics:type = "force"
             uniform token physics:axis = "X"
@@ -180,9 +201,19 @@ def Xform "two_link_arm" (
             quatf physics:localRot1 = (0.70710677, 0, 0, 0.70710677)
             float physics:lowerLimit = -90
             float physics:upperLimit = 90
+            float physxJoint:armature = 0.01
+            float physxJoint:maxJointVelocity = 114.59156
         }
 
-        def PhysicsRevoluteJoint "wrist"
+        def PhysicsRevoluteJoint "wrist" (
+            prepend apiSchemas = ["PhysxJointAPI"]
+            customData = {
+                dictionary cyberwave = {
+                    int dofIndex = 1
+                    string jointName = "wrist"
+                }
+            }
+        )
         {
             custom double3 cyberwave:joint:axis = (0, 0, 1)
             custom bool cyberwave:joint:hasLimits = 1
@@ -198,6 +229,7 @@ def Xform "two_link_arm" (
             point3f physics:localPos1 = (0, 0, 0)
             quatf physics:localRot0 = (0.70710677, 0, -0.70710677, 0)
             quatf physics:localRot1 = (0.70710677, 0, -0.70710677, 0)
+            float physxJoint:maxJointVelocity = 343.7747
         }
     }
 

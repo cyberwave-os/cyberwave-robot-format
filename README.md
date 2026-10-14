@@ -58,8 +58,9 @@ pip install "cyberwave-robot-format[usd]"
 
 The rest of the package works without them — importing `cyberwave_robot_format`
 never imports `pxr`, so only calling the USD parser or exporter requires it.
-`usd-core` publishes no `linux-aarch64` wheel; on that platform install
-conda-forge's `openusd` instead.
+`usd-core` publishes no `linux-aarch64` wheel (e.g. Docker on Apple Silicon), so
+on that platform the `[usd]` extra installs NVIDIA's `usd-exchange`, which ships
+the same `pxr` modules.
 
 ## Usage
 
@@ -298,8 +299,12 @@ Things worth knowing:
   emitting data its reader would discard. This does not limit scene hierarchy or
   mesh size, and brackets inside strings do not count as nesting.
 - **Angles.** USD stores angular joint limits and drive targets in degrees; the
-  schema uses radians. The conversion is automatic, and the `cyberwave:` sidecars
-  are always in schema units.
+  schema uses radians. Angular drive gains follow: `UsdPhysicsDriveAPI` stiffness
+  is per degree and damping per degree/s, so an actuator's `kp`/`kd` and a joint's
+  `spring_stiffness`/`damping` are written as `value * pi / 180` and read back
+  (including from foreign stages) as `value * 180 / pi`. Linear joints are SI
+  both ways. The conversion is automatic, and the `cyberwave:` sidecars are always
+  in schema units.
 - **Units.** The stage is always authored `metersPerUnit = 1`, `kilogramsPerUnit = 1`
   and Z-up, because that is what every number in the schema means. A schema
   declaring `metadata.units` as anything but `"SI"` is written unconverted, with a
@@ -329,6 +334,69 @@ Things worth knowing:
   warning — so both appearances survive the round trip.
 
 Since v0.1.6.
+
+#### Scene bundles
+
+`export_scene_usd` places one or more robot instances in a single scene and writes a
+directory of USD layers: `scene.usda` (default prim `/World`) plus one
+`assets/<asset>_<sha12>.usda` per distinct robot, shared by every instance of it.
+It is the USD counterpart of `CommonSchema.merge_in` followed by the MJCF scene
+export. The output is byte-for-byte deterministic for the same input and package
+version.
+
+```python
+from cyberwave_robot_format import Pose
+from cyberwave_robot_format.usd import (
+    SceneExportOptions,
+    SceneInstance,
+    export_scene_usd,
+)
+
+result = export_scene_usd(
+    [
+        SceneInstance(instance_id="arm-1", schema=arm, fixed_base=True),
+        SceneInstance(instance_id="amr-1", schema=amr, spawn_pose=Pose()),
+    ],
+    "output/scene",
+    options=SceneExportOptions(bake_meshes=True),
+)
+assert result.ok, result.compatibility["errors"]
+```
+
+- **`SceneInstance`** is one robot: `instance_id`, `schema`, `spawn_pose`,
+  `fixed_base` (`None` infers it from the schema's world joint), optional
+  `sensor_ids`, `first_person_camera`, `namespace`, docking via
+  `attach_to_instance`/`attach_to_link`, and `custom_data` for the caller's own
+  identity keys. A bare `CommonSchema` is accepted as a single instance.
+- **`SceneExportOptions`** holds the scene-level settings: the scene prim name and
+  `scene_custom_data`, `physics` (defaults to the first instance's), generated
+  lights, `ground_plane` (added unless an instance already has a plane),
+  `viewport` (a **`ViewportOptions`** for the free `sim_viewport` camera),
+  `static_fixtures` (**`StaticBoxFixture`** boxes welded to the world) and
+  `bake_meshes`/`mesh_search_paths`. Without baking, the bundle is reported
+  incomplete (`mesh_not_embedded`).
+- **`UsdExportResult`** lists the written `files`, the `identity_map` from
+  instances, links, joints and sensors to prim paths, `sensors`,
+  `articulations` (drive gains in schema units, per radian), `compatibility`
+  findings (`result.ok` is `True` when there are no errors), `units`,
+  `exporter` and `physics_scene`. `to_dict()` gives the JSON form.
+- **Identity on the stage.** `/World` carries `cyberwave:usdSchemaVersion`, the
+  version of the portable prim layout and identity keys (`USD_SCHEMA_VERSION` in
+  `usd/tokens.py`, currently `1.1`). Instance prims carry `cyberwave:base`
+  (`"fixed"` or `"floating"`). Links, joints, drives and sensors carry
+  `cyberwave:linkName`, `jointName`, `dofIndex`, `controlMode`, `actuatorName`,
+  `sensorName`, `sensorId`, `sensorKind`, `sensorParams` and `cameraRole`.
+  Synthesized prims (world anchor, lights, viewport, ground) carry
+  `cyberwave:generated`. These are plain customData values, readable with
+  `GetCustomDataByKey`.
+- **PhysX passthrough.** `extensions["physx"]`, keyed by full attribute name
+  (`{"physxRigidBody:linearDamping": 0.1}`), is authored as the matching PhysX
+  applied API on the schema root (articulation), links, collisions, joints and
+  `Physics` (scene). Velocity limits, armature and mimic joints are also derived
+  from the schema in PhysX/Newton form. An unknown or mistyped entry is skipped
+  and reported as `physx_attribute_skipped`, never a failed export. Scene
+  attributes the Isaac runtime owns (broadphase, GPU dynamics, step rate) are not
+  accepted.
 
 ### Convert a USD scene to a GLB
 

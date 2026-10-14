@@ -49,10 +49,25 @@ Two structural consequences worth knowing before reading the code:
 * ``UsdPhysics`` restricts ``physics:axis`` to ``"X"``/``"Y"``/``"Z"``, so an
   arbitrary schema axis is baked into the joint frame rotations
   ``physics:localRot0``/``localRot1`` and the token is always ``"X"``.
+
+:func:`export_scene_usd` places several robot instances in one scene bundle (a
+root layer referencing one shared asset layer per distinct robot) and returns
+the identity map from instances, links, joints and sensors to prim paths -- the
+USD counterpart of :meth:`CommonSchema.merge_in` plus the MJCF scene export.
+What an instance stands for (a twin, a fixture, a test robot) is the caller's
+business, exactly as it is for ``merge_in``.
 """
 
 from cyberwave_robot_format.usd.exporter import USDExporter
 from cyberwave_robot_format.usd.parser import USDParser
+from cyberwave_robot_format.usd.scene import (
+    SceneExportOptions,
+    SceneInstance,
+    StaticBoxFixture,
+    UsdExportResult,
+    ViewportOptions,
+    export_scene_usd,
+)
 from cyberwave_robot_format.usd.scene_to_glb import (
     SceneGlbReport,
     SceneGlbResult,
@@ -61,10 +76,16 @@ from cyberwave_robot_format.usd.scene_to_glb import (
 )
 
 __all__ = [
+    "SceneExportOptions",
     "SceneGlbReport",
     "SceneGlbResult",
+    "SceneInstance",
+    "StaticBoxFixture",
     "USDExporter",
     "USDParser",
     "USDSceneToGLB",
+    "UsdExportResult",
+    "ViewportOptions",
     "convert_usd_scene_to_glb",
+    "export_scene_usd",
 ]

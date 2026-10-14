@@ -40,6 +40,7 @@ SCOPE_COLLISION_GROUPS = "CollisionGroups"
 SCOPE_COLLISION_CONFIG = "CollisionConfig"
 SCOPE_PAIRS = "Pairs"
 SCOPE_RENDER = "Render"
+SCOPE_ROTORS = "Rotors"
 
 PHYSICS_SCENE_PATH = "/PhysicsScene"
 """``UsdPhysicsScene`` lives *beside* the robot prim, not under it.
@@ -79,6 +80,44 @@ CD_ORDER = f"{CW}:order"
 CD_SOLVER_EXTENSIONS = f"{CW}:solverExtensions"
 CD_EXCLUDES = f"{CW}:excludes"
 
+# Stable identity keys: the portable USD schema a runtime (Isaac Sim, usdview, a
+# test) reads to map prims back to schema names and ids without parsing prim
+# names. Unlike the JSON payloads above these are plain USD values (string, int,
+# dictionary of scalars), so a consumer reads them with GetCustomDataByKey alone.
+# The parser never reads them; the sidecars above stay authoritative for the
+# CommonSchema round trip. A caller's own identity keys (whatever its scene
+# instances stand for) are not defined here: they arrive as opaque
+# ``custom_data`` on the scene and instance prims (see :mod:`.scene`).
+CD_BASE = f"{CW}:base"
+"""``"fixed"`` or ``"floating"`` on a scene instance prim."""
+CD_LINK_NAME = f"{CW}:linkName"
+CD_JOINT_NAME = f"{CW}:jointName"
+CD_DOF_INDEX = f"{CW}:dofIndex"
+"""Index in the robot's canonical joint vector (schema order of 1-DOF joints)."""
+CD_CONTROL_MODE = f"{CW}:controlMode"
+"""``"position"``, ``"velocity"`` or ``"effort"`` for a driven joint."""
+CD_ACTUATOR_NAME = f"{CW}:actuatorName"
+CD_SENSOR_NAME = f"{CW}:sensorName"
+CD_SENSOR_ID = f"{CW}:sensorId"
+CD_SENSOR_KIND = f"{CW}:sensorKind"
+CD_SENSOR_PARAMS = f"{CW}:sensorParams"
+"""Normalized scalar parameters (SI, radians) as a USD dictionary."""
+CD_CAMERA_ROLE = f"{CW}:cameraRole"
+CD_ROTOR = f"{CW}:rotor"
+"""Rotor/thruster parameters as a USD dictionary (see ``semantics.RotorSpec``)."""
+CD_LIGHT_ROLE = f"{CW}:lightRole"
+CD_GENERATED = f"{CW}:generated"
+"""``True`` on prims the scene exporter synthesized (world anchor, ...)."""
+CD_USD_SCHEMA_VERSION = f"{CW}:usdSchemaVersion"
+"""On ``/World`` of a scene stage: the portable schema version below."""
+
+USD_SCHEMA_VERSION = "1.1"
+"""Version of the portable Cyberwave USD schema (prim layout + identity keys).
+
+Bump the minor version for additive keys, the major version for anything a
+runtime reading an older bundle would misinterpret.
+"""
+
 # --------------------------------------------------------------------------
 # Attribute names
 # --------------------------------------------------------------------------
@@ -102,6 +141,20 @@ A_LINK_MASS = f"{CW}:link:mass"
 A_LINK_CENTER_OF_MASS = f"{CW}:link:centerOfMass"
 A_LINK_INERTIA = f"{CW}:link:inertia"
 """Full symmetric tensor as ``[ixx, iyy, izz, ixy, ixz, iyz]``."""
+A_LINK_MASS_FALLBACK = f"{CW}:link:massFallback"
+"""``True`` when the native ``MassAPI`` values are the exporter's stand-in for a
+massless link (no mass or inertia, and either no collision geometry or another
+link in the schema carrying mass); the schema values are the (zero) sidecars."""
+
+# Stand-in inertial for such a link. UsdPhysics has no "massless" body: with no
+# authored mass and no collider to derive one from, PhysX substitutes its own
+# default ("negative mass, small sphere approximated inertia"), which moved the
+# Kinova wrist camera frames off the arm. One gram with the inertia of a
+# 1-cm-radius-of-gyration body is negligible next to any real link yet well
+# conditioned in a reduced-coordinate articulation -- the counterpart of the
+# MJCF exporter's ``_FALLBACK_MASS`` for movable bodies MuJoCo would reject.
+MASSLESS_LINK_FALLBACK_MASS_KG = 1e-3
+MASSLESS_LINK_FALLBACK_INERTIA_KG_M2 = 1e-7
 
 # Joint
 A_JOINT_TYPE = f"{CW}:joint:type"
@@ -472,6 +525,14 @@ what keeps a Cyberwave-written stage from *gaining* an ``extensions["usd"]`` ent
 on re-import. Attributes the exporter does derive — ``physics:excludeFromArticulation``
 (from ``FLOATING``) and ``physics:approximation`` (from a mesh collision) — are
 deliberately absent.
+"""
+
+PHYSX_EXTENSION_KEY = "physx"
+"""Sub-key under an object's ``extensions`` holding NVIDIA PhysX schema attributes.
+
+Keyed by the full attribute name (``"physxRigidBody:linearDamping"``); see
+:mod:`cyberwave_robot_format.usd.physx` for the supported set and where each
+applies.
 """
 
 USD_PASSTHROUGH_LINK: tuple[tuple[str, str, str], ...] = (
