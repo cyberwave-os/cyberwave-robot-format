@@ -53,5 +53,18 @@ Two structural consequences worth knowing before reading the code:
 
 from cyberwave_robot_format.usd.exporter import USDExporter
 from cyberwave_robot_format.usd.parser import USDParser
+from cyberwave_robot_format.usd.scene_to_glb import (
+    SceneGlbReport,
+    SceneGlbResult,
+    USDSceneToGLB,
+    convert_usd_scene_to_glb,
+)
 
-__all__ = ["USDExporter", "USDParser"]
+__all__ = [
+    "SceneGlbReport",
+    "SceneGlbResult",
+    "USDExporter",
+    "USDParser",
+    "USDSceneToGLB",
+    "convert_usd_scene_to_glb",
+]

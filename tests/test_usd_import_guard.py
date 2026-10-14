@@ -72,6 +72,7 @@ class TestImportsSucceedWithoutPxr:
             "cyberwave_robot_format.usd.common",
             "cyberwave_robot_format.usd.exporter",
             "cyberwave_robot_format.usd.parser",
+            "cyberwave_robot_format.usd.scene_to_glb",
         ],
     )
     def test_each_usd_module_imports(self, without_pxr, module_name):
@@ -82,6 +83,11 @@ class TestImportsSucceedWithoutPxr:
 
         assert USDExporter(bake_meshes=True) is not None
         assert USDParser() is not None
+
+    def test_constructing_the_scene_converter_succeeds(self, without_pxr):
+        from cyberwave_robot_format.usd import USDSceneToGLB
+
+        assert USDSceneToGLB(max_texture_size=512) is not None
 
     def test_can_parse_works_without_pxr(self, without_pxr, tmp_path):
         # Purely a suffix/magic-byte check, so it must not need USD.
@@ -127,6 +133,16 @@ class TestCallsFailWithAnActionableMessage:
         path.write_text("#usda 1.0\n")
         with pytest.raises(ImportError, match="usd-core"):
             USDParser().parse(path)
+
+    def test_scene_to_glb_raises_import_error_naming_usd_core(
+        self, without_pxr, tmp_path
+    ):
+        from cyberwave_robot_format.usd import USDSceneToGLB
+
+        path = tmp_path / "scene.usda"
+        path.write_text("#usda 1.0\n")
+        with pytest.raises(ImportError, match="usd-core"):
+            USDSceneToGLB().convert(path)
 
     def test_the_message_names_the_extra(self, without_pxr):
         from cyberwave_robot_format.usd import USDExporter

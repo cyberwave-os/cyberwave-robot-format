@@ -52,7 +52,7 @@ collision = ["coacd>=1.0.14"]
 # optional because usd-core publishes no linux-aarch64 wheel (conda-forge's
 # `openusd` is the way in there),
 # and because the rest of the package must stay installable without it.
-usd = ["usd-core>=24.0"]
+usd = ["usd-core>=24.0", "pillow>=10.0.0"]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.10.0",
@@ -67,6 +67,8 @@ dev = [
     # suite still runs. The `usd` extra above is deliberately *not* marked: asking
     # for it explicitly on an unsupported platform should fail loudly.
     'usd-core>=24.0; sys_platform != "linux" or platform_machine == "x86_64"',
+    # Texture handling in the USD scene -> GLB converter; part of the `usd` extra.
+    "pillow>=10.0.0",
 ]
 
 [tool.setuptools]
