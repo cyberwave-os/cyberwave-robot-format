@@ -50,10 +50,13 @@ dependencies = [
 collision = ["coacd>=1.0.14"]
 # OpenUSD Python bindings, required only by cyberwave_robot_format.usd. Kept
 # optional so the rest of the package stays installable without them.
+# scipy: the convex hull behind the hollow-mesh check (cyberwave_robot_format.collision),
+# which reports "unknown" rather than failing when it is missing.
 # usd-core publishes no linux/aarch64 wheel (e.g. Docker on Apple Silicon); there
 # NVIDIA's usd-exchange wheel ships the same ``pxr`` modules.
 usd = [
     "pillow>=10.0.0",
+    "scipy>=1.10",
     'usd-core>=24.0; sys_platform != "linux" or platform_machine == "x86_64"',
     'usd-exchange>=3.0; sys_platform == "linux" and platform_machine == "aarch64"',
     # Every other Linux architecture: neither wheel exists, and usd-core ships no
@@ -73,6 +76,8 @@ dev = [
     'usd-exchange>=3.0; sys_platform == "linux" and platform_machine == "aarch64"',
     # Texture handling in the USD scene -> GLB converter; part of the `usd` extra.
     "pillow>=10.0.0",
+    # Convex hull for the hollow-mesh check; part of the `usd` extra.
+    "scipy>=1.10",
 ]
 
 [tool.setuptools]
