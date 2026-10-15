@@ -52,6 +52,7 @@ import trimesh
 from trimesh.visual import TextureVisuals
 from trimesh.visual.material import PBRMaterial
 
+from cyberwave_robot_format.collision import hollow_collision_warning, hull_volume_ratio
 from cyberwave_robot_format.usd import common as c
 from cyberwave_robot_format.usd.parser import USD_SUFFIXES, USDParser
 
@@ -76,6 +77,10 @@ _NAME_PRESETS: dict[str, tuple[list[float], float, float]] = {
     "brass": ([0.78, 0.60, 0.25, 1.0], 1.0, 0.30),
     "plastic_black": ([0.02, 0.02, 0.02, 1.0], 0.0, 0.40),
 }
+
+# A scene with more large static meshes than this is a city, not a room: past it
+# the extra boxes are dropped and the report says so.
+_MAX_COLLIDERS = 256
 
 # Prim purposes that are part of the visible scene (``guide`` and ``proxy`` are not).
 _RENDER_PURPOSES = ("default", "render")
@@ -113,6 +118,11 @@ class SceneGlbReport:
     #: texture references that could not be read (missing, or outside the roots)
     missing_textures: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Box colliders, in output units (m) and axes:
+    #: ``{"name", "size": [x, y, z], "xyz": [x, y, z], "rpy": [r, p, y]}``.
+    collision: list[dict[str, Any]] = field(default_factory=list)
+    #: Mesh volume / convex-hull volume of the whole scene; low means hollow.
+    hull_ratio: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +133,8 @@ class SceneGlbReport:
             "substituted_materials": list(self.substituted_materials),
             "missing_textures": list(self.missing_textures),
             "warnings": list(self.warnings),
+            "collision": [dict(box) for box in self.collision],
+            "hull_ratio": self.hull_ratio,
         }
 
 
@@ -156,6 +168,13 @@ class USDSceneToGLB:
             naming the limit) instead of exhausting memory. Peak memory is roughly
             0.75 GB per million triangles, so the 5M default stays near 4 GB; a
             service running several conversions at once should keep it modest.
+        generate_colliders: Report box colliders for the scene (see
+            :attr:`SceneGlbReport.collision`). A ``Cube`` prim or a prim with the USD
+            collision API becomes one exact box; any other mesh whose longest world
+            edge is at least ``min_collider_size_m`` becomes its bounding box. Small
+            props are skipped. A prim with ``physics:collisionEnabled = false`` is
+            never a collider -- that is the opt-out.
+        min_collider_size_m: Size threshold for the above, in metres.
     """
 
     def __init__(
@@ -168,12 +187,16 @@ class USDSceneToGLB:
         material_overrides: dict[str, dict[str, Any]] | None = None,
         apply_name_presets: bool = True,
         max_triangles: int = 5_000_000,
+        generate_colliders: bool = True,
+        min_collider_size_m: float = 1.0,
     ) -> None:
         if max_texture_size < 1:
             raise ValueError("max_texture_size must be positive")
         if max_triangles < 1:
             raise ValueError("max_triangles must be positive")
         self.max_triangles = max_triangles
+        self.generate_colliders = generate_colliders
+        self.min_collider_size_m = min_collider_size_m
         self.max_texture_size = max_texture_size
         self.z_up = z_up
         self.allow_external_layers = allow_external_layers
@@ -259,7 +282,9 @@ class _Conversion:
             if built is None:
                 continue
             verts, tris, normals, uv = built
-            self._add(prim, verts, tris, normals, uv)
+            name = self._add(prim, verts, tris, normals, uv)
+            if self.cfg.generate_colliders:
+                self._collect_collider(prim, name, verts, xcache)
 
         if not self.scene.geometry:
             raise ValueError("The USD scene contains no renderable meshes.")
@@ -271,6 +296,7 @@ class _Conversion:
         self.report.triangle_count = sum(
             len(g.faces) for g in self.scene.geometry.values()
         )
+        self._assess_collision()
         glb = self.scene.export(file_type="glb")
         return SceneGlbResult(glb=bytes(glb), report=self.report)
 
@@ -493,6 +519,81 @@ class _Conversion:
             return shape
         return None
 
+    # -------------------------------------------------------------- colliders
+
+    def _collect_collider(
+        self, prim: Any, name: str, verts: np.ndarray, xcache: Any
+    ) -> None:
+        """Add ``prim``'s box to the report if it is a collider (see the class doc)."""
+        UsdGeom = self.pxr.UsdGeom
+        enabled = prim.GetAttribute("physics:collisionEnabled")
+        if enabled and enabled.Get() is False:
+            return
+        explicit = "PhysicsCollisionAPI" in prim.GetAppliedSchemas()
+        if prim.IsA(UsdGeom.Cube):
+            box = self._cube_box(prim, xcache)
+            if not explicit and max(box["size"]) < self.cfg.min_collider_size_m:
+                return
+        else:
+            # ``verts`` already carry the full world transform, so their axis-aligned
+            # bounds are the box; it is exact for the usual axis-aligned wall or slab.
+            lo, hi = verts.min(axis=0), verts.max(axis=0)
+            if not explicit and (hi - lo).max() < self.cfg.min_collider_size_m:
+                return
+            box = {
+                "size": (hi - lo).tolist(),
+                "xyz": ((hi + lo) / 2).tolist(),
+                "rpy": [0.0, 0.0, 0.0],
+            }
+        if len(self.report.collision) >= _MAX_COLLIDERS:
+            self._warn(
+                f"More than {_MAX_COLLIDERS} colliders; the rest were left out of "
+                "the collision."
+            )
+            return
+        self.report.collision.append({"name": name, **_rounded(box)})
+
+    def _cube_box(self, prim: Any, xcache: Any) -> dict[str, Any]:
+        """A ``Cube`` as a box with its exact size and pose.
+
+        Goes through the same matrix as the geometry (the stage's units and up-axis on
+        top of the prim's world transform), so it lines up with the GLB.
+        """
+        matrix = self._prim_matrix(prim, xcache)
+        edge = float(self.pxr.UsdGeom.Cube(prim).GetSizeAttr().Get())
+        linear = matrix[:3, :3]
+        scale = np.linalg.norm(linear, axis=0)
+        rot = linear / np.maximum(scale, 1e-12)
+        if np.linalg.det(rot) < 0:  # a mirrored cube is the same box
+            rot[:, 2] *= -1
+        size = edge * scale
+        if np.allclose(np.abs(rot), np.round(np.abs(rot)), atol=1e-6):
+            # A quarter-turn (the Y-up -> Z-up conversion): swap the sizes instead of
+            # carrying a rotation, so the box is axis-aligned like the walls it is.
+            size = np.abs(rot) @ size
+            rot = np.eye(3)
+        euler = trimesh.transformations.euler_from_matrix(rot, axes="sxyz")
+        return {
+            "size": size.tolist(),
+            "xyz": matrix[:3, 3].tolist(),
+            "rpy": [float(a) for a in euler],
+        }
+
+    def _assess_collision(self) -> None:
+        """Warn when the scene would collide as a solid block (no boxes, hollow hull)."""
+        if self.report.collision:
+            return
+        vertices, offset, faces = [], 0, []
+        for mesh in self.scene.geometry.values():
+            vertices.append(np.asarray(mesh.vertices))
+            faces.append(np.asarray(mesh.faces) + offset)
+            offset += len(mesh.vertices)
+        ratio = hull_volume_ratio(np.vstack(vertices), np.vstack(faces))
+        self.report.hull_ratio = ratio
+        warning = hollow_collision_warning(ratio)
+        if warning:
+            self._warn(warning)
+
     # ------------------------------------------------------------------ nodes
 
     def _add(
@@ -502,7 +603,8 @@ class _Conversion:
         tris: np.ndarray,
         normals: np.ndarray,
         uv: np.ndarray | None,
-    ) -> None:
+    ) -> str:
+        """Add one mesh node; returns the unique name it was given."""
         # Weld identical (position, normal, uv) rows: face-varying data otherwise
         # triples the vertex count for no visual gain.
         columns = [verts, normals] + ([uv] if uv is not None else [])
@@ -525,6 +627,7 @@ class _Conversion:
             mesh.visual = TextureVisuals(material=material)
         name = self._unique_name(prim)
         self.scene.add_geometry(mesh, node_name=name, geom_name=name)
+        return name
 
     def _unique_name(self, prim: Any) -> str:
         base = str(prim.GetPath()).strip("/").replace("/", ".") or prim.GetName()
@@ -952,6 +1055,14 @@ def _mask_if_rgba(args: dict[str, Any], base_color_image: Any) -> None:
     """Alpha-test a base-colour texture that actually carries an alpha channel."""
     if base_color_image is not None and base_color_image.mode == "RGBA":
         args["alphaMode"], args["alphaCutoff"] = "MASK", 0.5
+
+
+def _rounded(box: dict[str, Any]) -> dict[str, list[float]]:
+    """Box values at 0.1 mm / 1e-6 rad: the report is JSON, not a mesh."""
+    return {
+        k: [round(float(x), 6 if k == "rpy" else 4) + 0.0 for x in v]
+        for k, v in box.items()
+    }
 
 
 def _fan_triangulate(counts: np.ndarray) -> np.ndarray:
