@@ -7,6 +7,7 @@ format-specific information through extensions.
 """
 
 from __future__ import annotations
+
 import math
 import re
 from collections.abc import Iterable
@@ -16,6 +17,7 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
+
 from ._geometry import core as _geometry_core
 
 
@@ -1033,6 +1035,8 @@ class CommonSchema:
                 sensor.parent_link = prefixed(sensor.parent_link)
             if sensor.extensions.get("mjcf_site"):
                 sensor.extensions["mjcf_site"] = prefixed(sensor.extensions["mjcf_site"])
+            if sensor.parameters.get("joint"):
+                sensor.parameters["joint"] = prefixed(sensor.parameters["joint"])
 
         # Rewrite all contacts and their references
         for contact in other_copy.contacts:

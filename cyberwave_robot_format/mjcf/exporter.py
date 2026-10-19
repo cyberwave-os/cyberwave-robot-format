@@ -1229,6 +1229,8 @@ class MJCFExporter(BaseExporter):
                 ``ctrl`` is a rad/s setpoint, so a joint-angle band is the wrong
                 quantity entirely (see the velocity branch below).
         """
+        # New transmission targets also need scoping in the backend RL export
+        # packager's actuator_scopes and its per-entity MuJoCo compile tests.
         adhesion = actuator.get_mjcf_adhesion()
         if adhesion is not None:
             assert actuator.control_range is not None  # Validated with the body binding.
@@ -1368,6 +1370,8 @@ class MJCFExporter(BaseExporter):
         runtime with ``mj_ray`` instead and are skipped here without a warning:
         they are not broken, just not MJCF-native.
         """
+        # New sensor references also need the backend RL packager's sensor_scopes
+        # and per-entity MuJoCo compile tests, alongside actuator_scopes above.
         sensor_type = (sensor.type or "").lower()
 
         if sensor_type in _RUNTIME_SAMPLED_SENSOR_TYPES:
