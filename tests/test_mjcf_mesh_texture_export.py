@@ -9,6 +9,7 @@ made a fully textured inspection asset render flat in simulation.
 
 import logging
 from pathlib import Path
+from unittest import mock
 from xml.etree import ElementTree as ET
 
 import pytest
@@ -176,6 +177,132 @@ def test_two_meshes_do_not_share_one_texture(tmp_path: Path) -> None:
 
     assert a != b
     assert Path(a).read_bytes() != Path(b).read_bytes()
+
+
+_DAE_EFFECT = """<effect id="eff{i}"><profile_COMMON><technique sid="common"><lambert>
+<diffuse><color sid="diffuse">{r} {g} {b} 1</color></diffuse>
+</lambert></technique></profile_COMMON></effect>"""
+_DAE_GEOMETRY = """<geometry id="geo{i}"><mesh>
+<source id="pos{i}"><float_array id="arr{i}" count="9">0 0 {i} 1 0 {i} 0 1 {i}</float_array>
+<technique_common><accessor source="#arr{i}" count="3" stride="3">
+<param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+</accessor></technique_common></source>
+<vertices id="vert{i}"><input semantic="POSITION" source="#pos{i}"/></vertices>
+<triangles count="1" material="sym{i}"><input semantic="VERTEX" source="#vert{i}" offset="0"/>
+<p>0 1 2</p></triangles></mesh></geometry>"""
+_DAE_NODE = """<node id="n{i}"><instance_geometry url="#geo{i}"><bind_material><technique_common>
+<instance_material symbol="sym{i}" target="#mat{i}"/>
+</technique_common></bind_material></instance_geometry></node>"""
+
+
+def _dae_with_diffuse_colours(path: Path, colours) -> str:
+    """Write a DAE whose materials carry nothing but a diffuse colour.
+
+    One triangle per colour, each bound to its own material -- the shape of a
+    vendor part painted by paint code, and the only shape that makes the
+    converter merge materials into an atlas. Hand-written because trimesh's
+    COLLADA *writer* drops materials, so no in-process export produces one.
+    """
+    effects = materials = geometries = nodes = ""
+    for i, (red, green, blue) in enumerate(colours):
+        effects += _DAE_EFFECT.format(i=i, r=red / 255, g=green / 255, b=blue / 255)
+        materials += f'<material id="mat{i}"><instance_effect url="#eff{i}"/></material>'
+        geometries += _DAE_GEOMETRY.format(i=i)
+        nodes += _DAE_NODE.format(i=i)
+    path.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">'
+        '<asset><unit meter="1" name="meter"/><up_axis>Z_UP</up_axis></asset>'
+        f"<library_effects>{effects}</library_effects>"
+        f"<library_materials>{materials}</library_materials>"
+        f"<library_geometries>{geometries}</library_geometries>"
+        f'<library_visual_scenes><visual_scene id="s">{nodes}</visual_scene>'
+        '</library_visual_scenes><scene><instance_visual_scene url="#s"/></scene></COLLADA>'
+    )
+    return str(path)
+
+
+def test_a_daes_own_diffuse_colours_survive_conversion(tmp_path: Path) -> None:
+    """Merging materials must not gamma-encode a colour that is already sRGB.
+
+    A mesh with more than one material is merged into one texture atlas, and
+    building that atlas runs trimesh's `linear_to_srgb` over each material's
+    `baseColorFactor` -- correct for glTF, which declares that factor linear,
+    wrong for COLLADA, whose `<diffuse>` is the display colour and lands in the
+    same field. The DEEP Robotics M20's RAL 7024 `#3D4A56` came out `#86939D`:
+    right in the viewer, which reads the DAE, washed out in simulation.
+    """
+    image = pytest.importorskip("PIL.Image")
+    import numpy as np
+    from trimesh.visual.color import linear_to_srgb
+
+    from cyberwave_robot_format.mesh import convert_dae_to_obj
+
+    colours = ((0x3D, 0x4A, 0x56), (0x4F, 0x5D, 0x6B))  # RAL 7024, RAL 7011
+    source = _dae_with_diffuse_colours(tmp_path / "painted.dae", colours)
+
+    texture = converted_mesh_texture(convert_dae_to_obj(source, None, tmp_path / "converted"))
+
+    assert texture is not None
+    pixels = np.asarray(image.open(texture).convert("RGB")).reshape(-1, 3)
+    found = {tuple(pixel) for pixel in pixels.tolist()}
+    # The atlas pads between regions, so it holds more than the two colours.
+    assert set(colours) <= found
+    lightened = {
+        tuple(int(round(channel * 255)) for channel in linear_to_srgb(np.array(rgb, dtype=np.uint8))) for rgb in colours
+    }
+    assert not (lightened & found)
+
+
+def test_a_single_material_dae_keeps_its_colour(tmp_path: Path) -> None:
+    """One material never merges, but it still has to reach disk as an image.
+
+    This is the shape most vendor parts actually have, and the one the gamma
+    defect never reached. It is rewritten anyway, because that rewrite is also
+    what makes trimesh write a sidecar PNG: a bare factor leaves only an `mtl`
+    `Kd`, which `converted_mesh_texture` does not match, and the part would
+    render in MuJoCo's default grey.
+    """
+    image = pytest.importorskip("PIL.Image")
+    import numpy as np
+
+    from cyberwave_robot_format.mesh import convert_dae_to_obj
+
+    colour = (0x3D, 0x4A, 0x56)  # RAL 7024
+    source = _dae_with_diffuse_colours(tmp_path / "plain.dae", (colour,))
+
+    texture = converted_mesh_texture(convert_dae_to_obj(source, None, tmp_path / "converted"))
+
+    assert texture is not None
+    pixels = np.asarray(image.open(texture).convert("RGB")).reshape(-1, 3)
+    assert {tuple(pixel) for pixel in pixels.tolist()} == {colour}
+
+
+def test_a_mesh_converted_by_an_earlier_release_is_not_served_again(tmp_path: Path) -> None:
+    """A cached conversion has to be keyed by what the converter produces.
+
+    The cache holds trimesh's sidecar PNG as well as the OBJ, and its key was
+    built from the source path and scale alone. A host that converted a mesh
+    before the colour correction would keep handing back the washed-out atlas
+    afterwards -- the corrected colour computed, cached, and never reached.
+    """
+    pytest.importorskip("PIL.Image")
+
+    from cyberwave_robot_format.mesh import convert_dae_to_obj, processing
+
+    colours = ((0x3D, 0x4A, 0x56), (0x4F, 0x5D, 0x6B))
+    source = _dae_with_diffuse_colours(tmp_path / "painted.dae", colours)
+    output = tmp_path / "converted"
+
+    stale = Path(convert_dae_to_obj(source, None, output)).parent
+    current = Path(convert_dae_to_obj(source, None, output)).parent
+    assert current == stale, "an unchanged converter must still hit its cache"
+
+    monkeypatched = str(int(processing._CONVERSION_REVISION) + 1)
+    with mock.patch.object(processing, "_CONVERSION_REVISION", monkeypatched):
+        rebuilt = Path(convert_dae_to_obj(source, None, output)).parent
+
+    assert rebuilt != stale
 
 
 def test_a_mesh_with_no_texture_beside_it_resolves_to_nothing(tmp_path: Path) -> None:

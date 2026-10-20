@@ -21,6 +21,87 @@ from cyberwave_robot_format.math_utils import Vector3
 
 logger = logging.getLogger(__name__)
 
+# The edge of the flat swatch a bare colour is carried in. One texel would
+# hold the colour; four keeps it a size every consumer downstream already
+# handles, and matches the backend's copy of this correction.
+_SWATCH_EDGE = 4
+
+# Bumped whenever conversion starts producing something different for inputs
+# that have not changed. The converted OBJ and trimesh's sidecar PNG are cached
+# under a key built from the source path and the scale alone, so without this a
+# host that converted a mesh under an older release keeps serving that old
+# artifact forever -- the fix is computed, but never reached.
+# v2: a COLLADA diffuse colour is no longer gamma-encoded into the atlas.
+_CONVERSION_REVISION = "2"
+
+
+def _bake_display_referred_diffuse(loaded: object) -> None:
+    """Hand COLLADA's diffuse colours to trimesh as pixels, not as a factor.
+
+    When a mesh carries more than one material, trimesh concatenates them into
+    a single texture atlas, and building that atlas reads each material's
+    ``baseColorFactor`` through ``linear_to_srgb``
+    (``trimesh/visual/material.py``, ``get_base_color_texture``) because the
+    glTF spec defines that factor as a *linear* multiplier. A COLLADA
+    ``<diffuse><color>`` is not linear — trimesh's own COLLADA loader puts the
+    file's display-referred value straight into that field — so the converted
+    mesh renders visibly lighter than the DAE says it is. Measured on the DEEP
+    Robotics M20: RAL 7024 ``#3D4A56`` came out ``#86939D``.
+
+    Writing the colour into a flat ``baseColorTexture`` and clearing the factor
+    moves the material onto the packer's image branch, which copies pixels
+    through untouched. Correcting the factor instead would be both lossy
+    (it is stored as uint8) and wrong for a single-material mesh, which never
+    reaches the packer and so is never transformed.
+
+    A single-material mesh is rewritten too, although its colour was never at
+    risk of being encoded twice, and that is deliberate rather than
+    incidental. Correcting the colour is not the only thing this does: it is
+    also what gets the colour onto disk at all. ``trimesh``'s OBJ exporter
+    writes a sidecar PNG for an image, but only an ``mtl`` ``Kd`` line for a
+    bare factor, and ``converted_mesh_texture`` matches ``map_Kd`` — so a bare
+    colour left alone reaches the MJCF as nothing and the part renders in
+    MuJoCo's default grey. The backend's copy of this correction *does* skip
+    the single-material case, because ``_base_color_png`` there builds a
+    swatch out of the factor itself and so has its own way of carrying a bare
+    colour. This copy has none, which is why the two differ here.
+
+    Only a material carrying a bare colour is touched. One that references an
+    image keeps its factor, which genuinely is a multiplier in that branch.
+
+    The cloud scene exporter in ``cyberwave-backend`` carries the same
+    correction (``src/lib/robot_export/mesh_textures.py``) rather than calling
+    this one: it depends on ``cyberwave-robot-format>=0.1.3``, so importing a
+    symbol added here would break every install that resolves an older release,
+    and the floor cannot be raised to a version that is not published yet.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        # Pillow is not a base dependency. Without it trimesh cannot build an
+        # atlas at all, so there is no converted colour here to get wrong.
+        return
+
+    from trimesh.visual.material import PBRMaterial
+
+    geometries = getattr(loaded, "geometry", None)
+    meshes = list(geometries.values()) if geometries else [loaded]
+    for mesh in meshes:
+        material = getattr(getattr(mesh, "visual", None), "material", None)
+        if not isinstance(material, PBRMaterial):
+            continue
+        factor = material.baseColorFactor
+        if material.baseColorTexture is not None or factor is None:
+            continue
+        channels = [int(channel) for channel in np.asarray(factor).reshape(-1)[:4]]
+        if len(channels) < 3:
+            continue
+        rgba = tuple(channels) + (255,) * (4 - len(channels))
+        material.baseColorTexture = Image.new(
+            "RGBA", (_SWATCH_EDGE, _SWATCH_EDGE), rgba
+        )
+        material.baseColorFactor = None
+
 
 def convert_dae_to_obj(
     dae_path: str,
@@ -49,10 +130,12 @@ def convert_dae_to_obj(
     if output_dir is None:
         output_dir = Path("/tmp/mujoco_converted_meshes")
 
-    # Generate unique name based on path AND scale
+    # Generate unique name based on path AND scale AND converter revision
     scale_tuple = (scale.x, scale.y, scale.z) if scale else (1.0, 1.0, 1.0)
     scale_str = f"{scale_tuple[0]}_{scale_tuple[1]}_{scale_tuple[2]}"
-    h = hashlib.sha256(f"{dae_path}_{scale_str}".encode()).hexdigest()
+    h = hashlib.sha256(
+        f"{dae_path}_{scale_str}_{_CONVERSION_REVISION}".encode()
+    ).hexdigest()
     # One directory per conversion. trimesh names an OBJ's sidecars after the
     # material rather than the mesh -- `material.mtl`, `material_0.png` -- so a
     # shared output directory has every textured mesh overwriting the previous
@@ -81,6 +164,9 @@ def convert_dae_to_obj(
     # missing file, an ``asset://`` URI) must not leave an empty per-mesh
     # directory behind on every failed attempt.
     mesh = trimesh.load(dae_path)
+    # Before anything merges the materials: the merge is where a DAE's own
+    # colours would be gamma-encoded a second time.
+    _bake_display_referred_diffuse(mesh)
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
     # Handle Scene objects (flatten to single mesh)
