@@ -1,4 +1,5 @@
 from cyberwave_robot_format.mesh.processing import (
+    collada_unit_scale,
     convert_dae_to_obj,
     convert_mesh_bytes_to_obj,
     converted_mesh_texture,
@@ -8,6 +9,7 @@ from cyberwave_robot_format.mesh.processing import (
 from cyberwave_robot_format.mesh.resolution import resolve_mesh_uri
 
 __all__ = [
+    "collada_unit_scale",
     "convert_dae_to_obj",
     "converted_mesh_texture",
     "convert_mesh_bytes_to_obj",

@@ -195,7 +195,7 @@ _DAE_NODE = """<node id="n{i}"><instance_geometry url="#geo{i}"><bind_material><
 </technique_common></bind_material></instance_geometry></node>"""
 
 
-def _dae_with_diffuse_colours(path: Path, colours) -> str:
+def _dae_with_diffuse_colours(path: Path, colours, unit: float = 1.0) -> str:
     """Write a DAE whose materials carry nothing but a diffuse colour.
 
     One triangle per colour, each bound to its own material -- the shape of a
@@ -212,7 +212,7 @@ def _dae_with_diffuse_colours(path: Path, colours) -> str:
     path.write_text(
         '<?xml version="1.0" encoding="utf-8"?>'
         '<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">'
-        '<asset><unit meter="1" name="meter"/><up_axis>Z_UP</up_axis></asset>'
+        f'<asset><unit meter="{unit}" name="unit"/><up_axis>Z_UP</up_axis></asset>'
         f"<library_effects>{effects}</library_effects>"
         f"<library_materials>{materials}</library_materials>"
         f"<library_geometries>{geometries}</library_geometries>"
@@ -303,6 +303,48 @@ def test_a_mesh_converted_by_an_earlier_release_is_not_served_again(tmp_path: Pa
         rebuilt = Path(convert_dae_to_obj(source, None, output)).parent
 
     assert rebuilt != stale
+
+
+def test_collada_unit_scale_reads_the_root_asset_unit() -> None:
+    from cyberwave_robot_format.mesh import collada_unit_scale
+
+    def dae(asset: str) -> bytes:
+        return f'<?xml version="1.0"?><COLLADA><asset>{asset}</asset></COLLADA>'.encode()
+
+    assert collada_unit_scale(dae('<unit meter="0.0254" name="inch"/>')) == 0.0254
+    assert collada_unit_scale(dae("<up_axis>Z_UP</up_axis>")) == 1.0
+    assert collada_unit_scale(dae('<unit meter="-1"/>')) == 1.0
+    assert collada_unit_scale(dae('<unit meter="inch"/>')) == 1.0
+
+
+def _obj_extents(obj_bytes: bytes):
+    import io
+
+    import trimesh
+
+    return trimesh.load(io.BytesIO(obj_bytes), file_type="obj", force="mesh").extents
+
+
+def test_an_inch_authored_dae_converts_to_metres(tmp_path: Path) -> None:
+    """trimesh ignores a COLLADA `<unit>`, so an inch-authored part came out 39x oversize."""
+    from cyberwave_robot_format.mesh import convert_dae_to_obj
+
+    source = _dae_with_diffuse_colours(tmp_path / "trunk.dae", ((0x3D, 0x4A, 0x56),), unit=0.0254)
+
+    obj = Path(convert_dae_to_obj(source, Vector3(2.0, 2.0, 2.0), tmp_path / "converted"))
+
+    # The fixture's triangle spans one unit in x and y; the caller's scale applies on top.
+    assert _obj_extents(obj.read_bytes())[:2] == pytest.approx([0.0508, 0.0508])
+
+
+def test_an_inch_authored_dae_converts_to_metres_from_bytes(tmp_path: Path) -> None:
+    from cyberwave_robot_format.mesh import convert_mesh_bytes_to_obj
+
+    source = _dae_with_diffuse_colours(tmp_path / "calf.dae", ((0x3D, 0x4A, 0x56),), unit=0.0254)
+
+    obj = convert_mesh_bytes_to_obj(Path(source).read_bytes(), "calf.dae")
+
+    assert _obj_extents(obj)[:2] == pytest.approx([0.0254, 0.0254])
 
 
 def test_a_mesh_with_no_texture_beside_it_resolves_to_nothing(tmp_path: Path) -> None:

@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import math
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -32,7 +34,32 @@ _SWATCH_EDGE = 4
 # host that converted a mesh under an older release keeps serving that old
 # artifact forever -- the fix is computed, but never reached.
 # v2: a COLLADA diffuse colour is no longer gamma-encoded into the atlas.
-_CONVERSION_REVISION = "2"
+# v3: a COLLADA file's declared <unit> is applied.
+_CONVERSION_REVISION = "3"
+
+# A COLLADA file's root <asset> comes first; this much of the file holds it.
+_COLLADA_ASSET_HEAD_BYTES = 64 * 1024
+_COLLADA_ASSET = re.compile(rb"<asset\b.*?</asset>", re.DOTALL)
+_COLLADA_UNIT_METER = re.compile(rb"<unit\b[^>]*\bmeter\s*=\s*[\"']([^\"']+)[\"']")
+
+
+def collada_unit_scale(dae_bytes: bytes) -> float:
+    """Metres per unit declared by a COLLADA file's root ``<asset><unit>``.
+
+    trimesh records it as metadata but never scales the geometry, so a mesh
+    authored in inches converts 39x oversize while the viewer, which honours
+    it, shows it right. Both converters here apply it.
+
+    The backend carries its own copy for its texture route, for the reason
+    given at the end of ``_bake_display_referred_diffuse``.
+    """
+    asset = _COLLADA_ASSET.search(dae_bytes[:_COLLADA_ASSET_HEAD_BYTES])
+    unit = _COLLADA_UNIT_METER.search(asset.group(0)) if asset else None
+    try:
+        scale = float(unit.group(1)) if unit else 1.0
+    except ValueError:
+        return 1.0
+    return scale if math.isfinite(scale) and scale > 0 else 1.0
 
 
 def _bake_display_referred_diffuse(loaded: object) -> None:
@@ -111,11 +138,12 @@ def convert_dae_to_obj(
     """Convert a DAE (Collada) mesh file to OBJ format.
 
     MuJoCo does not natively support DAE files, so this function converts
-    them to OBJ format using trimesh. The scale is baked into the vertices.
+    them to OBJ format using trimesh. The file's declared unit and the scale
+    are baked into the vertices.
 
     Args:
         dae_path: Path to the input DAE file.
-        scale: Optional scale to apply to mesh vertices.
+        scale: Optional scale to apply to mesh vertices, on top of the unit.
         output_dir: Directory to write the output OBJ file. Defaults to
             /tmp/mujoco_converted_meshes.
 
@@ -178,6 +206,11 @@ def convert_dae_to_obj(
     else:
         geom = mesh
 
+    with open(dae_path, "rb") as handle:
+        unit = collada_unit_scale(handle.read(_COLLADA_ASSET_HEAD_BYTES))
+    if unit != 1.0:
+        geom.apply_scale(unit)
+
     # Apply the scale to the mesh
     if scale:
         transform = np.eye(4)
@@ -231,12 +264,13 @@ def convert_mesh_bytes_to_obj(
     Any format trimesh can load is accepted; the extension is taken from
     ``original_filename`` so trimesh picks the right loader. This is how
     MuJoCo-undecodable formats (DAE, GLB/glTF) are turned into OBJ for the
-    MuJoCo scene export.
+    MuJoCo scene export. A DAE's declared unit is applied
+    (``collada_unit_scale``).
 
     Args:
         mesh_bytes: Raw mesh file bytes (DAE, GLB, glTF, STL, etc.)
         original_filename: Original filename (used for extension detection)
-        scale: Optional scale to apply to mesh vertices
+        scale: Optional scale to apply to mesh vertices, on top of the unit
 
     Returns:
         OBJ format bytes
@@ -265,6 +299,11 @@ def convert_mesh_bytes_to_obj(
                 geom = trimesh.Trimesh()
         else:
             geom = mesh
+
+        if original_filename.lower().endswith(".dae"):
+            unit = collada_unit_scale(mesh_bytes)
+            if unit != 1.0:
+                geom.apply_scale(unit)
 
         # Apply scale transform if provided
         if scale:
