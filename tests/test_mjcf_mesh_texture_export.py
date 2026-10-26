@@ -354,6 +354,25 @@ def test_a_mesh_with_no_texture_beside_it_resolves_to_nothing(tmp_path: Path) ->
     assert converted_mesh_texture(str(obj)) is None
 
 
+def test_a_urdf_texture_file_does_not_dangle_in_the_mjcf(tmp_path: Path) -> None:
+    """A URDF <texture filename> names an image, not an MJCF texture; referencing
+    it from the material made MuJoCo reject the whole model."""
+    from cyberwave_robot_format.urdf import URDFParser
+
+    mujoco = pytest.importorskip("mujoco")
+    source = tmp_path / "robot.urdf"
+    source.write_text("""<robot name="arm">
+      <material name="black"><texture filename="../meshes/black.png"/></material>
+      <link name="base_link"><visual><geometry><box size=".1 .1 .1"/></geometry>
+        <material name="black"/></visual></link></robot>""")
+    out = tmp_path / "model.xml"
+    MJCFExporter().export(URDFParser().parse(source), out)
+
+    root = ET.parse(out).getroot()
+    assert root.find("asset/material").get("texture") is None
+    mujoco.MjModel.from_xml_path(str(out))
+
+
 def test_a_textured_mesh_reaches_mujoco_as_texture_material_and_geom_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

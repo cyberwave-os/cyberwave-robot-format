@@ -494,17 +494,22 @@ class MJCFExporter(BaseExporter):
 
         if material.texture:
             texture = material.extensions.get("mjcf_texture")
+            existing = next(
+                (item for item in asset.findall("texture") if item.get("name") == material.texture), None
+            )
             if texture:
                 attributes = {key: str(value) for key, value in texture.items()}
                 attributes["name"] = material.texture
-                existing = next(
-                    (item for item in asset.findall("texture") if item.get("name") == material.texture), None
-                )
                 if existing is None:
-                    ET.SubElement(asset, "texture", attributes)
+                    existing = ET.SubElement(asset, "texture", attributes)
                 elif existing.attrib != attributes:
                     raise ValueError(f"Conflicting MJCF texture declaration: {material.texture}")
-            mat_elem.set("texture", material.texture)
+            if existing is not None:
+                mat_elem.set("texture", material.texture)
+            else:
+                # A URDF <texture filename> names an image, not a declared
+                # texture; MuJoCo rejects the whole model over the dangling name.
+                logger.warning("Material %s drops undeclared texture %s", material.name, material.texture)
 
         if material.emissive:
             mat_elem.set("emission", str(material.emissive[0]))
