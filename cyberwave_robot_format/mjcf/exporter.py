@@ -49,6 +49,15 @@ from cyberwave_robot_format.schema import (
 
 logger = logging.getLogger(__name__)
 
+
+def _is_camera(sensor: Sensor) -> bool:
+    """Every spelling of an RGB or depth camera becomes a ``<camera>``: the
+    simulator renders by camera name, so a sensor stored as ``depth`` (not
+    only ``depth_camera``) must exist in the model too."""
+    from cyberwave_robot_format.usd.semantics import sensor_kind
+
+    return sensor_kind(sensor.type) in {"rgb", "depth"}
+
 # A mesh reference with any URI scheme (``asset://<uuid>/...`` from cloud
 # exports, ``package://``, ``https://``, ``file://``) is not a path trimesh can
 # open; whoever handed the exporter a URI owns resolving it.
@@ -464,7 +473,7 @@ class MJCFExporter(BaseExporter):
         if schema.sensors:
             sensor_elem = ET.SubElement(mujoco, "sensor")
             for sensor in schema.sensors:
-                if sensor.type in ("camera", "depth_camera"):
+                if _is_camera(sensor):
                     pass  # cameras become <camera> elements in the body, not <sensor>
                 else:
                     self._add_sensor(sensor_elem, sensor)
@@ -733,7 +742,7 @@ class MJCFExporter(BaseExporter):
             for sensor in schema.sensors:
                 if sensor.parent_link != link.name:
                     continue
-                if sensor.type in ("camera", "depth_camera"):
+                if _is_camera(sensor):
                     self._add_camera(body, sensor)
                 else:
                     # Root links come through this path, and a site-attached sensor
@@ -989,7 +998,7 @@ class MJCFExporter(BaseExporter):
             for sensor in schema.sensors:
                 if sensor.parent_link != link.name:
                     continue
-                if sensor.type in ("camera", "depth_camera"):
+                if _is_camera(sensor):
                     self._add_camera(body, sensor)
                 else:
                     # Every site-attached MuJoCo sensor (gyro, accelerometer,

@@ -216,6 +216,16 @@ class TestMountSites:
         assert referenced == {"imu_site"}
         assert referenced <= set(_sites(root))
 
+    @pytest.mark.parametrize("sensor_type", ["rgb", "rgbd", "depth", "depth_camera"])
+    def test_every_camera_spelling_becomes_a_model_camera(self, sensor_type):
+        """The simulator renders by camera name: a camera stored as ``depth``
+        or ``rgb`` (spellings the platform writes) must exist in the model."""
+        root = _export(
+            [{"name": "cam", "type": sensor_type, "parent_link": "base_link"}]
+        )
+        base_body = root.find(".//body[@name='base_link']")
+        assert [c.get("name") for c in base_body.findall("camera")] == ["cam"]
+
     def test_root_link_camera_still_exports(self):
         """Guard the rewritten loop: cameras on the root must not regress."""
         root = _export([{"name": "cam", "type": "camera", "parent_link": "base_link"}])
