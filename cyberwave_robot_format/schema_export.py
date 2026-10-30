@@ -44,8 +44,19 @@ def export_universal_schema_json(
     # Serialize to dict
     schema_dict = schema.to_dict()
 
-    # Convert to JSON with pretty printing and sorted keys for determinism
-    json_str = json.dumps(schema_dict, sort_keys=True, indent=2, ensure_ascii=False)
+    # Convert to JSON with pretty printing and sorted keys for determinism.
+    # ``allow_nan=False``: Python's default emits the bare tokens ``NaN``/``Infinity``,
+    # which are not JSON, so every strict consumer (``JSON.parse``, a ``jsonb`` column)
+    # would fail later with nothing pointing back here.
+    try:
+        json_str = json.dumps(
+            schema_dict, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Schema for {schema.metadata.name!r} contains a value that is not "
+            f"representable in JSON ({exc}). NaN and Infinity are not valid JSON."
+        ) from exc
     json_bytes = json_str.encode("utf-8")
 
     # Optionally write to output path
