@@ -3,6 +3,7 @@ Utility functions for format detection, validation, and conversion support.
 """
 
 import logging
+import math
 import re
 import xml.etree.ElementTree as ET
 import zipfile
@@ -12,6 +13,22 @@ from typing import Any
 from cyberwave_robot_format.schema import CommonSchema
 
 logger = logging.getLogger(__name__)
+
+
+def require_finite_float(raw: str | float) -> float:
+    """Parse a numeric attribute as a finite float, or raise ``ValueError``.
+
+    ``float("nan")`` and ``float("inf")`` both *succeed*, so a bare ``float(...)`` is
+    how a non-finite value enters a schema, where it is not representable in JSON and
+    MuJoCo turns an infinite mass into ``NaN`` for every quantity the body touches.
+
+    Raises ``ValueError`` rather than returning ``None`` so it drops into the
+    ``except ValueError`` each parser already has for non-numeric text.
+    """
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"expected a finite number, got {raw!r}")
+    return value
 
 
 def detect_format(file_path):

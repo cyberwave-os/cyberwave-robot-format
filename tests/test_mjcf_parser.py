@@ -1,9 +1,11 @@
 """Tests for MJCF parser."""
 
+import json
 from pathlib import Path
 
 import pytest
 
+from cyberwave_robot_format.core import ParseError
 from cyberwave_robot_format.mjcf import MJCFParser, MJCFExporter
 from cyberwave_robot_format.schema import (
     ActuatorType,
@@ -260,6 +262,201 @@ def test_mjcf_exporter_basic(simple_mjcf_path, tmp_path):
     root = tree.getroot()
     assert root.tag == "mujoco"
     assert root.get("model") == "simple_robot"
+
+
+def test_non_finite_attributes_never_enter_the_schema(tmp_path):
+    """MJCF ingest is a user-upload path (``import/mujoco-scene``), and a bare
+    ``float()`` accepts ``nan``/``inf``/``Infinity``. Each non-finite attribute is
+    reported and dropped like non-numeric text, so the schema stays exportable."""
+    mjcf = """<mujoco model="hostile">
+      <worldbody>
+        <body name="b1" pos="nan 0 0">
+          <inertial pos="0 0 0" mass="Infinity" diaginertia="0.1 0.1 0.1"/>
+          <joint name="j1" type="hinge" axis="0 0 1" range="-inf inf"/>
+          <geom type="box" size="0.1 0.1 0.1" rgba="1 0 0 nan"/>
+        </body>
+      </worldbody>
+    </mujoco>"""
+    path = tmp_path / "hostile.xml"
+    path.write_text(mjcf)
+
+    schema = MJCFParser().parse(path)
+
+    assert schema.validate() == []
+    parse_context = schema.extensions["parse_context"]
+    assert any("Invalid mass value" in error for error in parse_context["errors"])
+    warnings = parse_context["warnings"]
+    link = schema.get_link("b1")
+    assert link.mass == 0.0  # the Infinity mass was refused, not stored
+    assert any("Invalid position for body b1" in warning for warning in warnings)
+    joint = schema.get_joint("j1")
+    assert joint.limits is None or (
+        joint.limits.lower is None and joint.limits.upper is None
+    )
+    # The whole schema now serializes as strict JSON.
+    json.dumps(schema.to_dict(), allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "inertial",
+    [
+        'pos="0 0 0" mass="inf" diaginertia="0.1 0.1 0.1"',
+        'pos="0 0 0" mass="1" diaginertia="inf inf inf"',
+        'pos="inf 0 0" mass="1" diaginertia="0.1 0.1 0.1"',
+        'pos="0 0 0" quat="nan 0 0 1" mass="1" diaginertia="0.1 0.1 0.1"',
+        'pos="0 0 0" euler="nan 0 0" mass="1" diaginertia="0.1 0.1 0.1"',
+    ],
+    ids=["mass", "inertia", "center_of_mass", "quat", "euler"],
+)
+def test_resolve_inertia_rejects_a_non_finite_compiled_value(tmp_path, inertial):
+    """``resolve_inertia=True`` re-reads mass, inertia and center of mass from the
+    compiled MuJoCo model, which accepts ``inf`` for all three and a NaN inertial
+    orientation, so the attribute-level drop is undone there unless the compiled
+    values are checked too."""
+    pytest.importorskip("mujoco")
+    mjcf = f"""<mujoco model="hostile">
+      <worldbody>
+        <body name="b1">
+          <inertial {inertial}/>
+          <joint name="j1" type="hinge" axis="0 0 1"/>
+          <geom type="box" size="0.1 0.1 0.1"/>
+        </body>
+      </worldbody>
+    </mujoco>"""
+    path = tmp_path / "hostile.xml"
+    path.write_text(mjcf)
+
+    with pytest.raises(ParseError, match="non-finite mass, inertia or center of mass"):
+        MJCFParser().parse(path, resolve_inertia=True)
+
+
+# Float max. A rotated diagonal tensor's entries are bounded by its largest
+# eigenvalue, so it only overflows through rounding. ``20 0 0 99`` (wxyz) has an
+# exact norm of 101 and trimesh builds its rotation elementwise, so the matrix is
+# the same on every platform, and its row norm² sits ~4.6 ulps above 1. That puts
+# the exact tensor entry ~17 half-ulps of the float maximum past the round-to-inf
+# threshold, so every BLAS summation order or FMA choice in
+# ``rotation @ D @ rotation.T`` still rounds to inf.
+_FLOAT_MAX = "1.7976931348623157e308"
+
+
+@pytest.mark.parametrize(
+    ("body", "warning", "error"),
+    [
+        ('<geom type="box" size="1e308 0.1 0.1"/>', "Invalid size values for geometry in link b1", None),
+        ('<geom type="cylinder" size="0.1 1e308"/>', "Invalid size values for geometry in link b1", None),
+        ('<geom type="capsule" size="0.1 1e308"/>', "Invalid size values for geometry in link b1", None),
+        (
+            f'<inertial pos="0 0 0" mass="1" quat="20 0 0 99" diaginertia="{_FLOAT_MAX} {_FLOAT_MAX} 1"/>'
+            '<geom type="sphere" size="0.1"/>',
+            None,
+            "Invalid inertia values for link b1",
+        ),
+    ],
+    ids=["box", "cylinder", "capsule", "rotated_inertia"],
+)
+def test_a_finite_value_that_overflows_in_conversion_never_enters_the_schema(tmp_path, body, warning, error):
+    """The parser doubles box half-sizes and cylinder/capsule half-lengths and
+    rotates a diagonal inertia, so a finite attribute near the float maximum
+    becomes ``inf`` without any ``nan``/``inf`` text in the file."""
+    mjcf = f"""<mujoco model="hostile">
+      <worldbody>
+        <body name="b1">
+          <joint name="j1" type="hinge" axis="0 0 1"/>
+          {body}
+        </body>
+      </worldbody>
+    </mujoco>"""
+    path = tmp_path / "hostile.xml"
+    path.write_text(mjcf)
+
+    schema = MJCFParser().parse(path)
+
+    json.dumps(schema.to_dict(), allow_nan=False)
+    parse_context = schema.extensions["parse_context"]
+    if warning:
+        assert warning in parse_context["warnings"]
+    if error:
+        assert error in parse_context["errors"]
+        # The overflowing rotation falls back to the unrotated diagonal, as an
+        # invalid inertial quaternion already does.
+        inertia = next(link for link in schema.links if link.name == "b1").inertia
+        assert (inertia.ixx, inertia.iyy, inertia.izz) == (float(_FLOAT_MAX), float(_FLOAT_MAX), 1.0)
+        assert (inertia.ixy, inertia.ixz, inertia.iyz) == (0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("geom", "check"),
+    [
+        ('<geom type="sphere" size="1e308"/>', lambda g: g.radius == 1e308),
+        ('<geom type="ellipsoid" size="1e308 0.1 0.1"/>', lambda g: g.size.x == 1e308),
+        ('<geom type="plane" size="1e308 1e308 0.1"/>', lambda g: g.size.x == 1e308),
+        # Only the half-length is doubled; the radius is stored as is.
+        ('<geom type="cylinder" size="1e308 0.1"/>', lambda g: g.radius == 1e308 and g.length == 0.2),
+        ('<geom type="capsule" size="1e308 0.1"/>', lambda g: g.radius == 1e308 and g.length == 0.2),
+    ],
+    ids=["sphere", "ellipsoid", "plane", "cylinder_radius", "capsule_radius"],
+)
+def test_a_large_size_that_is_never_doubled_is_kept(tmp_path, geom, check):
+    """The doubling overflow guard covers only the values the parser doubles, so a
+    large but finite size that is stored unchanged still parses."""
+    mjcf = f"""<mujoco model="large">
+      <worldbody>
+        <body name="b1">
+          <joint name="j1" type="hinge" axis="0 0 1"/>
+          {geom}
+        </body>
+      </worldbody>
+    </mujoco>"""
+    path = tmp_path / "large.xml"
+    path.write_text(mjcf)
+
+    schema = MJCFParser().parse(path)
+
+    parse_context = schema.extensions["parse_context"]
+    assert "Invalid size values for geometry in link b1" not in parse_context["warnings"]
+    link = schema.get_link("b1")
+    assert link.visuals and check(link.visuals[0].geometry)
+    json.dumps(schema.to_dict(), allow_nan=False)
+
+
+def test_a_joint_position_that_overflows_with_its_body_position_is_rejected(tmp_path):
+    """A joint's schema position is its own plus its body's; two finite values near
+    the float maximum sum to ``inf``."""
+    mjcf = """<mujoco model="hostile">
+      <worldbody>
+        <body name="b1" pos="1e308 0 0">
+          <joint name="j1" type="hinge" pos="1e308 0 0" axis="0 0 1"/>
+          <geom type="sphere" size="0.1"/>
+        </body>
+      </worldbody>
+    </mujoco>"""
+    path = tmp_path / "hostile.xml"
+    path.write_text(mjcf)
+
+    with pytest.raises(ParseError, match="'j1' position overflows"):
+        MJCFParser().parse(path)
+
+
+def test_finite_attributes_still_parse(tmp_path):
+    """The guard must not cost the ordinary case."""
+    mjcf = """<mujoco model="fine">
+      <worldbody>
+        <body name="b1" pos="0.1 0.2 0.3">
+          <inertial pos="0 0 0" mass="2.5" diaginertia="0.1 0.1 0.1"/>
+          <joint name="j1" type="hinge" axis="0 0 1" range="-1.5 1.5"/>
+          <geom type="box" size="0.1 0.1 0.1"/>
+        </body>
+      </worldbody>
+    </mujoco>"""
+    path = tmp_path / "fine.xml"
+    path.write_text(mjcf)
+
+    schema = MJCFParser().parse(path)
+
+    assert schema.get_link("b1").mass == 2.5
+    limits = schema.get_joint("j1").limits
+    assert (limits.lower, limits.upper) == (-1.5, 1.5)
 
 
 if __name__ == "__main__":

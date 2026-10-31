@@ -46,7 +46,7 @@ from cyberwave_robot_format.schema import (
     Vector3,
     Visual,
 )
-from cyberwave_robot_format.utils import sanitize_name
+from cyberwave_robot_format.utils import require_finite_float, sanitize_name
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class MJCFParser(BaseParser):
                 friction_attr = geom_default.get("friction")
                 if friction_attr:
                     try:
-                        self._default_geom_friction = [float(x) for x in friction_attr.split()]
+                        self._default_geom_friction = [require_finite_float(x) for x in friction_attr.split()]
                     except ValueError:
                         context.add_warning("Invalid default geom friction")
                 material_attr = geom_default.get("material")
@@ -239,8 +239,15 @@ class MJCFParser(BaseParser):
             mujoco.mju_quat2Mat(rotation, model.body_iquat[index])
             rotation = rotation.reshape(3, 3)
             tensor = rotation @ np.diag(model.body_inertia[index]) @ rotation.T
-            link.mass = float(model.body_mass[index])
-            link.center_of_mass = Vector3.from_list(model.body_ipos[index].tolist())
+            mass = float(model.body_mass[index])
+            center_of_mass = model.body_ipos[index]
+            # MuJoCo compiles mass="inf", an infinite diaginertia and an infinite inertial
+            # pos without complaint, so the compiled values bypass the attribute-level
+            # finite check. A NaN inertial quat/euler reaches the tensor through body_iquat.
+            if not math.isfinite(mass) or not np.isfinite(tensor).all() or not np.isfinite(center_of_mass).all():
+                raise ParseError(f"Compiled MJCF body {link.name!r} has a non-finite mass, inertia or center of mass")
+            link.mass = mass
+            link.center_of_mass = Vector3.from_list(center_of_mass.tolist())
             link.inertia = Inertia(
                 ixx=float(tensor[0, 0]),
                 iyy=float(tensor[1, 1]),
@@ -307,7 +314,7 @@ class MJCFParser(BaseParser):
         pos_str = body_elem.get("pos")
         if pos_str:
             try:
-                pos_values = [float(x) for x in pos_str.split()]
+                pos_values = [require_finite_float(x) for x in pos_str.split()]
                 if len(pos_values) == 3:
                     body_pose = Pose(position=Vector3(pos_values[0], pos_values[1], pos_values[2]))
             except ValueError:
@@ -316,7 +323,7 @@ class MJCFParser(BaseParser):
         quat_str = body_elem.get("quat")
         if quat_str:
             try:
-                quat_values = [float(x) for x in quat_str.split()]
+                quat_values = [require_finite_float(x) for x in quat_str.split()]
                 if len(quat_values) == 4:
                     orientation = Quaternion.from_wxyz(quat_values)
                     if body_pose is None:
@@ -397,7 +404,7 @@ class MJCFParser(BaseParser):
         mass_str = inertial_elem.get("mass")
         if mass_str:
             try:
-                link.mass = float(mass_str)
+                link.mass = require_finite_float(mass_str)
                 if link.mass < 0:
                     context.add_warning(f"Negative mass for link {link.name}")
             except ValueError:
@@ -406,7 +413,7 @@ class MJCFParser(BaseParser):
         pos_str = inertial_elem.get("pos")
         if pos_str:
             try:
-                pos_values = [float(x) for x in pos_str.split()]
+                pos_values = [require_finite_float(x) for x in pos_str.split()]
                 if len(pos_values) == 3:
                     link.center_of_mass = Vector3(pos_values[0], pos_values[1], pos_values[2])
             except ValueError:
@@ -415,7 +422,7 @@ class MJCFParser(BaseParser):
         diaginertia_str = inertial_elem.get("diaginertia")
         if diaginertia_str:
             try:
-                diag_values = [float(x) for x in diaginertia_str.split()]
+                diag_values = [require_finite_float(x) for x in diaginertia_str.split()]
                 if len(diag_values) == 3:
                     link.inertia = Inertia(
                         ixx=diag_values[0],
@@ -438,6 +445,8 @@ class MJCFParser(BaseParser):
                         # orientation, so rotate the tensor instead of discarding it.
                         rotation = quaternion_matrix([value / norm for value in quat])[:3, :3]
                         tensor = rotation @ link.inertia.to_matrix() @ rotation.T
+                        if not all(math.isfinite(value) for value in tensor.flat):
+                            raise ValueError("Rotated inertia overflows")
                         link.inertia = Inertia(
                             ixx=float(tensor[0, 0]),
                             iyy=float(tensor[1, 1]),
@@ -452,7 +461,7 @@ class MJCFParser(BaseParser):
         fullinertia_str = inertial_elem.get("fullinertia")
         if fullinertia_str:
             try:
-                inertia_values = [float(x) for x in fullinertia_str.split()]
+                inertia_values = [require_finite_float(x) for x in fullinertia_str.split()]
                 if len(inertia_values) == 6:
                     link.inertia = Inertia(
                         ixx=inertia_values[0],
@@ -482,7 +491,19 @@ class MJCFParser(BaseParser):
         size_values = []
         if size_str:
             try:
-                size_values = [float(x) for x in size_str.split()]
+                size_values = [require_finite_float(x) for x in size_str.split()]
+                # Box half-sizes and cylinder/capsule half-lengths are doubled below,
+                # which turns a finite value near the float maximum into inf. Other
+                # sizes (sphere, ellipsoid, plane, and the cylinder/capsule radius)
+                # are stored unchanged, so they are not checked here.
+                if geom_type == "box":
+                    doubled = size_values[:3]
+                elif geom_type in ("cylinder", "capsule"):
+                    doubled = size_values[1:2]
+                else:
+                    doubled = []
+                if not all(math.isfinite(value * 2) for value in doubled):
+                    raise ValueError("geom size overflows when doubled")
             except ValueError:
                 context.add_warning(f"Invalid size values for geometry in link {link.name}")
                 return
@@ -532,7 +553,7 @@ class MJCFParser(BaseParser):
                 geom_scale = geom_elem.get("scale")
                 if geom_scale:
                     try:
-                        scale_vals = [float(x) for x in geom_scale.split()]
+                        scale_vals = [require_finite_float(x) for x in geom_scale.split()]
                         if len(scale_vals) == 3:
                             geometry.scale = Vector3(scale_vals[0], scale_vals[1], scale_vals[2])
                     except ValueError:
@@ -551,7 +572,7 @@ class MJCFParser(BaseParser):
                 rgba_attr = geom_elem.get("rgba")
                 if rgba_attr:
                     try:
-                        rgba_vals = [float(x) for x in rgba_attr.split()]
+                        rgba_vals = [require_finite_float(x) for x in rgba_attr.split()]
                         if len(rgba_vals) == 4:
                             material = Material(color=rgba_vals)
                     except ValueError:
@@ -563,7 +584,7 @@ class MJCFParser(BaseParser):
 
             if pos_str:
                 try:
-                    pos_values = [float(x) for x in pos_str.split()]
+                    pos_values = [require_finite_float(x) for x in pos_str.split()]
                     if len(pos_values) == 3:
                         pose.position = Vector3(pos_values[0], pos_values[1], pos_values[2])
 
@@ -571,7 +592,7 @@ class MJCFParser(BaseParser):
                     context.add_warning(f"Invalid geometry position for link {link.name}")
             if quat_str:
                 try:
-                    quat_values = [float(x) for x in quat_str.split()]
+                    quat_values = [require_finite_float(x) for x in quat_str.split()]
                     if len(quat_values) == 4:
                         pose.orientation = Quaternion.from_wxyz(quat_values)
                 except ValueError:
@@ -610,7 +631,7 @@ class MJCFParser(BaseParser):
                 friction_attr = geom_elem.get("friction")
                 if friction_attr:
                     try:
-                        friction_vals = [float(x) for x in friction_attr.split()]
+                        friction_vals = [require_finite_float(x) for x in friction_attr.split()]
                         if friction_vals:
                             collision.mu_dynamic = friction_vals[0]
                             collision.mu_static = friction_vals[0]
@@ -671,14 +692,14 @@ class MJCFParser(BaseParser):
         quat_str = joint_elem.get("quat")
         if pos_str:
             try:
-                pos_vals = [float(x) for x in pos_str.split()]
+                pos_vals = [require_finite_float(x) for x in pos_str.split()]
                 if len(pos_vals) == 3:
                     joint.pose.position = Vector3(pos_vals[0], pos_vals[1], pos_vals[2])
             except ValueError:
                 context.add_warning(f"Invalid joint pos for {joint_name}")
         if quat_str:
             try:
-                quat_vals = [float(x) for x in quat_str.split()]
+                quat_vals = [require_finite_float(x) for x in quat_str.split()]
                 if len(quat_vals) == 4:
                     joint.pose.orientation = Quaternion.from_wxyz(quat_vals)
             except ValueError:
@@ -691,6 +712,9 @@ class MJCFParser(BaseParser):
                 joint.pose.position.x += body_pose.position.x
                 joint.pose.position.y += body_pose.position.y
                 joint.pose.position.z += body_pose.position.z
+                # Each term is finite, but two near the float maximum sum to inf.
+                if not all(math.isfinite(value) for value in joint.pose.position.to_list()):
+                    raise ParseError(f"Joint {joint_name!r} position overflows when its body position is added")
             if body_pose.orientation:
                 # If body has orientation, ideally we should compose quaternions
                 # For now, if joint has identity orientation, take body's orientation
@@ -710,7 +734,7 @@ class MJCFParser(BaseParser):
         axis_str = joint_elem.get("axis")
         if axis_str:
             try:
-                axis_values = [float(x) for x in axis_str.split()]
+                axis_values = [require_finite_float(x) for x in axis_str.split()]
                 if len(axis_values) == 3:
                     magnitude = math.sqrt(sum(x**2 for x in axis_values))
                     if magnitude > 1e-6:
@@ -727,7 +751,7 @@ class MJCFParser(BaseParser):
         range_str = joint_elem.get("range")
         if range_str:
             try:
-                range_values = [float(x) for x in range_str.split()]
+                range_values = [require_finite_float(x) for x in range_str.split()]
                 if len(range_values) == 2:
                     joint.limits = JointLimits(lower=range_values[0], upper=range_values[1])
             except ValueError:
@@ -782,7 +806,7 @@ class MJCFParser(BaseParser):
             rgba_str = mat_elem.get("rgba")
             if rgba_str:
                 try:
-                    rgba = [float(x) for x in rgba_str.split()]
+                    rgba = [require_finite_float(x) for x in rgba_str.split()]
                     if len(rgba) == 4:
                         material.color = rgba
                     else:
@@ -793,7 +817,7 @@ class MJCFParser(BaseParser):
             specular_str = mat_elem.get("specular")
             if specular_str:
                 try:
-                    specular = [float(x) for x in specular_str.split()]
+                    specular = [require_finite_float(x) for x in specular_str.split()]
                     material.specular = specular
                 except ValueError:
                     context.add_warning(f"Invalid specular values for material {name}")
@@ -859,7 +883,7 @@ class MJCFParser(BaseParser):
 
                 if scale_attr:
                     try:
-                        scale_vals = [float(x) for x in scale_attr.split()]
+                        scale_vals = [require_finite_float(x) for x in scale_attr.split()]
                         if len(scale_vals) == 3:
                             mesh_info["scale"] = Vector3(scale_vals[0], scale_vals[1], scale_vals[2])
                     except ValueError:
@@ -1033,7 +1057,7 @@ class MJCFParser(BaseParser):
         if value is None:
             return None
         try:
-            values = [float(x) for x in value.split()]
+            values = [require_finite_float(x) for x in value.split()]
         except ValueError:
             return None
         return values[0] if values else None
@@ -1042,7 +1066,7 @@ class MJCFParser(BaseParser):
         if value is None:
             return None
         try:
-            values = [float(x) for x in value.split()]
+            values = [require_finite_float(x) for x in value.split()]
         except ValueError:
             return None
         if len(values) != 2:
@@ -1154,7 +1178,7 @@ class MJCFParser(BaseParser):
         if value is None:
             return None
         try:
-            return float(value)
+            return require_finite_float(value)
         except ValueError:
             return None
 
@@ -1200,7 +1224,7 @@ class MJCFParser(BaseParser):
         gravity_str = option_elem.get("gravity")
         if gravity_str:
             try:
-                gravity_vals = [float(x) for x in gravity_str.split()]
+                gravity_vals = [require_finite_float(x) for x in gravity_str.split()]
                 if len(gravity_vals) >= 3:
                     physics.gravity = Vector3(gravity_vals[0], gravity_vals[1], gravity_vals[2])
             except ValueError:
@@ -1209,7 +1233,7 @@ class MJCFParser(BaseParser):
         timestep_str = option_elem.get("timestep")
         if timestep_str:
             try:
-                physics.timestep = float(timestep_str)
+                physics.timestep = require_finite_float(timestep_str)
             except ValueError:
                 context.add_warning("Invalid timestep value in MJCF option")
 
@@ -1228,7 +1252,7 @@ class MJCFParser(BaseParser):
             try:
                 if physics.solver is None:
                     physics.solver = PhysicsSolver()
-                physics.solver.iterations = int(float(iterations_str))
+                physics.solver.iterations = int(require_finite_float(iterations_str))
             except ValueError:
                 context.add_warning("Invalid iterations value in MJCF option")
 
@@ -1237,7 +1261,7 @@ class MJCFParser(BaseParser):
             try:
                 if physics.solver is None:
                     physics.solver = PhysicsSolver()
-                physics.solver.tolerance = float(tolerance_str)
+                physics.solver.tolerance = require_finite_float(tolerance_str)
             except ValueError:
                 context.add_warning("Invalid tolerance value in MJCF option")
 

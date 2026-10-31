@@ -117,3 +117,27 @@ def test_export_universal_schema_json_formatting():
     # Verify it's valid JSON
     json_data = json.loads(json_str)
     assert json_data is not None
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_a_non_finite_value_fails_the_export_instead_of_writing_invalid_json(value):
+    """``json.dumps`` defaults to writing bare ``NaN``/``Infinity`` tokens, which no
+    strict JSON parser (browser ``JSON.parse``, ``jsonb``) accepts."""
+    schema = CommonSchema(
+        metadata=Metadata(name="nonfinite"),
+        links=[Link(name="base_link", mass=value)],
+    )
+
+    with pytest.raises(ValueError, match="not representable in JSON"):
+        export_universal_schema_json(schema)
+
+
+def test_a_finite_schema_still_exports_after_the_guard():
+    schema = CommonSchema(
+        metadata=Metadata(name="finite"),
+        links=[Link(name="base_link", mass=1.5)],
+    )
+
+    payload = json.loads(export_universal_schema_json(schema).decode("utf-8"))
+
+    assert payload["links"][0]["mass"] == 1.5
