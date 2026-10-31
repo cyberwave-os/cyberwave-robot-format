@@ -293,6 +293,7 @@ class _StageReader:
             px.read_physx(self.root_prim, px.ARTICULATION_APIS),
         )
 
+        schema.materials = self._read_document_materials()
         schema.links = self._read_links()
         schema.joints = self._read_joints()
         schema.actuators = self._read_actuators()
@@ -406,6 +407,7 @@ class _StageReader:
                     name=name,
                     mass=self._read_mass(prim),
                     center_of_mass=self._read_center_of_mass(prim),
+                    inertial_orientation=self._read_inertial_orientation(prim),
                     inertia=self._read_inertia(prim),
                     visuals=visuals,
                     collisions=collisions,
@@ -442,6 +444,12 @@ class _StageReader:
             # sentinel, not a centre of mass.
             return Vector3()
         return c.gf_to_vector3(native)
+
+    def _read_inertial_orientation(self, prim: Any) -> Quaternion:
+        # Only the sidecar: without it the native MassAPI tensor read below is
+        # already in the link frame, which is what identity means.
+        sidecar = c.read_quaternion(prim, t.A_LINK_INERTIAL_ORIENTATION)
+        return sidecar if sidecar is not None else Quaternion()
 
     def _read_inertia(self, prim: Any) -> Inertia:
         sidecar = c.read_float_list(prim, t.A_LINK_INERTIA)
@@ -762,9 +770,30 @@ class _StageReader:
             return None
         if not material:
             return None
+        return self._read_material(material, prim)
 
+    def _read_document_materials(self) -> list[Material]:
+        """Rebuild ``CommonSchema.materials`` from the root's ``cyberwave:order``.
+
+        The exporter lists the document-level materials' prims there in schema
+        order; a foreign stage has no such list and no document materials.
+        """
+        order = c.read_custom_data_json(self.root_prim, t.CD_ORDER)
+        paths = order.get("materials") if isinstance(order, dict) else None
+        materials: list[Material] = []
+        for relative in paths or []:
+            prim = self.root_prim.GetPrimAtPath(relative)
+            material = self.pxr.UsdShade.Material(prim) if prim else None
+            if not material:
+                continue
+            read = self._read_material(material, None)
+            if read is not None:
+                materials.append(read)
+        return materials
+
+    def _read_material(self, material: Any, bound_to: Any) -> Material | None:
         material_prim = material.GetPrim()
-        name = self._material_name(material_prim, prim)
+        name = self._material_name(material_prim, bound_to)
 
         color = c.read_float_list(material_prim, t.A_MATERIAL_COLOR)
         specular = c.read_float_list(material_prim, t.A_MATERIAL_SPECULAR)
@@ -814,7 +843,8 @@ class _StageReader:
         if explicit is not None:
             return explicit
         if (
-            material_prim.GetName() == t.INLINE_MATERIAL_NAME
+            bound_to is not None
+            and material_prim.GetName() == t.INLINE_MATERIAL_NAME
             and material_prim.GetParent() == bound_to
         ):
             return None

@@ -284,7 +284,16 @@ class Link:
     # Inertial properties
     mass: float = 0.0
     center_of_mass: Vector3 = field(default_factory=Vector3)
+    inertial_orientation: Quaternion = field(default_factory=Quaternion)
+    """Rotation of the inertial frame relative to the link frame.
+
+    URDF's ``<inertial><origin>`` carries an ``rpy`` alongside its ``xyz``, and a
+    rotated inertia tensor is common on real robots. ``center_of_mass`` holds the
+    translation; without this field the rotation was dropped on parse and every
+    export wrote ``rpy="0 0 0"``, quietly changing the link's dynamics.
+    """
     inertia: Inertia = field(default_factory=Inertia)
+    """Tensor in the inertial frame (rotated by ``inertial_orientation``)."""
 
     # Geometric representations
     visuals: list[Visual] = field(default_factory=list)
@@ -292,6 +301,33 @@ class Link:
 
     # Format-specific extensions
     extensions: dict[str, Any] = field(default_factory=dict)
+
+    def inertia_in_link_frame(self) -> Inertia:
+        """``inertia`` rotated into the link frame: ``R · I · Rᵀ``.
+
+        For exporters whose format has no inertial-frame rotation slot of its own
+        (MJCF's ``fullinertia`` cannot be combined with ``quat``; UsdPhysics'
+        ``principalAxes`` is already spent on the diagonalisation). Returns
+        ``inertia`` itself for an identity orientation.
+        """
+        q = self.inertial_orientation
+        if q.x == 0.0 and q.y == 0.0 and q.z == 0.0:
+            return self.inertia
+        geometry = _geometry_core()
+        # Lenient normalisation, as usd/frames.quat_to_matrix: zero reads as identity.
+        unit = geometry.compat.normalize_quaternion_or_identity(
+            geometry.Quaternion.from_xyzw((q.x, q.y, q.z, q.w))
+        )
+        rotation = np.array(geometry.quat.to_matrix(unit)).reshape(3, 3)
+        tensor = rotation @ self.inertia.to_matrix() @ rotation.T
+        return Inertia(
+            ixx=float(tensor[0, 0]),
+            iyy=float(tensor[1, 1]),
+            izz=float(tensor[2, 2]),
+            ixy=float(tensor[0, 1]),
+            ixz=float(tensor[0, 2]),
+            iyz=float(tensor[1, 2]),
+        )
 
     def get_mjcf_sites(self) -> list[dict[str, str]]:
         """Named native frames, retained without interpreting them as geometry."""
@@ -309,7 +345,15 @@ class Link:
 
 @dataclass
 class JointLimits:
-    """Joint limit specification."""
+    """Joint limit specification.
+
+    ``effort`` and ``velocity`` are ceilings, and ``None`` **or** ``<= 0`` means
+    "unspecified", never "must not move". URDF requires both on every ``<limit>``,
+    so a URDF with no real value writes ``0`` (CAD exporters do, and so does
+    ``URDFExporter`` for a schema that has none), and the parser keeps that ``0``.
+    Readers that turn these into a cap must skip ``<= 0``. A declared actuator's
+    zero ceiling (``Actuator.max_torque``/``force_range``) is not covered by this.
+    """
 
     lower: float | None = None
     upper: float | None = None
@@ -682,6 +726,15 @@ class CommonSchema:
     physics: Physics | None = None
     scene: Scene | None = None
     collision_config: CollisionConfig | None = None
+    materials: list[Material] = field(default_factory=list)
+    """Document-level named materials, referenced by ``Visual.material.name``.
+
+    URDF allows a material to be declared once at ``<robot>`` level and referenced
+    by name from many visuals. These used to be stashed in the diagnostic
+    ``extensions["parse_context"]["materials"]`` bucket, which no exporter reads, so
+    a schema -> URDF export emitted name-only ``<material>`` references with nothing
+    defining them and every such link rendered untextured.
+    """
     links: list[Link] = field(default_factory=list)
     joints: list[Joint] = field(default_factory=list)
     actuators: list[Actuator] = field(default_factory=list)
@@ -802,6 +855,38 @@ class CommonSchema:
                 tree[parent] = []
             tree[parent].append(child)
         return tree
+
+    def parse_issues(self) -> list[str]:
+        """Parse-time coercions the parser recorded and then carried on from.
+
+        The parser files these into ``extensions["parse_context"]["errors"]`` and
+        carries on without the value. For example, a non-finite ``<mimic>`` coefficient
+        drops the coupling entirely, so the joint exports as free. Nothing read that
+        bucket, so the loss was invisible.
+
+        Deliberately **not** folded into :meth:`validate`. That method is a hard gate —
+        ``mujoco_scene_utils``, ``environments_exports``, ``universal_schema_patch`` and
+        four robot-format exporters all turn a non-empty result into a raise — and these
+        are advisory: the schema they describe is structurally sound and exportable,
+        just lossier than the file it came from. Worse, ``to_dict`` serializes
+        ``extensions``, so a parse issue persists into a stored ``universal_schema`` and
+        survives ``from_dict``; routing it through ``validate`` would make one bad
+        ``<mass>`` permanently un-exportable and un-patchable for that asset.
+
+        Report these from ingest/rebuild paths (which log rather than raise) and from
+        drift reports. Keep them out of anything that gates.
+
+        Public API for the backend; nothing in this package calls it. The first caller
+        is the backend's schema rebuild (``app/services/schema_rebuild.py``, CYB-3121),
+        which logs the list once the backend pins a robot-format with this method.
+        """
+        parse_context = self.extensions.get("parse_context")
+        if not isinstance(parse_context, dict):
+            return []
+        return [
+            f"Parse error carried into the schema: {error}"
+            for error in parse_context.get("errors") or []
+        ]
 
     def validate(self) -> list[str]:
         """Validate schema consistency and return list of issues.
@@ -982,6 +1067,13 @@ class CommonSchema:
         # A material may be shared by several visuals in the copied schema.
         # Prefix it once so distinct assets cannot steal each other's textures.
         prefixed_materials: set[int] = set()
+        # The document copy of a named material is the source of truth (as in the
+        # URDF and MJCF exporters). A composed scene carries no document materials,
+        # so resolve each named material onto its visuals before they are discarded;
+        # otherwise a scene would render a stale per-visual copy.
+        document_materials = {
+            material.name: material for material in other_copy.materials if material.name
+        }
         # Rewrite all links (including nested collision/visual names)
         for link in other_copy.links:
             link.name = prefixed(link.name)
@@ -994,6 +1086,8 @@ class CommonSchema:
                 if visual.name:
                     visual.name = prefixed(visual.name)
                 material = visual.material
+                if material is not None and material.name in document_materials:
+                    material = visual.material = document_materials[material.name]
                 if material is not None and id(material) not in prefixed_materials:
                     prefixed_materials.add(id(material))
                     if material.name:

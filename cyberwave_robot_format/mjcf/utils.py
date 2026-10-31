@@ -41,8 +41,11 @@ def sanitize_inertia(link: Link) -> tuple[float, float, float, float, float, flo
         val = max(1e-6, link.mass * 1e-4)
         return val, val, val, 0.0, 0.0, 0.0
 
-    ixx, iyy, izz = link.inertia.ixx, link.inertia.iyy, link.inertia.izz
-    ixy, ixz, iyz = link.inertia.ixy, link.inertia.ixz, link.inertia.iyz
+    # MJCF's fullinertia is in the body frame and cannot be paired with quat, so a
+    # rotated inertial frame (URDF <inertial><origin rpy>) is folded into the tensor.
+    inertia = link.inertia_in_link_frame()
+    ixx, iyy, izz = inertia.ixx, inertia.iyy, inertia.izz
+    ixy, ixz, iyz = inertia.ixy, inertia.ixz, inertia.iyz
     mass = link.mass
 
     min_inertia = max(1e-6, mass * 1e-4)

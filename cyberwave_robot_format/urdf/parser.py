@@ -43,13 +43,27 @@ from cyberwave_robot_format.schema import (
     Metadata,
     MimicJoint,
     Pose,
+    Quaternion,
     Sensor,
     Vector3,
     Visual,
 )
+from cyberwave_robot_format.urdf.conventions import (
+    AXIS_JOINT_TYPES,
+    URDF_DEFAULT_AXIS,
+)
+from cyberwave_robot_format.urdf.passthrough import (
+    EXTENSION_KEY as PASSTHROUGH_EXTENSION_KEY,
+)
+from cyberwave_robot_format.urdf.passthrough import capture_urdf_passthrough
+from cyberwave_robot_format.usd.semantics import CAMERA_KINDS, sensor_kind
 from cyberwave_robot_format.utils import sanitize_name
 
 logger = logging.getLogger(__name__)
+
+# ``<axis>`` present but carrying no ``xyz``: URDF defaults it exactly as it defaults a
+# missing ``<axis>`` element.
+_URDF_DEFAULT_AXIS_ATTR = " ".join(str(component) for component in URDF_DEFAULT_AXIS)
 
 # Sensor types whose parameters live in a Gazebo ``<ray>`` block. "ray" is
 # Gazebo's own spelling and is resolved to lidar_2d/lidar_3d from the scan block;
@@ -57,6 +71,63 @@ logger = logging.getLogger(__name__)
 _RAY_SENSOR_TYPES = frozenset(
     {"ray", "gpu_ray", "lidar", "lidar_2d", "lidar_3d", "rangefinder"}
 )
+
+# Sensor types whose frame looks along +X, as a Gazebo camera's does: every Gazebo/SDF
+# camera type, whether or not Cyberwave renders it as a camera today. Their ``<pose>``
+# rotation is in the Gazebo camera convention, not the schema's (-Z forward), so only
+# the mount position is kept. Keyed off Gazebo's types rather than ``CAMERA_KINDS``
+# on purpose: a type with no camera kind yet (``thermal_camera``, ``multicamera``,
+# ...) would otherwise store a wrong-convention rotation that a future renderer reads.
+# Types that map to a camera kind are covered too, see ``_is_gazebo_camera_type``.
+_GAZEBO_CAMERA_SENSOR_TYPES = frozenset(
+    {
+        "camera",
+        "depth",
+        "depth_camera",
+        "rgbd",
+        "rgbd_camera",
+        "multicamera",
+        "wideanglecamera",
+        "wide_angle_camera",
+        "thermal_camera",
+        "thermal",
+        # gz-sim's segmentation, bounding-box and logical cameras. None has a camera
+        # kind, but each frame looks along +X like any Gazebo camera. ``gpu_lidar``
+        # is not listed: cyberwave-sim casts its beams along +X too, so it keeps
+        # its rotation.
+        "segmentation_camera",
+        "boundingbox_camera",
+        "logical_camera",
+    }
+)
+
+
+def _is_gazebo_camera_type(sensor_type: str) -> bool:
+    """Whether a Gazebo ``<sensor type>`` names a frame that looks along +X."""
+    return (
+        sensor_type.strip().lower() in _GAZEBO_CAMERA_SENSOR_TYPES
+        or sensor_kind(sensor_type) in CAMERA_KINDS
+    )
+
+
+# ``<safety_controller>`` and ``<calibration>`` attributes, per the URDF spec. Both
+# are stored as plain ``dict[str, float]`` on ``Joint``, so only the spec'd keys are
+# read — an unknown attribute would travel into a typed field with no consumer.
+_SAFETY_CONTROLLER_ATTRIBUTES = (
+    "soft_lower_limit",
+    "soft_upper_limit",
+    "k_position",
+    "k_velocity",
+)
+_CALIBRATION_ATTRIBUTES = ("rising", "falling")
+
+
+def _finite_float(raw: str) -> float:
+    """``float(raw)``, raising ``ValueError`` for NaN/Infinity as for non-numeric text."""
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"expected a finite number, got {raw!r}")
+    return value
 
 
 class URDFParser(BaseParser):
@@ -173,10 +244,12 @@ class URDFParser(BaseParser):
             version=root.get("version", "1.0"),
         )
 
+        document_materials: list[Material] = []
         for material_elem in root.findall("material"):
             material = self._parse_material(material_elem, context)
             if material and material.name:
                 context.materials[material.name] = material
+                document_materials.append(material)
 
         links = []
         for link_elem in root.findall("link"):
@@ -222,6 +295,7 @@ class URDFParser(BaseParser):
         schema = CommonSchema(
             metadata=metadata,
             collision_config=collision_config,
+            materials=document_materials,
             links=links,
             joints=joints,
             sensors=sensors,
@@ -232,6 +306,14 @@ class URDFParser(BaseParser):
             "errors": context.errors,
             "materials": context.materials,
         }
+
+        # Everything the schema cannot type — <ros2_control>, <transmission>,
+        # <gazebo> plugins, unknown/namespaced elements — kept verbatim so the
+        # exporter can re-emit it. Without this a schema -> URDF export deletes a
+        # robot's whole control configuration. See :mod:`.passthrough`.
+        passthrough = capture_urdf_passthrough(root)
+        if passthrough:
+            schema.extensions[PASSTHROUGH_EXTENSION_KEY] = passthrough
 
         return schema
 
@@ -288,6 +370,109 @@ class URDFParser(BaseParser):
 
         return link
 
+    def _parse_sensor_pose(
+        self, sensor_elem: ET.Element, sensor_name: str, context: ParseContext
+    ) -> Pose:
+        """Mount pose of a Gazebo sensor, relative to its reference link.
+
+        This was never read, so ``Sensor.pose`` stayed at the identity default for every
+        URDF-sourced sensor — while the MJCF exporter *writes* that field into the
+        ``<site>`` a sensor is sampled at, and ``cyberwave-sim/sensors/range.py`` depends
+        on it ("a MiR250 carries two scanners on opposite corners, each yawed 45°"). Both
+        scanners therefore ended up at the chassis centre pointing the same way, while
+        Gazebo still saw the right pose via the ``<gazebo>`` passthrough.
+
+        SDF spells it ``<pose>x y z roll pitch yaw</pose>``, with ``degrees="true"``
+        switching the angles to degrees and ``rotation_format="quat_xyzw"`` taking
+        ``x y z qx qy qz qw`` instead; both are honoured. A URDF-style
+        ``<origin xyz= rpy=>`` is accepted too, because hand-written descriptions mix
+        the two. A pose that cannot be read falls back to the identity with a warning
+        rather than silently.
+        """
+        pose_elem = sensor_elem.find("pose")
+        if pose_elem is not None and (pose_elem.text or "").strip():
+            pose = self._parse_sdf_pose(pose_elem)
+            if pose is not None:
+                return pose
+            context.add_warning(
+                f"Unreadable sensor <pose>{(pose_elem.text or '').strip()}</pose> "
+                f"(attributes {dict(pose_elem.attrib)}); using the identity",
+                sensor_name,
+            )
+            return Pose()
+
+        origin_elem = sensor_elem.find("origin")
+        if origin_elem is not None:
+            xyz = self._parse_xyz(origin_elem.get("xyz", "0 0 0"))
+            rpy = self._parse_rpy(origin_elem.get("rpy", "0 0 0"))
+            if xyz and rpy:
+                return Pose.from_xyzrpy(xyz, rpy)
+            context.add_warning(
+                f"Unreadable sensor <origin> {dict(origin_elem.attrib)}; using the identity",
+                sensor_name,
+            )
+
+        return Pose()
+
+    @staticmethod
+    def _parse_sdf_pose(pose_elem: ET.Element) -> Pose | None:
+        """An SDF ``<pose>`` as a :class:`Pose`, or ``None`` if it cannot be read.
+
+        Honours ``rotation_format`` (``euler_rpy``, the default, or ``quat_xyzw``) and
+        ``degrees`` (Euler angles only, as in SDF). Wrong value counts, non-numeric or
+        non-finite values and a zero quaternion are all unreadable.
+        """
+        rotation_format = pose_elem.get("rotation_format", "euler_rpy").strip().lower()
+        try:
+            values = [_finite_float(part) for part in (pose_elem.text or "").split()]
+        except ValueError:
+            return None
+
+        if rotation_format == "euler_rpy" and len(values) == 6:
+            rpy = values[3:6]
+            if pose_elem.get("degrees", "false").strip().lower() in ("true", "1"):
+                rpy = [math.radians(angle) for angle in rpy]
+            return Pose.from_xyzrpy(values[0:3], rpy)
+
+        if rotation_format == "quat_xyzw" and len(values) == 7:
+            qx, qy, qz, qw = values[3:7]
+            norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+            if norm < 1e-12:
+                return None
+            return Pose(
+                position=Vector3.from_list(values[0:3]),
+                orientation=Quaternion(
+                    x=qx / norm, y=qy / norm, z=qz / norm, w=qw / norm
+                ),
+            )
+
+        return None
+
+    def _camera_mount_pose(
+        self, pose: Pose, sensor_name: str, context: ParseContext
+    ) -> Pose:
+        """Keep a Gazebo camera's mount position but not its rotation.
+
+        A Gazebo camera looks along +X of its pose frame, while ``CommonSchema``
+        camera poses use the MuJoCo/USD convention (look along -Z, +Y up). Copying
+        the Gazebo rotation verbatim aims the exported camera somewhere unrelated: one
+        pitched straight down in Gazebo came out looking backwards. The rotation is
+        dropped, as it was before sensor poses were read, and reported.
+        """
+        q = pose.orientation
+        if not (
+            abs(abs(q.w) - 1.0) < 1e-9
+            and abs(q.x) < 1e-9
+            and abs(q.y) < 1e-9
+            and abs(q.z) < 1e-9
+        ):
+            context.add_warning(
+                "Gazebo camera <pose> rotation not applied: Gazebo cameras look "
+                "along +X, schema cameras along -Z",
+                sensor_name,
+            )
+        return Pose(position=pose.position)
+
     def _parse_gazebo_sensor(
         self,
         sensor_elem: ET.Element,
@@ -304,10 +489,15 @@ class URDFParser(BaseParser):
 
         parent_link = sanitize_name(reference) if reference else "world"
 
+        pose = self._parse_sensor_pose(sensor_elem, name, context)
+        if _is_gazebo_camera_type(sensor_type):
+            pose = self._camera_mount_pose(pose, name, context)
+
         sensor = Sensor(
             name=sanitize_name(name),
             type=sensor_type,
             parent_link=parent_link,
+            pose=pose,
         )
 
         update_rate = sensor_elem.find("update_rate")
@@ -419,6 +609,9 @@ class URDFParser(BaseParser):
             name=sanitize_name(name),
             type="camera",
             parent_link=parent_link,
+            pose=self._camera_mount_pose(
+                self._parse_sensor_pose(cam_elem, name, context), name, context
+            ),
         )
 
         self._extract_camera_properties(cam_elem, sensor)
@@ -555,6 +748,9 @@ class URDFParser(BaseParser):
             xyz = self._parse_xyz(origin.get("xyz", "0 0 0"))
             if xyz:
                 link.center_of_mass = Vector3(xyz[0], xyz[1], xyz[2])
+            rpy = self._parse_rpy(origin.get("rpy", "0 0 0"))
+            if rpy:
+                link.inertial_orientation = Quaternion.from_rpy(rpy[0], rpy[1], rpy[2])
 
         inertia_elem = elem.find("inertia")
         if inertia_elem is not None:
@@ -575,6 +771,38 @@ class URDFParser(BaseParser):
 
             except ValueError as e:
                 context.add_error(f"Invalid inertia values: {e}", link.name)
+
+    def _parse_float_attributes(
+        self,
+        elem: ET.Element | None,
+        attributes: tuple[str, ...],
+        context: ParseContext,
+        joint_name: str,
+    ) -> dict[str, float] | None:
+        """Read ``attributes`` off ``elem`` as finite floats, or ``None`` when absent.
+
+        Returns ``None`` rather than ``{}`` for a missing element so the schema
+        distinguishes "not authored" from "authored empty" — the backend's
+        rebuild-merge treats a falsy section as a gap to fill.
+
+        Non-finite values are dropped with the same warning as non-numeric ones: a
+        NaN soft limit disables the safety controller it was meant to configure.
+        """
+        if elem is None:
+            return None
+        parsed: dict[str, float] = {}
+        for attribute in attributes:
+            raw = elem.get(attribute)
+            if raw is None:
+                continue
+            try:
+                parsed[attribute] = _finite_float(raw)
+            except ValueError:
+                context.add_warning(
+                    f"Ignoring non-numeric or non-finite <{elem.tag} {attribute}={raw!r}>",
+                    joint_name,
+                )
+        return parsed or None
 
     def _validate_inertia(self, inertia: Inertia) -> bool:
         """Enhanced validation of inertia tensor for physical plausibility."""
@@ -678,9 +906,17 @@ class URDFParser(BaseParser):
             if xyz and rpy:
                 joint.pose = Pose.from_xyzrpy(xyz, rpy)
 
+        # A joint that moves always gets an explicit axis, because the exporter always
+        # writes one (see ``AXIS_JOINT_TYPES``). Leaving the ``Joint`` dataclass default
+        # of ``(0, 0, 1)`` in place for a document that omitted ``<axis>`` silently
+        # rotated the joint off spec, and the next schema->URDF render then wrote that
+        # wrong axis out explicitly, making it permanent.
         axis = elem.find("axis")
-        if axis is not None:
-            axis_xyz = self._parse_xyz(axis.get("xyz", "0 0 1"))
+        if axis is None:
+            if joint_type_enum.value in AXIS_JOINT_TYPES:
+                joint.axis = Vector3(*URDF_DEFAULT_AXIS)
+        else:
+            axis_xyz = self._parse_xyz(axis.get("xyz", _URDF_DEFAULT_AXIS_ATTR))
             if axis_xyz:
                 axis_vec = Vector3(axis_xyz[0], axis_xyz[1], axis_xyz[2])
                 magnitude = math.sqrt(axis_vec.x**2 + axis_vec.y**2 + axis_vec.z**2)
@@ -692,7 +928,12 @@ class URDFParser(BaseParser):
                     )
                 else:
                     context.add_warning("Zero-magnitude joint axis", name)
-                    joint.axis = Vector3(0.0, 0.0, 1.0)
+                    joint.axis = Vector3(*URDF_DEFAULT_AXIS)
+            elif joint_type_enum.value in AXIS_JOINT_TYPES:
+                # ``<axis>`` present but unparseable (non-numeric, wrong arity): same
+                # spec default as a missing ``<axis>``, not the dataclass ``(0, 0, 1)``.
+                context.add_warning("Malformed joint axis", name)
+                joint.axis = Vector3(*URDF_DEFAULT_AXIS)
 
         limit = elem.find("limit")
         if limit is not None:
@@ -724,10 +965,25 @@ class URDFParser(BaseParser):
             except ValueError as e:
                 context.add_error(f"Invalid dynamics values: {e}", name)
 
+        # ``safety_controller`` and ``calibration`` have had fields on ``Joint``
+        # all along but were never read here, so the only thing keeping a
+        # hand-authored value alive was the backend's rebuild-merge carry list.
+        joint.safety_controller = self._parse_float_attributes(
+            elem.find("safety_controller"), _SAFETY_CONTROLLER_ATTRIBUTES, context, name
+        )
+        joint.calibration = self._parse_float_attributes(
+            elem.find("calibration"), _CALIBRATION_ATTRIBUTES, context, name
+        )
+
         mimic = elem.find("mimic")
         if mimic is not None:
-            driver = mimic.get("joint")
-            if driver == name:
+            raw_driver = mimic.get("joint")
+            # Sanitized exactly as joint *names* are above. Without this, a URDF whose
+            # joints are named "1".."6" parses to joints "_1".."_6" while the mimic
+            # still points at "5" — a reference that matches nothing, so every consumer
+            # drops the coupling.
+            driver = sanitize_name(raw_driver) if raw_driver else None
+            if driver and driver == joint.name:
                 # A joint that mimics itself yields a degenerate coupling
                 # (slave == its own driver). Drop it rather than propagate a
                 # self-referential MimicJoint into the schema/MJCF equality.
@@ -737,13 +993,16 @@ class URDFParser(BaseParser):
                 )
             elif driver:
                 try:
-                    joint.mimic = MimicJoint(
-                        joint=driver,
-                        multiplier=float(mimic.get("multiplier", "1")),
-                        offset=float(mimic.get("offset", "0")),
-                    )
+                    # ``float`` accepts "nan"/"inf", and a non-finite coefficient makes
+                    # every derived position NaN; drop the coupling instead.
+                    multiplier = _finite_float(mimic.get("multiplier", "1"))
+                    offset = _finite_float(mimic.get("offset", "0"))
                 except ValueError as e:
                     context.add_error(f"Invalid mimic values: {e}", name)
+                else:
+                    joint.mimic = MimicJoint(
+                        joint=driver, multiplier=multiplier, offset=offset
+                    )
 
         return joint
 

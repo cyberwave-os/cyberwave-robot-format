@@ -484,6 +484,62 @@ class TestURDFExporterJointTypes:
             Path(output_path).unlink(missing_ok=True)
 
 
+def test_a_sizeless_box_still_emits_a_shape_child():
+    """``<geometry/>`` must never be empty — URDF requires exactly one shape child.
+
+    Most parsers reject the whole document when it is missing, so a single sizeless
+    box took the entire robot down rather than one link. Every other branch of
+    ``_add_geometry`` already falls back to a visibly-wrong placeholder for exactly
+    this reason; BOX was guarded by a bare ``if geometry.size:`` with no ``else``.
+    """
+    schema = CommonSchema(
+        metadata=Metadata(name="sizeless"),
+        links=[
+            Link(
+                name="base",
+                mass=1.0,
+                visuals=[Visual(geometry=Geometry(type=GeometryType.BOX, size=None))],
+            )
+        ],
+        joints=[],
+    )
+
+    root = ET.fromstring(URDFExporter().export_string(schema))
+
+    geometry = root.find("./link/visual/geometry")
+    assert geometry is not None
+    children = list(geometry)
+    assert len(children) == 1, "geometry must carry exactly one shape child"
+    assert children[0].tag == "box"
+    assert children[0].get("size") == "1 1 1"
+
+
+def test_a_box_with_a_size_is_unaffected():
+    schema = CommonSchema(
+        metadata=Metadata(name="sized"),
+        links=[
+            Link(
+                name="base",
+                mass=1.0,
+                visuals=[
+                    Visual(
+                        geometry=Geometry(
+                            type=GeometryType.BOX, size=Vector3(x=0.2, y=0.3, z=0.4)
+                        )
+                    )
+                ],
+            )
+        ],
+        joints=[],
+    )
+
+    root = ET.fromstring(URDFExporter().export_string(schema))
+
+    box = root.find("./link/visual/geometry/box")
+    assert box is not None
+    assert box.get("size") == "0.2 0.3 0.4"
+
+
 @pytest.mark.parametrize("pitch", [math.pi / 2, -math.pi / 2, math.pi / 2 - 1e-7, -math.pi / 2 + 1e-7])
 @pytest.mark.parametrize("roll,yaw", [(0.0, 0.0), (0.7, -1.2), (-math.pi / 2, math.pi), (math.pi, math.pi / 2)])
 @pytest.mark.parametrize("scale", [1.0, -1.0, 7.0])

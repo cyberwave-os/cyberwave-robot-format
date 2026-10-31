@@ -29,6 +29,21 @@ cyberwave_robot_format/
 └── utils.py            # General utilities
 ```
 
+## Schema changes in 0.1.14
+
+Backwards compatible to *read*, but any hash computed over
+`export_universal_schema_json` output will differ from 0.1.13.
+
+- **`Link.inertial_orientation`**: the `rpy` of URDF's `<inertial><origin>`, which
+  used to be dropped on parse and written back as `rpy="0 0 0"`.
+- **`CommonSchema.materials`**: document-level named materials, so a URDF export
+  defines the materials its visuals reference by name.
+- **URDF passthrough**: `<ros2_control>`, `<transmission>`, `<gazebo>` and other
+  elements the schema cannot type are kept verbatim in
+  `extensions["urdf_passthrough"]` and re-emitted by `URDFExporter`.
+- **`CommonSchema.parse_issues()`** lists the coercions the parser recorded. It is
+  advisory and does not affect `validate()`.
+
 ## Schema changes in 0.1.6
 
 Two fixes to `CommonSchema` itself. Both are backwards compatible to *read* — an

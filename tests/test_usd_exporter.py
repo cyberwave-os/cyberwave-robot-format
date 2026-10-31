@@ -403,6 +403,59 @@ class TestMass:
         assert principal.HasAuthoredValue()
         assert Gf.Quatf(principal.Get()) != Gf.Quatf(1.0, 0.0, 0.0, 0.0)
 
+    def test_rotated_inertial_frame_reaches_the_native_mass_api(self):
+        # URDF <inertial><origin rpy="0 0 0.785"/> with diag(1, 4, 9): PhysX reads
+        # physics:principalAxes relative to the body frame, so the native tensor
+        # must be the link-frame R·I·Rᵀ, not the unrotated inertial-frame one.
+        from cyberwave_robot_format.usd import common as c
+        from cyberwave_robot_format.usd import frames as f
+
+        orientation = Quaternion.from_rpy(0.0, 0.0, 0.785)
+        schema = CommonSchema(
+            metadata=Metadata(name="r"),
+            links=[
+                Link(
+                    name="a",
+                    mass=2.0,
+                    inertial_orientation=orientation,
+                    inertia=Inertia(ixx=1.0, iyy=4.0, izz=9.0),
+                )
+            ],
+        )
+        stage = open_exported(schema)
+        link = stage.GetPrimAtPath(
+            stage.GetDefaultPrim().GetPath().AppendPath("Links/a")
+        )
+        mass_api = UsdPhysics.MassAPI(link)
+        native = f.inertia_from_principal(
+            tuple(mass_api.GetDiagonalInertiaAttr().Get()),
+            c.gf_to_quaternion(mass_api.GetPrincipalAxesAttr().Get()),
+        )
+        yaw = np.array(
+            [
+                [math.cos(0.785), -math.sin(0.785), 0.0],
+                [math.sin(0.785), math.cos(0.785), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        np.testing.assert_allclose(
+            native.to_matrix(), yaw @ np.diag([1.0, 4.0, 9.0]) @ yaw.T, atol=1e-5
+        )
+        # The sidecars keep the schema's own (inertial-frame) values.
+        assert list(link.GetAttribute(t.A_LINK_INERTIA).Get()) == [
+            1.0, 4.0, 9.0, 0.0, 0.0, 0.0
+        ]
+        assert tuple(link.GetAttribute(t.A_LINK_INERTIAL_ORIENTATION).Get()) == (
+            pytest.approx(orientation.to_list())
+        )
+
+    def test_identity_inertial_orientation_authors_no_sidecar(self):
+        schema = CommonSchema(
+            metadata=Metadata(name="r"),
+            links=[Link(name="a", mass=1.0, inertia=Inertia(ixx=1.0, iyy=2.0, izz=3.0))],
+        )
+        assert t.A_LINK_INERTIAL_ORIENTATION not in export(schema)
+
 
 class TestJoints:
     @pytest.mark.parametrize(

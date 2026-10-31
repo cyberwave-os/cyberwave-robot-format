@@ -264,6 +264,41 @@ def test_mjcf_exporter_basic(simple_mjcf_path, tmp_path):
     assert root.get("model") == "simple_robot"
 
 
+@pytest.mark.parametrize("forcelimited", [None, "auto", "false"])
+def test_a_zero_forcerange_motor_stays_drivable_through_a_round_trip(
+    forcelimited, tmp_path
+):
+    """MuJoCo reads ``forcerange="0 0"`` (unless ``forcelimited="true"``) as "no force
+    limit". Importing it as a zero torque ceiling made the exporter pin the motor
+    with ``gear="0"``, so an MJCF -> schema -> MJCF round trip killed it."""
+    mujoco = pytest.importorskip("mujoco")
+
+    limited = f' forcelimited="{forcelimited}"' if forcelimited else ""
+    source = tmp_path / "zero_forcerange.xml"
+    source.write_text(
+        '<mujoco><compiler autolimits="true"/><worldbody><body name="arm">'
+        '<joint name="hinge" type="hinge" axis="0 0 1"/>'
+        '<geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.02" mass="1"/>'
+        "</body></worldbody>"
+        f'<actuator><motor name="drive" joint="hinge" forcerange="0 0"{limited}/></actuator>'
+        "</mujoco>"
+    )
+    schema = MJCFParser().parse(source)
+    actuator = next(a for a in schema.actuators if a.name == "drive")
+    assert actuator.force_range is None
+    assert actuator.max_torque is None
+
+    destination = tmp_path / "export.xml"
+    MJCFExporter().export(schema, destination)
+    model = mujoco.MjModel.from_xml_path(str(destination))
+    data = mujoco.MjData(model)
+    data.ctrl[model.actuator("drive").id] = 1.0
+    for _ in range(200):
+        mujoco.mj_step(model, data)
+
+    assert abs(float(data.qpos[model.joint("hinge").qposadr[0]])) > 1e-3
+
+
 def test_non_finite_attributes_never_enter_the_schema(tmp_path):
     """MJCF ingest is a user-upload path (``import/mujoco-scene``), and a bare
     ``float()`` accepts ``nan``/``inf``/``Infinity``. Each non-finite attribute is

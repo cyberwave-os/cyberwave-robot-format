@@ -24,6 +24,7 @@ from cyberwave_robot_format.schema import (
     Vector3,
     Visual,
 )
+from cyberwave_robot_format.urdf import URDFParser
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -133,6 +134,41 @@ def test_inertia_repair_is_frame_independent(moments) -> None:
     if sum(moments[:2]) < moments[2]:
         expected[:2] += (moments[2] * 1.01 - sum(moments[:2])) / 2
     np.testing.assert_allclose(repaired, rotation @ np.diag(expected) @ rotation.T, atol=1e-12)
+
+
+def test_rotated_urdf_inertial_frame_reaches_the_mjcf_tensor(tmp_path) -> None:
+    """URDF ``<inertial><origin rpy>`` rotates the tensor; MJCF must see it in the body frame."""
+    urdf = tmp_path / "robot.urdf"
+    urdf.write_text(
+        '<robot name="r"><link name="base"><inertial><origin xyz="0 0 0" rpy="0 0 0.785"/>'
+        '<mass value="2"/><inertia ixx="1" iyy="2" izz="2.5" ixy="0" ixz="0" iyz="0"/>'
+        "</inertial></link></robot>"
+    )
+    schema = URDFParser().parse(urdf)
+    archive = export_mujoco_zip_cloud(schema, mesh_resolver=lambda _: None)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        xml = zf.read("mujoco_scene.xml").decode()
+
+    inertial = ET.fromstring(xml).find(".//body[@name='base']/inertial")
+    ixx, iyy, izz, ixy, ixz, iyz = (float(v) for v in inertial.get("fullinertia").split())
+    yaw = np.array([[np.cos(0.785), -np.sin(0.785), 0], [np.sin(0.785), np.cos(0.785), 0], [0, 0, 1]])
+    np.testing.assert_allclose(
+        [[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]],
+        yaw @ np.diag([1.0, 2.0, 2.5]) @ yaw.T,
+        atol=1e-9,
+    )
+
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(xml)
+    body = model.body("base").id
+    rotation = np.zeros(9)
+    mujoco.mju_quat2Mat(rotation, model.body_iquat[body])
+    rotation = rotation.reshape(3, 3)
+    np.testing.assert_allclose(
+        rotation @ np.diag(model.body_inertia[body]) @ rotation.T,
+        yaw @ np.diag([1.0, 2.0, 2.5]) @ yaw.T,
+        atol=1e-6,
+    )
 
 
 def _mesh_schema() -> CommonSchema:
@@ -419,3 +455,300 @@ def test_velocity_actuator_ctrlrange_omitted_without_max_velocity(caplog) -> Non
     ]
     assert warnings, "expected a warning naming the unbounded velocity actuator"
     assert "max_velocity" in warnings[0]
+
+
+# --------------------------------------------------------------------------- #
+# The fallback <motor> (no declared actuators) bounds torque, not angle
+# --------------------------------------------------------------------------- #
+
+
+def _fallback_motor_xml(joint_kwargs: dict) -> str:
+    """Export a one-joint schema that declares NO actuators, so the fallback runs."""
+    import tempfile
+    from pathlib import Path
+
+    from cyberwave_robot_format.mjcf import MJCFExporter
+
+    limits = (
+        JointLimits(**joint_kwargs.pop("limits")) if "limits" in joint_kwargs else None
+    )
+    joint = Joint(
+        name="j1",
+        parent_link="base",
+        child_link="l1",
+        limits=limits,
+        **joint_kwargs,
+    )
+    schema = CommonSchema(
+        metadata=Metadata(name="r"),
+        links=[Link(name="base", mass=1.0), Link(name="l1", mass=1.0)],
+        joints=[joint],
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "scene.xml"
+        MJCFExporter().export(schema, path)
+        return path.read_text()
+
+
+def _motor_attr(xml: str, attr: str) -> str | None:
+    """Read an attribute off the actuator-section <motor>.
+
+    Parsed rather than regexed: the document also carries a <motor> inside
+    <default>, and a regex for the first match reads that one instead — which makes
+    an "attribute is absent" assertion pass for the wrong element.
+    """
+    root = ET.fromstring(xml)
+    motors = root.findall("./actuator/motor")
+    assert len(motors) == 1, f"expected one actuator motor, got {len(motors)}"
+    return motors[0].get(attr)
+
+
+def test_a_fallback_motor_never_carries_a_positional_ctrlrange():
+    """``ctrl`` on a <motor> is a torque. Copying the joint's angular range in means
+    a joint limited to [-2.72, -0.84] could only ever be driven one way."""
+    xml = _fallback_motor_xml(
+        {
+            "type": JointType.REVOLUTE,
+            "limits": {"lower": -2.7227, "upper": -0.83776, "effort": 45.0},
+        }
+    )
+    assert _motor_attr(xml, "ctrlrange") is None
+
+
+def test_a_continuous_joint_gets_no_ctrlrange_from_stray_bounds():
+    """The joint element says ``limited="false"``; a finite ctrl clamp would
+    contradict it."""
+    xml = _fallback_motor_xml(
+        {
+            "type": JointType.CONTINUOUS,
+            "limits": {"lower": -3.14, "upper": 3.14, "effort": 10.0},
+        }
+    )
+    assert _motor_attr(xml, "ctrlrange") is None
+
+
+def test_a_zero_effort_on_a_fallback_motor_means_unspecified():
+    """With no declared actuators, URDF ``effort="0"`` is a placeholder, not "inert".
+
+    CAD exporters (SolidWorks among them) write ``effort="0"`` on every joint. Reading
+    it as "must not be driven" froze such robots completely, so on the fallback path a
+    zero effort is treated like a missing one: no ``forcerange`` and no ``gear`` pin.
+    A declared actuator keeps the strict meaning; see
+    ``test_a_declared_zero_torque_actuator_stays_strict_on_a_zero_effort_joint``.
+    """
+    xml = _fallback_motor_xml(
+        {
+            "type": JointType.REVOLUTE,
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 0.0},
+        }
+    )
+
+    assert _motor_attr(xml, "gear") is None
+    assert _motor_attr(xml, "forcerange") is None
+
+
+def test_a_zero_effort_fallback_motor_still_drives_the_joint():
+    """The same property asserted against MuJoCo: the joint moves when commanded."""
+    mujoco = pytest.importorskip("mujoco")
+
+    xml = _fallback_motor_xml(
+        {
+            "type": JointType.REVOLUTE,
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 0.0},
+        }
+    )
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    data.ctrl[0] = 1.0
+    for _ in range(200):
+        mujoco.mj_step(model, data)
+
+    assert abs(float(data.qpos[0])) > 1e-3
+
+
+def test_a_real_effort_bounds_the_torque_and_is_limited():
+    """The counterpart: a non-zero effort must compile to an actually-limited motor."""
+    mujoco = pytest.importorskip("mujoco")
+
+    xml = _fallback_motor_xml(
+        {
+            "type": JointType.REVOLUTE,
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 5.0},
+        }
+    )
+    model = mujoco.MjModel.from_xml_string(xml)
+
+    assert bool(model.actuator_forcelimited[0])
+    assert model.actuator_forcerange[0].tolist() == [-5.0, 5.0]
+
+
+def test_a_real_effort_still_bounds_the_torque():
+    xml = _fallback_motor_xml(
+        {
+            "type": JointType.REVOLUTE,
+            "limits": {"lower": -1.0, "upper": 1.0, "effort": 45.0},
+        }
+    )
+    assert _motor_attr(xml, "forcerange") == "-45.0 45.0"
+
+
+def _declared_actuator_xml(**actuator_kwargs) -> str:
+    """Export a one-joint schema that DOES declare an actuator.
+
+    The `_fallback_motor_xml` helper above only reaches the no-declared-actuators
+    branch, which is why `_add_actuator` carried the same zero-forcerange inversion
+    for as long as it did with two compiler-level tests sitting right beside it.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from cyberwave_robot_format.schema import Actuator, ActuatorType
+    from cyberwave_robot_format.mjcf import MJCFExporter
+
+    schema = CommonSchema(
+        metadata=Metadata(name="r"),
+        links=[Link(name="base", mass=1.0), Link(name="l1", mass=1.0)],
+        joints=[
+            Joint(
+                name="j1",
+                type=JointType.REVOLUTE,
+                parent_link="base",
+                child_link="l1",
+                limits=JointLimits(lower=-1.0, upper=1.0, effort=5.0),
+            )
+        ],
+        actuators=[
+            Actuator(name="a1", joint="j1", type=ActuatorType.TORQUE, **actuator_kwargs)
+        ],
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        out = Path(directory) / "r.xml"
+        MJCFExporter().export(schema, out)
+        return out.read_text()
+
+
+def _actuator_attr(xml: str, attr: str) -> str | None:
+    root = ET.fromstring(xml)
+    motors = root.findall("./actuator/motor")
+    assert len(motors) == 1, f"expected one actuator motor, got {len(motors)}"
+    return motors[0].get(attr)
+
+
+def test_a_declared_actuator_with_zero_max_torque_is_inert_not_unlimited():
+    """`max_torque: 0.0` emitted `forcerange="-0.0 0.0"` — i.e. *unlimited* torque.
+
+    A zero torque ceiling authored on a declared actuator means "do not drive", and
+    the old encoding turned it into the strongest actuator in the scene.
+    """
+    xml = _declared_actuator_xml(max_torque=0.0)
+
+    assert _actuator_attr(xml, "gear") == "0"
+    assert _actuator_attr(xml, "forcerange") is None
+
+
+def test_a_declared_actuator_with_a_zero_force_range_is_inert_too():
+    """`force_range: (0, 0)` is the same statement, and was the same inversion."""
+    xml = _declared_actuator_xml(force_range=(0.0, 0.0))
+
+    assert _actuator_attr(xml, "gear") == "0"
+    assert _actuator_attr(xml, "forcerange") is None
+
+
+def test_a_zero_torque_ceiling_survives_a_gear_ratio():
+    """`gear_ratio` is written further down and would overwrite the `gear="0"` pin,
+    silently making the joint drivable again two statements after it was made inert."""
+    xml = _declared_actuator_xml(max_torque=0.0, gear_ratio=50.0)
+
+    assert _actuator_attr(xml, "gear") == "0"
+
+
+def test_a_real_max_torque_still_becomes_a_symmetric_forcerange():
+    """The ordinary case must be untouched."""
+    xml = _declared_actuator_xml(max_torque=7.5)
+
+    assert _actuator_attr(xml, "forcerange") == "-7.5 7.5"
+    assert _actuator_attr(xml, "gear") is None
+
+
+def test_a_declared_zero_torque_actuator_does_not_move_when_commanded():
+    """The property behind the encoding, asserted against MuJoCo itself."""
+    mujoco = pytest.importorskip("mujoco")
+
+    model = mujoco.MjModel.from_xml_string(_declared_actuator_xml(max_torque=0.0))
+    data = mujoco.MjData(model)
+    data.ctrl[0] = 1000.0
+    for _ in range(200):
+        mujoco.mj_step(model, data)
+
+    assert abs(float(data.qpos[0])) < 1e-9
+
+
+def test_a_declared_zero_torque_actuator_stays_strict_on_a_zero_effort_joint():
+    """The counterpart of the fallback rule: a *declared* zero ceiling stays inert.
+
+    The joint carries ``effort=0.0`` as well, so this pins that the fallback's
+    "zero effort means unspecified" reading does not leak into declared actuators.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from cyberwave_robot_format.mjcf import MJCFExporter
+    from cyberwave_robot_format.schema import Actuator, ActuatorType
+
+    schema = CommonSchema(
+        metadata=Metadata(name="r"),
+        links=[Link(name="base", mass=1.0), Link(name="l1", mass=1.0)],
+        joints=[
+            Joint(
+                name="j1",
+                type=JointType.REVOLUTE,
+                parent_link="base",
+                child_link="l1",
+                limits=JointLimits(lower=-1.0, upper=1.0, effort=0.0),
+            )
+        ],
+        actuators=[
+            Actuator(name="a1", joint="j1", type=ActuatorType.TORQUE, max_torque=0.0)
+        ],
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        out = Path(directory) / "r.xml"
+        MJCFExporter().export(schema, out)
+        xml = out.read_text()
+
+    assert _actuator_attr(xml, "gear") == "0"
+    assert _actuator_attr(xml, "forcerange") is None
+
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    data.ctrl[0] = 1000.0
+    for _ in range(200):
+        mujoco.mj_step(model, data)
+    assert abs(float(data.qpos[0])) < 1e-9
+
+
+def test_a_zero_torque_ceiling_wins_over_a_declared_force_range():
+    """The two conditions are not mutually exclusive, and inert must win.
+
+    ``force_range=(-10, 10)`` with ``max_torque=0.0`` sets both ``has_real_force_range``
+    and ``must_not_drive``. Testing the forcerange first wrote ``forcerange`` and left
+    ``gear`` unset, and the gear-ratio guard then skipped the ratio while logging
+    "keeping gear=0" — a pin that was never written. MuJoCo fell back to gear=1, so a
+    schema asking for an inert joint produced a drivable one delivering 1/gear_ratio of
+    the intended torque.
+    """
+    xml = _declared_actuator_xml(
+        force_range=(-10.0, 10.0), max_torque=0.0, gear_ratio=100.0
+    )
+
+    assert _actuator_attr(xml, "gear") == "0"
+    assert _actuator_attr(xml, "forcerange") is None
+
+
+def test_a_gear_ratio_survives_a_real_force_range():
+    """The ordinary geared actuator must keep its ratio."""
+    xml = _declared_actuator_xml(force_range=(-10.0, 10.0), gear_ratio=100.0)
+
+    assert _actuator_attr(xml, "forcerange") == "-10.0 10.0"
+    assert _actuator_attr(xml, "gear") == "100.0"
