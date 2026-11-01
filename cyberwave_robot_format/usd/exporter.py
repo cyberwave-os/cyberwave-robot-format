@@ -241,6 +241,7 @@ class _StageBuilder:
         self.material_paths: dict[str, Any] = {}
         self._physics_materials: dict[tuple, Any] = {}
         self._named_materials: dict[str, Material] = {}
+        self._document_material_names: frozenset[str] = frozenset()
         self._shadowed_warned: set[str] = set()
         self._group_members: dict[str, list[Any]] = {}
         self.sensor_paths: dict[str, Any] = {}
@@ -364,8 +365,9 @@ class _StageBuilder:
         self.links_scope = self._scope(self.root_path, t.SCOPE_LINKS)
         self.joints_scope = self._scope(self.root_path, t.SCOPE_JOINTS)
 
-        self._write_named_materials()
+        document_materials = self._write_named_materials()
         order = self._write_links()
+        order["materials"] = document_materials
         order["joints"] = self._write_joints()
         order["actuators"], driven_joints = self._write_actuators()
         self._write_passive_drives(driven_joints)
@@ -462,6 +464,16 @@ class _StageBuilder:
         every zero-mass body a stand-in -- never sees. Those links get the small
         stand-in from :meth:`_write_massless_fallback` instead.
         """
+        orientation = link.inertial_orientation
+        if (orientation.x, orientation.y, orientation.z, orientation.w) != (
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ):
+            # Sidecar only, and only when rotated, so unrotated links stay
+            # byte-identical: the native MassAPI below gets the link-frame tensor.
+            c.write_quaternion(prim, t.A_LINK_INERTIAL_ORIENTATION, orientation)
         inertia = link.inertia
         has_inertia = any(
             value != 0.0
@@ -494,7 +506,11 @@ class _StageBuilder:
             )
             c.write_vector3(prim, t.A_LINK_CENTER_OF_MASS, link.center_of_mass)
         if has_inertia:
-            diagonal, principal_axes, _is_exact = f.inertia_to_principal(inertia)
+            # physics:principalAxes is relative to the link (prim) frame, so a
+            # rotated inertial frame is folded in before the diagonalisation.
+            diagonal, principal_axes, _is_exact = f.inertia_to_principal(
+                link.inertia_in_link_frame()
+            )
             mass_api.CreateDiagonalInertiaAttr(self.pxr.Gf.Vec3f(*diagonal))
             mass_api.CreatePrincipalAxesAttr(
                 c.quaternion_to_gf(principal_axes, precision="float")
@@ -788,30 +804,51 @@ class _StageBuilder:
 
     # -- materials -----------------------------------------------------
 
-    def _write_named_materials(self) -> None:
+    def _write_named_materials(self) -> list[str]:
         """Define every *named* visual material once, up front, so visuals share them."""
+        # A named material's document-level copy is the source of truth, as in the
+        # URDF and MJCF exporters; otherwise the first visual's copy defines it.
+        document = {
+            material.name: material
+            for material in getattr(self.schema, "materials", None) or []
+            if material.name
+        }
         named: dict[str, Material] = {}
         for link in self.schema.links:
             for visual in link.visuals:
                 material = visual.material
                 if material and material.name and material.name not in named:
-                    named[material.name] = material
+                    named[material.name] = document.get(material.name, material)
         self._named_materials = named
-        if not named:
-            return
+        self._document_material_names = frozenset(document)
+        # Document materials no visual references are still written (after the
+        # referenced ones, so existing output keeps its prim order): the
+        # root's cyberwave:order "materials" list is what rebuilds
+        # CommonSchema.materials on import.
+        to_write = dict(named)
+        for name, material in document.items():
+            to_write.setdefault(name, material)
+        if not to_write:
+            return []
 
         scope = self._scope(self.root_path, t.SCOPE_MATERIALS)
-        for name, material in named.items():
+        for name, material in to_write.items():
             path, _ = self._child_path(scope, name)
             prim = self._write_preview_surface(path, material)
             self._author_optional_name(prim, name)
             self.material_paths[name] = path
+        return [
+            self._relative(self.material_paths[name], self.root_path) for name in document
+        ]
 
     def _bind_visual_material(self, prim: Any, visual: Visual) -> None:
         material = visual.material
         if material is None:
             return
-        if material.name and self._named_materials.get(material.name) == material:
+        if material.name and (
+            material.name in self._document_material_names
+            or self._named_materials.get(material.name) == material
+        ):
             self._bind_material(prim, self.material_paths[material.name])
             return
         if material.name and material.name not in self._shadowed_warned:

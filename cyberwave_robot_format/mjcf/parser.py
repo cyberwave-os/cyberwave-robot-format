@@ -1015,6 +1015,16 @@ class MJCFParser(BaseParser):
                 )
             ):
                 raise ParseError(f"Site motor {name!r} has invalid forcerange")
+            if (
+                force_range is not None
+                and force_range[0] == 0.0
+                and force_range[1] == 0.0
+                and attrs.get("forcelimited", "auto").strip().lower() != "true"
+            ):
+                # MuJoCo reads a zero forcerange as "no force limit" unless
+                # forcelimited is "true". Recording it as a zero torque ceiling
+                # would make the exporter pin the motor with gear="0".
+                force_range = None
             if force_range is not None:
                 actuator.force_range = force_range
                 actuator.max_torque = max(abs(force_range[0]), abs(force_range[1]))

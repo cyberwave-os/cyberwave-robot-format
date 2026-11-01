@@ -335,10 +335,20 @@ class MJCFExporter(BaseExporter):
                 if visual.material and visual.material.name:
                     materials_used.add(visual.material.name)
 
+        # A named material's document-level copy is the source of truth, as in the
+        # URDF exporter; otherwise the first visual's copy defines it.
+        document_materials = {
+            material.name: material
+            for material in getattr(schema, "materials", None) or []
+            if material.name
+        }
         for link in schema.links:
             for visual in link.visuals:
                 if visual.material and visual.material.name in materials_used:
-                    self._add_material(asset, visual.material)
+                    self._add_material(
+                        asset,
+                        document_materials.get(visual.material.name, visual.material),
+                    )
                     materials_used.remove(visual.material.name)
 
         mesh_name_map = self._add_mesh_assets(asset, schema)
@@ -455,20 +465,23 @@ class MJCFExporter(BaseExporter):
                     motor.set("joint", joint.name)
                     motor.set("class", "motor")
 
-                    if joint.limits and joint.limits.effort:
-                        motor.set(
-                            "forcerange",
-                            f"-{joint.limits.effort} {joint.limits.effort}",
-                        )
+                    # On this fallback path a URDF ``effort="0"`` means
+                    # "unspecified", not "must not be driven": CAD exporters (e.g.
+                    # SolidWorks) write it as a placeholder on every joint, and
+                    # reading it strictly would freeze the whole robot. So zero is
+                    # treated like a missing effort: no ``forcerange``, unlimited
+                    # torque, as before. A zero ceiling on a *declared* actuator
+                    # keeps the strict meaning; see ``_add_actuator``.
+                    effort = joint.limits.effort if joint.limits else None
+                    if effort:
+                        motor.set("forcerange", f"-{effort} {effort}")
 
-                    if (
-                        joint.limits
-                        and joint.limits.lower is not None
-                        and joint.limits.upper is not None
-                    ):
-                        motor.set(
-                            "ctrlrange", f"{joint.limits.lower} {joint.limits.upper}"
-                        )
+                    # Deliberately no ``ctrlrange``. A <motor>'s ``ctrl`` is a
+                    # force/torque, so the joint's positional ``lower``/``upper``
+                    # is the wrong quantity: go2's calf range [-2.72, -0.84] would
+                    # let the leg be pulled only one way. ``ctrl`` stays unbounded
+                    # (``ctrllimited`` compiles false) and ``forcerange`` alone
+                    # clamps the torque.
 
         if schema.sensors:
             sensor_elem = ET.SubElement(mujoco, "sensor")
@@ -1333,16 +1346,46 @@ class MJCFExporter(BaseExporter):
                 # joint's allowed range.
                 act.set("ctrlrange", f"{limits.lower} {limits.upper}")
 
-        if hasattr(actuator, "force_range") and actuator.force_range:
-            force_min, force_max = actuator.force_range
-            force_range = f"{force_min} {force_max}"
-            act.set("forcerange", force_range)
-        elif hasattr(actuator, "max_torque") and actuator.max_torque is not None:
-            # If max_torque is specified but no force_range, use symmetric range
-            max_torque = actuator.max_torque
+        # A zero torque ceiling means "do not drive this joint", and `forcerange`
+        # cannot express that: `forcerange="0 0"` compiles to `forcelimited=False`
+        # under `autolimits="true"`, i.e. *unlimited* torque. Use `gear="0"`.
+        # Only declared actuators read zero this strictly; the fallback motor
+        # treats a URDF ``effort="0"`` as unspecified.
+        force_range = getattr(actuator, "force_range", None)
+        max_torque = getattr(actuator, "max_torque", None)
+        has_real_force_range = bool(force_range) and any(
+            bound != 0.0 for bound in force_range
+        )
+        must_not_drive = (bool(force_range) and not has_real_force_range) or (
+            max_torque is not None and max_torque == 0.0
+        )
+
+        # ``must_not_drive`` first: ``force_range=(-10, 10)`` with
+        # ``max_torque=0.0`` sets both flags, and a zero torque ceiling wins.
+        if must_not_drive:
+            act.set("gear", "0")
+            logger.info(
+                "Actuator %s declares a zero torque ceiling (must not be driven); "
+                "emitting gear=0 so it is inert. A forcerange of 0 would compile to "
+                "*unlimited* torque.",
+                actuator.name,
+            )
+        elif has_real_force_range:
+            act.set("forcerange", f"{force_range[0]} {force_range[1]}")
+        elif max_torque is not None:
+            # max_torque without an explicit force_range: symmetric range.
             act.set("forcerange", f"-{max_torque} {max_torque}")
 
-        if actuator.gear_ratio is not None:
+        if actuator.gear_ratio is not None and act.get("gear") == "0":
+            # Writing the gear ratio over the gear=0 pin would make the actuator
+            # drivable again.
+            logger.info(
+                "Actuator %s declares both a zero torque ceiling and gear_ratio=%s; "
+                "keeping gear=0 so it stays inert.",
+                actuator.name,
+                actuator.gear_ratio,
+            )
+        elif actuator.gear_ratio is not None:
             if act_tag in ("position", "velocity"):
                 import warnings
 

@@ -797,3 +797,258 @@ def test_joint_origin_rpy_round_trips_through_parse_and_export(tmp_path):
         + before.orientation.w * after.orientation.w
     )
     assert abs(dot) == pytest.approx(1.0, abs=1e-12)
+
+
+class TestGazeboSensorPose:
+    """A Gazebo sensor's mount pose must reach `Sensor.pose`.
+
+    It was never read, so every URDF-sourced sensor sat at the identity — while the
+    MJCF exporter *writes* that field into the `<site>` the sensor is sampled at, and
+    `cyberwave-sim/sensors/range.py` depends on it: "a MiR250 carries two scanners on
+    opposite corners, each yawed 45°". Both ended up at the chassis centre pointing the
+    same way. Gazebo still saw the right pose via the `<gazebo>` passthrough, so the two
+    disagreed — and `gazebo_sensor_drift` compares only sensor *names*.
+    """
+
+    _URDF = """<?xml version="1.0"?>
+<robot name="scanner_bot">
+  <link name="base_link"/>
+  <gazebo reference="base_link">
+    <sensor name="front_scan" type="ray">
+      <pose>0.3 0.3 0.2 0 0 -0.7853981634</pose>
+      <update_rate>15</update_rate>
+    </sensor>
+  </gazebo>
+</robot>"""
+
+    def _sensor(self, urdf: str):
+        import tempfile
+        from pathlib import Path
+
+        from cyberwave_robot_format.urdf import URDFParser
+
+        directory = Path(tempfile.mkdtemp())
+        path = directory / "robot.urdf"
+        path.write_text(urdf)
+        return URDFParser().parse(path).sensors[0]
+
+    def test_the_sdf_pose_is_read(self):
+        sensor = self._sensor(self._URDF)
+
+        assert sensor.pose is not None
+        assert sensor.pose.position.x == pytest.approx(0.3)
+        assert sensor.pose.position.y == pytest.approx(0.3)
+        assert sensor.pose.position.z == pytest.approx(0.2)
+        # A yaw of -45° must survive; identity here is what put both MiR250 scanners
+        # on the same bearing.
+        assert sensor.pose.orientation is not None
+        assert sensor.pose.orientation.w != pytest.approx(1.0)
+
+    def test_a_urdf_style_origin_is_accepted_too(self):
+        urdf = self._URDF.replace(
+            "<pose>0.3 0.3 0.2 0 0 -0.7853981634</pose>",
+            '<origin xyz="0.3 0.3 0.2" rpy="0 0 -0.7853981634"/>',
+        )
+        sensor = self._sensor(urdf)
+
+        assert sensor.pose.position.x == pytest.approx(0.3)
+
+    def test_a_sensor_without_a_pose_stays_at_the_identity(self):
+        urdf = self._URDF.replace("<pose>0.3 0.3 0.2 0 0 -0.7853981634</pose>", "")
+        sensor = self._sensor(urdf)
+
+        assert sensor.pose.position.x == pytest.approx(0.0)
+
+    def _schema(self, pose_xml: str):
+        import tempfile
+        from pathlib import Path
+
+        from cyberwave_robot_format.urdf import URDFParser
+
+        urdf = self._URDF.replace(
+            "<pose>0.3 0.3 0.2 0 0 -0.7853981634</pose>", pose_xml
+        )
+        path = Path(tempfile.mkdtemp()) / "robot.urdf"
+        path.write_text(urdf)
+        return URDFParser().parse(path)
+
+    @staticmethod
+    def _yaw(orientation) -> float:
+        return orientation.to_rpy()[2]
+
+    def test_degrees_true_converts_the_angles(self):
+        # SDF's `degrees="true"` makes the rotation degrees. It used to be read as
+        # radians, so a 90° yaw became 90 rad (~5157°) with no warning.
+        schema = self._schema('<pose degrees="true">0.3 0.3 0.2 0 0 90</pose>')
+        sensor = schema.sensors[0]
+
+        assert sensor.pose.position.x == pytest.approx(0.3)
+        assert self._yaw(sensor.pose.orientation) == pytest.approx(math.pi / 2)
+
+    def test_degrees_false_keeps_radians(self):
+        schema = self._schema('<pose degrees="false">0 0 0 0 0 1.0</pose>')
+
+        assert self._yaw(schema.sensors[0].pose.orientation) == pytest.approx(1.0)
+
+    def test_quat_xyzw_rotation_format_is_read(self):
+        half = math.sqrt(0.5)
+        schema = self._schema(
+            f'<pose rotation_format="quat_xyzw">1 2 3 0 0 {half} {half}</pose>'
+        )
+        sensor = schema.sensors[0]
+
+        assert sensor.pose.position.z == pytest.approx(3.0)
+        assert self._yaw(sensor.pose.orientation) == pytest.approx(math.pi / 2)
+
+    @pytest.mark.parametrize(
+        "pose_xml",
+        [
+            "<pose>0.3 0.3 0.2</pose>",
+            "<pose>0.3 0.3 0.2 0 0 0.5 9</pose>",
+            "<pose>0.3 0.3 0.2 0 0 nan</pose>",
+            "<pose>0.3 0.3 0.2 0 0 yaw</pose>",
+            '<pose rotation_format="quat_xyzw">0 0 0 0 0 0 0</pose>',
+            '<pose rotation_format="axis_angle">0 0 0 0 0 1</pose>',
+        ],
+    )
+    def test_an_unreadable_pose_falls_back_to_the_identity_with_a_warning(
+        self, pose_xml
+    ):
+        schema = self._schema(pose_xml)
+        sensor = schema.sensors[0]
+
+        assert sensor.pose.position.x == pytest.approx(0.0)
+        assert sensor.pose.orientation.w == pytest.approx(1.0)
+        warnings = schema.extensions["parse_context"]["warnings"]
+        assert any("Unreadable sensor <pose>" in w for w in warnings)
+
+    def test_an_unreadable_origin_warns(self):
+        schema = self._schema('<origin xyz="0.3 0.3" rpy="0 0 0"/>')
+
+        assert schema.sensors[0].pose.position.x == pytest.approx(0.0)
+        warnings = schema.extensions["parse_context"]["warnings"]
+        assert any("Unreadable sensor <origin>" in w for w in warnings)
+
+    def test_a_camera_keeps_its_mount_position_but_not_its_gazebo_rotation(self):
+        # A Gazebo camera looks along +X; schema cameras look along -Z (MuJoCo/USD).
+        # Copying the rotation verbatim turned a camera pitched straight down in
+        # Gazebo into one looking backwards in MJCF.
+        import tempfile
+        from pathlib import Path
+
+        from cyberwave_robot_format.urdf import URDFParser
+
+        urdf = self._URDF.replace('type="ray"', 'type="camera"').replace(
+            "0 0 -0.7853981634", "0 1.5707963268 0"
+        )
+        path = Path(tempfile.mkdtemp()) / "robot.urdf"
+        path.write_text(urdf)
+        schema = URDFParser().parse(path)
+        sensor = schema.sensors[0]
+
+        assert sensor.pose.position.x == pytest.approx(0.3)
+        assert sensor.pose.position.z == pytest.approx(0.2)
+        assert sensor.pose.orientation.w == pytest.approx(1.0)
+        warnings = schema.extensions["parse_context"]["warnings"]
+        assert any("camera <pose> rotation not applied" in w for w in warnings)
+
+    @pytest.mark.parametrize(
+        "sensor_type",
+        [
+            "rgbd_camera",
+            "thermal_camera",
+            "thermal",
+            "multicamera",
+            "wideanglecamera",
+            "wide_angle_camera",
+            "segmentation_camera",
+            "boundingbox_camera",
+            "logical_camera",
+        ],
+    )
+    def test_every_gazebo_camera_type_drops_its_gazebo_rotation(self, sensor_type):
+        # These Gazebo camera types map to no Cyberwave camera kind today, but their
+        # frame still looks along +X. Keeping the rotation stored a wrong-convention
+        # pose that a future renderer of the type would aim by.
+        import tempfile
+        from pathlib import Path
+
+        from cyberwave_robot_format.urdf import URDFParser
+
+        urdf = self._URDF.replace('type="ray"', f'type="{sensor_type}"').replace(
+            "0 0 -0.7853981634", "0 1.5707963268 0"
+        )
+        path = Path(tempfile.mkdtemp()) / "robot.urdf"
+        path.write_text(urdf)
+        schema = URDFParser().parse(path)
+        sensor = schema.sensors[0]
+
+        assert sensor.type == sensor_type
+        assert sensor.pose.position.x == pytest.approx(0.3)
+        assert sensor.pose.position.z == pytest.approx(0.2)
+        assert sensor.pose.orientation.w == pytest.approx(1.0)
+        warnings = schema.extensions["parse_context"]["warnings"]
+        assert any("camera <pose> rotation not applied" in w for w in warnings)
+
+    @pytest.mark.parametrize("sensor_type", ["gpu_lidar", "gpu_ray", "sonar"])
+    def test_a_non_camera_gazebo_sensor_keeps_its_rotation(self, sensor_type):
+        # Range sensors look along +X in Gazebo and in cyberwave-sim (sensors/range.py
+        # builds its beams along +X), so their rotation is already in the right frame.
+        sensor = self._sensor(
+            self._URDF.replace('type="ray"', f'type="{sensor_type}"').replace(
+                "0 0 -0.7853981634", "0 1.5707963268 0"
+            )
+        )
+
+        assert sensor.type == sensor_type
+        assert sensor.pose.orientation.y == pytest.approx(math.sqrt(0.5))
+        assert sensor.pose.orientation.w == pytest.approx(math.sqrt(0.5))
+
+
+_MALFORMED_AXIS_URDF = """<?xml version="1.0"?>
+<robot name="arm">
+  <link name="base"/>
+  <link name="tool"/>
+  <joint name="j1" type="revolute">
+    <parent link="base"/>
+    <child link="tool"/>
+    <axis xyz="{xyz}"/>
+    <limit lower="-1" upper="1" effort="10" velocity="1"/>
+  </joint>
+</robot>
+"""
+
+
+@pytest.mark.parametrize(
+    "xyz",
+    ["not a vector", "1 0", "1 0 0 0", ""],
+    ids=["non-numeric", "too-short", "too-long", "empty"],
+)
+def test_a_malformed_axis_falls_back_to_the_urdf_spec_default(tmp_path, xyz):
+    """An unparseable ``<axis>`` must land on (1,0,0), not the dataclass default.
+
+    ``Joint.axis`` defaults to ``(0, 0, 1)`` while the URDF spec default is
+    ``(1, 0, 0)``. The missing-``<axis>`` path already corrects for that; a *present
+    but malformed* axis fell through and kept the dataclass value, which is the same
+    90-degree-off-spec error — and the next schema->URDF render writes it out
+    explicitly, making it permanent and invisible to the fidelity check.
+    """
+    schema, context = _parse_urdf(
+        tmp_path, _MALFORMED_AXIS_URDF.format(xyz=xyz), "malformed_axis.urdf"
+    )
+
+    joint = next(j for j in schema.joints if j.name == "j1")
+    assert (joint.axis.x, joint.axis.y, joint.axis.z) == (1.0, 0.0, 0.0)
+    assert any("Malformed joint axis" in w for w in context["warnings"]), context[
+        "warnings"
+    ]
+
+
+def test_a_well_formed_axis_is_still_honoured(tmp_path):
+    """The fallback must not swallow a perfectly good axis."""
+    schema, _ = _parse_urdf(
+        tmp_path, _MALFORMED_AXIS_URDF.format(xyz="0 0 1"), "good_axis.urdf"
+    )
+
+    joint = next(j for j in schema.joints if j.name == "j1")
+    assert (joint.axis.x, joint.axis.y, joint.axis.z) == (0.0, 0.0, 1.0)

@@ -1543,6 +1543,13 @@ def _snake_rotor(data: dict[str, Any]) -> dict[str, Any]:
     return {names.get(key, key): value for key, value in data.items()}
 
 
+def _positive_or_none(value: float | None) -> float | None:
+    """``value`` when it is a usable joint-limit ceiling, else ``None`` (unspecified)."""
+    if value is None or not float(value) > 0.0:
+        return None
+    return value
+
+
 def _drive_entry(joint: Joint, actuator: Any, dof_index: int, usd_path: str | None) -> dict[str, Any]:
     """The articulation's per-joint drive declaration, SI per radian/metre."""
 
@@ -1580,10 +1587,15 @@ def _drive_entry(joint: Joint, actuator: Any, dof_index: int, usd_path: str | No
     else:
         mode = "none"
         max_velocity = None
+    # A URDF ``<limit>`` must carry ``effort`` and ``velocity``, so ``0`` there means
+    # "unspecified": CAD exporters write it as a placeholder, and the URDF exporter
+    # writes it when the schema has none. Read as a ceiling it would clamp the joint
+    # to zero torque/speed. Same rule as ``derived_joint_physx`` and the MJCF fallback
+    # motor. An actuator's own zero (above) is a declared value and stays strict.
     if max_force is None and limits is not None:
-        max_force = limits.effort
+        max_force = _positive_or_none(limits.effort)
     if max_velocity is None and limits is not None:
-        max_velocity = limits.velocity
+        max_velocity = _positive_or_none(limits.velocity)
 
     entry.update(
         mode=mode,

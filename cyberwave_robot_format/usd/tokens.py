@@ -140,7 +140,10 @@ A_POSE_ORIENTATION = f"{CW}:pose:orientation"
 A_LINK_MASS = f"{CW}:link:mass"
 A_LINK_CENTER_OF_MASS = f"{CW}:link:centerOfMass"
 A_LINK_INERTIA = f"{CW}:link:inertia"
-"""Full symmetric tensor as ``[ixx, iyy, izz, ixy, ixz, iyz]``."""
+"""Full symmetric tensor as ``[ixx, iyy, izz, ixy, ixz, iyz]``, in the inertial frame."""
+A_LINK_INERTIAL_ORIENTATION = f"{CW}:link:inertialOrientation"
+"""``Link.inertial_orientation`` (``x, y, z, w``); authored only when not identity.
+The native ``MassAPI`` values are already in the link frame."""
 A_LINK_MASS_FALLBACK = f"{CW}:link:massFallback"
 """``True`` when the native ``MassAPI`` values are the exporter's stand-in for a
 massless link (no mass or inertia, and either no collision geometry or another

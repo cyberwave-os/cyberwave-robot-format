@@ -152,11 +152,25 @@ def full_schema() -> CommonSchema:
             ],
             extensions=dict(NESTED_EXTENSIONS),
         ),
+        materials=[
+            # Same values as the visual's copy: the document material wins on export.
+            Material(
+                name="metal",
+                color=[0.7, 0.7, 0.75, 0.9],
+                texture="textures/metal.png",
+                specular=[0.4, 0.4, 0.4],
+                emissive=[0.01, 0.02, 0.03],
+                shininess=0.65,
+            ),
+            # Referenced by no visual: still part of the document.
+            Material(name="rubber", color=[0.05, 0.05, 0.05, 1.0], shininess=0.1),
+        ],
         links=[
             Link(
                 name="base_link",
                 mass=12.3456789012345,
                 center_of_mass=Vector3(x=0.011, y=-0.022, z=0.033),
+                inertial_orientation=Quaternion.from_rpy(0.05, -0.1, 0.785),
                 inertia=Inertia(
                     ixx=0.51, iyy=0.62, izz=0.73, ixy=0.011, ixz=-0.022, iyz=0.033
                 ),
