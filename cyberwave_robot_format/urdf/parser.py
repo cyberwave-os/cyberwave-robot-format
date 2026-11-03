@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import re
@@ -128,6 +129,19 @@ def _finite_float(raw: str) -> float:
     if not math.isfinite(value):
         raise ValueError(f"expected a finite number, got {raw!r}")
     return value
+
+
+def _content_name(elem: ET.Element) -> str | None:
+    """A name for a nameless ``<material>``, derived from its colour and texture."""
+    color = elem.find("color")
+    texture = elem.find("texture")
+    content = (
+        " ".join((color.get("rgba") or "").split()) if color is not None else "",
+        (texture.get("filename") or "") if texture is not None else "",
+    )
+    if not any(content):
+        return None
+    return "material_" + hashlib.sha1("|".join(content).encode()).hexdigest()[:8]
 
 
 class URDFParser(BaseParser):
@@ -1047,10 +1061,16 @@ class URDFParser(BaseParser):
             context.add_warning(f"Orphaned links detected: {orphaned}")
 
     def _parse_material(
-        self, elem: ET.Element, context: ParseContext
+        self, elem: ET.Element, context: ParseContext, *, inline: bool = False
     ) -> Material | None:
-        """Parse URDF material element with validation."""
-        name = elem.get("name")
+        """Parse URDF material element with validation.
+
+        ``inline`` marks a visual's own ``<material>``. urdfdom accepts one with an
+        empty name and uses its colour, which is how the SolidWorks exporter writes
+        colours, so it is named after its content: equal ones share a name and
+        different ones keep theirs apart in exports that key materials by name.
+        """
+        name = elem.get("name") or (_content_name(elem) if inline else None)
         if not name:
             context.add_warning("Material missing name attribute")
             return None
@@ -1096,7 +1116,7 @@ class URDFParser(BaseParser):
             if material_name and material_name in context.materials:
                 material = context.materials[material_name]
             else:
-                material = self._parse_material(material_elem, context)
+                material = self._parse_material(material_elem, context, inline=True)
 
         pose = Pose()
         origin_elem = elem.find("origin")

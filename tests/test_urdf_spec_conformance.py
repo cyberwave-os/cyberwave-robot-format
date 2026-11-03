@@ -109,6 +109,55 @@ def test_self_referential_mimic_is_still_dropped(tmp_path):
     assert _joints(_parse(tmp_path, urdf))["_5"].mimic is None
 
 
+# -------------------------------------------------------------------- material
+
+
+_NAMELESS_MATERIAL_URDF = """<robot name="t">
+  <link name="a"><visual><geometry><box size="1 1 1"/></geometry>
+    <material name=""><color rgba="1 0 0 1"/></material></visual></link>
+  <link name="b"><visual><geometry><box size="1 1 1"/></geometry>
+    <material name=""><color rgba="1  0 0 1"/></material></visual></link>
+  <link name="c"><visual><geometry><box size="1 1 1"/></geometry>
+    <material name=""><color rgba="0 0 1 1"/></material></visual></link>
+  <link name="d"><visual><geometry><box size="1 1 1"/></geometry>
+    <material name=""/></visual></link>
+  <joint name="ab" type="fixed"><parent link="a"/><child link="b"/></joint>
+  <joint name="ac" type="fixed"><parent link="a"/><child link="c"/></joint>
+  <joint name="ad" type="fixed"><parent link="a"/><child link="d"/></joint>
+</robot>"""
+
+
+def _visual_materials(schema: CommonSchema) -> dict:
+    return {link.name: link.visuals[0].material for link in schema.links}
+
+
+def test_nameless_visual_material_keeps_its_colour(tmp_path):
+    # urdfdom reads a visual's <material name=""> and uses its colour, which is how
+    # the SolidWorks exporter writes colours. It used to be dropped, so the visual
+    # rendered in default grey everywhere except the browser's URDF viewer.
+    materials = _visual_materials(_parse(tmp_path, _NAMELESS_MATERIAL_URDF))
+    assert materials["a"].color == [1.0, 0.0, 0.0, 1.0]
+    assert materials["c"].color == [0.0, 0.0, 1.0, 1.0]
+    assert materials["d"] is None
+
+
+def test_nameless_materials_are_named_by_content(tmp_path):
+    # Exports key materials by name: equal colours may share one, different
+    # colours must not.
+    materials = _visual_materials(_parse(tmp_path, _NAMELESS_MATERIAL_URDF))
+    assert materials["a"].name == materials["b"].name
+    assert materials["a"].name != materials["c"].name
+
+
+def test_nameless_material_colours_survive_a_round_trip(tmp_path):
+    once = _parse(tmp_path, _NAMELESS_MATERIAL_URDF)
+    reparsed_path = tmp_path / "roundtrip.urdf"
+    reparsed_path.write_text(URDFExporter().export_string(once))
+    materials = _visual_materials(URDFParser().parse(reparsed_path))
+    assert materials["a"].color == [1.0, 0.0, 0.0, 1.0]
+    assert materials["c"].color == [0.0, 0.0, 1.0, 1.0]
+
+
 # -------------------------------------------------------------------- geometry
 
 

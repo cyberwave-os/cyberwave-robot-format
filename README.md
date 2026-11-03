@@ -29,6 +29,15 @@ cyberwave_robot_format/
 └── utils.py            # General utilities
 ```
 
+## Schema changes in 0.1.15
+
+Backwards compatible to *read*, but a URDF that colours its visuals with
+`<material name="">` now parses to a different universal schema than in 0.1.14.
+
+- **Nameless visual materials** keep their colour and texture, as urdfdom reads
+  them, under a name derived from that content (`material_<hash>`). They used to be
+  dropped, so those visuals rendered in default grey.
+
 ## Schema changes in 0.1.14
 
 Backwards compatible to *read*, but any hash computed over
