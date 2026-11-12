@@ -478,6 +478,15 @@ texture that is not where it is referenced but has a same-named file elsewhere i
 the input directory is used anyway, with a `report.warnings` entry (noting when
 there were several candidates) so a wrong match is visible.
 
+### Passive joint declaration
+
+`joint.extensions["passive"] = True` declares that the joint is independently
+undriven: it is excluded from fallback joint motors and independent joint commands.
+The flag is shared across consumers, not scoped to simulation. A drone's visual
+propeller hinge can be passive while separate thrust-site actuators drive the
+aircraft. This does not classify the physical motor as passive or identify a
+hinge as a propeller for animation. Author active actuators separately.
+
 ### Export positional loop closures to MuJoCo
 
 For a closed-chain robot, declare link-frame pairs in
