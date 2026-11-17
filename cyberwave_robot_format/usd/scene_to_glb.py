@@ -52,7 +52,11 @@ import trimesh
 from trimesh.visual import TextureVisuals
 from trimesh.visual.material import PBRMaterial
 
-from cyberwave_robot_format.collision import hollow_collision_warning, hull_volume_ratio
+from cyberwave_robot_format.collision import (
+    fit_collision_boxes,
+    hollow_collision_warning,
+    hull_volume_ratio,
+)
 from cyberwave_robot_format.usd import common as c
 from cyberwave_robot_format.usd.parser import USD_SUFFIXES, USDParser
 
@@ -78,8 +82,10 @@ _NAME_PRESETS: dict[str, tuple[list[float], float, float]] = {
     "plastic_black": ([0.02, 0.02, 0.02, 1.0], 0.0, 0.40),
 }
 
-# A scene with more large static meshes than this is a city, not a room: past it
-# the extra boxes are dropped and the report says so.
+# Boxes, not meshes: a hollow mesh can take up to ``BOX_FIT_MAX_BOXES`` of them. Past
+# the cap, the meshes with the most boxes collide as their bounding box, so a prim is
+# dropped only when the scene has more collider prims than this. The report says so
+# in both cases.
 _MAX_COLLIDERS = 256
 
 # Prim purposes that are part of the visible scene (``guide`` and ``proxy`` are not).
@@ -171,9 +177,12 @@ class USDSceneToGLB:
         generate_colliders: Report box colliders for the scene (see
             :attr:`SceneGlbReport.collision`). A ``Cube`` prim or a prim with the USD
             collision API becomes one exact box; any other mesh whose longest world
-            edge is at least ``min_collider_size_m`` becomes its bounding box. Small
-            props are skipped. A prim with ``physics:collisionEnabled = false`` is
-            never a collider -- that is the opt-out.
+            edge is at least ``min_collider_size_m`` becomes the boxes that
+            :func:`~cyberwave_robot_format.collision.fit_collision_boxes` fits to
+            it: one for a solid mesh, several along the surface of a hollow one, so
+            walls modelled as one mesh do not close the room they stand around.
+            Small props are skipped. A prim with ``physics:collisionEnabled =
+            false`` is never a collider -- that is the opt-out.
         min_collider_size_m: Size threshold for the above, in metres.
     """
 
@@ -243,6 +252,17 @@ def convert_usd_scene_to_glb(input_path: str | Path, **options: Any) -> SceneGlb
 # ----------------------------------------------------------------------------
 
 
+@dataclass
+class _Collider:
+    """One prim's boxes, held until the whole scene is known."""
+
+    path: str
+    name: str
+    boxes: list[dict[str, Any]]
+    bounding_box: dict[str, Any]
+    notes: list[str] = field(default_factory=list)
+
+
 class _Conversion:
     """One conversion run: owns the caches that must not outlive it."""
 
@@ -252,6 +272,7 @@ class _Conversion:
         self.pxr = c.require_pxr()
         self.report = SceneGlbReport()
         self.scene = trimesh.Scene()
+        self._colliders: list[_Collider] = []
         self._materials: dict[str, PBRMaterial] = {}
         # path -> decoded image, or None for a file that could not be read
         self._images: dict[str, Any] = {}
@@ -284,7 +305,7 @@ class _Conversion:
             verts, tris, normals, uv = built
             name = self._add(prim, verts, tris, normals, uv)
             if self.cfg.generate_colliders:
-                self._collect_collider(prim, name, verts, xcache)
+                self._collect_collider(prim, name, verts, tris, xcache)
 
         if not self.scene.geometry:
             raise ValueError("The USD scene contains no renderable meshes.")
@@ -296,6 +317,7 @@ class _Conversion:
         self.report.triangle_count = sum(
             len(g.faces) for g in self.scene.geometry.values()
         )
+        self._place_colliders()
         self._assess_collision()
         glb = self.scene.export(file_type="glb")
         return SceneGlbResult(glb=bytes(glb), report=self.report)
@@ -522,36 +544,76 @@ class _Conversion:
     # -------------------------------------------------------------- colliders
 
     def _collect_collider(
-        self, prim: Any, name: str, verts: np.ndarray, xcache: Any
+        self, prim: Any, name: str, verts: np.ndarray, tris: np.ndarray, xcache: Any
     ) -> None:
-        """Add ``prim``'s box to the report if it is a collider (see the class doc)."""
+        """Hold ``prim``'s boxes if it is a collider (see the class doc)."""
         UsdGeom = self.pxr.UsdGeom
         enabled = prim.GetAttribute("physics:collisionEnabled")
         if enabled and enabled.Get() is False:
             return
         explicit = "PhysicsCollisionAPI" in prim.GetAppliedSchemas()
+        path = str(prim.GetPath())
         if prim.IsA(UsdGeom.Cube):
             box = self._cube_box(prim, xcache)
             if not explicit and max(box["size"]) < self.cfg.min_collider_size_m:
                 return
-        else:
-            # ``verts`` already carry the full world transform, so their axis-aligned
-            # bounds are the box; it is exact for the usual axis-aligned wall or slab.
-            lo, hi = verts.min(axis=0), verts.max(axis=0)
-            if not explicit and (hi - lo).max() < self.cfg.min_collider_size_m:
-                return
-            box = {
-                "size": (hi - lo).tolist(),
-                "xyz": ((hi + lo) / 2).tolist(),
-                "rpy": [0.0, 0.0, 0.0],
-            }
-        if len(self.report.collision) >= _MAX_COLLIDERS:
-            self._warn(
-                f"More than {_MAX_COLLIDERS} colliders; the rest were left out of "
-                "the collision."
-            )
+            self._colliders.append(_Collider(path, name, [box], box))
             return
-        self.report.collision.append({"name": name, **_rounded(box)})
+        # ``verts`` already carry the full world transform, so the boxes are fitted
+        # in the frame of the GLB. Not the mesh's bounding box: around walls that
+        # share a mesh, or a wall that stands at an angle, that box also covers the
+        # floor between them.
+        lo, hi = verts.min(axis=0), verts.max(axis=0)
+        if not explicit and (hi - lo).max() < self.cfg.min_collider_size_m:
+            return
+        bounding_box = {
+            "size": (hi - lo).tolist(),
+            "xyz": ((hi + lo) / 2).tolist(),
+            "rpy": [0.0, 0.0, 0.0],
+        }
+        # The fitter takes axis 2 as up, so a Y-up output keeps the bounding box.
+        notes: list[str] = []
+        boxes = (
+            fit_collision_boxes(verts, tris, notes=notes)
+            if self.cfg.z_up
+            else [bounding_box]
+        )
+        self._colliders.append(_Collider(path, name, boxes, bounding_box, notes))
+
+    def _place_colliders(self) -> None:
+        """Write the held boxes to the report, within ``_MAX_COLLIDERS``.
+
+        Over the cap, the meshes with the most boxes (the later one on a tie) collide
+        as their bounding box until the rest fit. It runs once the whole scene is
+        known, so early meshes cannot use up the cap before a late one, often the
+        outer walls, gets its box.
+        """
+        total = sum(len(c.boxes) for c in self._colliders)
+        for collider in sorted(
+            reversed(self._colliders), key=lambda c: len(c.boxes), reverse=True
+        ):
+            if total <= _MAX_COLLIDERS or len(collider.boxes) == 1:
+                break
+            total -= len(collider.boxes) - 1
+            collider.boxes = [collider.bounding_box]
+            collider.notes = [
+                f"the scene needs more than {_MAX_COLLIDERS} collision boxes, so it "
+                "collides as its bounding box"
+            ]
+        for collider in self._colliders:
+            # Without them a fit that fell back looks like one that worked.
+            for note in collider.notes:
+                self._warn(f"{collider.path}: {note}.")
+            for index, box in enumerate(collider.boxes):
+                if len(self.report.collision) >= _MAX_COLLIDERS:
+                    self._warn(
+                        f"More than {_MAX_COLLIDERS} colliders; the rest were left "
+                        "out of the collision."
+                    )
+                    return
+                # ``-`` is not valid in a USD identifier, so no prim name can clash.
+                name = f"{collider.name}-{index}" if index else collider.name
+                self.report.collision.append({"name": name, **_rounded(box)})
 
     def _cube_box(self, prim: Any, xcache: Any) -> dict[str, Any]:
         """A ``Cube`` as a box with its exact size and pose.
